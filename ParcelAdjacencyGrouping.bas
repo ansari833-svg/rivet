@@ -257,17 +257,17 @@ NextRow:
 
     ' -----------------------------------------------------------------------
     ' STAGE 6: Initialise union-find structures.
-    '   parent(i) = root of set containing i  (path-compressed lazily)
-    '   ufSize(i) = size of set rooted at i   (union by size)
+    '   ufParent(i) = root of set containing i  (path-compressed lazily)
+    '   ufSize(i)   = size of set rooted at i   (union by size)
     ' -----------------------------------------------------------------------
 
-    Dim parent() As Long
+    Dim ufParent() As Long
     Dim ufSize() As Long
-    ReDim parent(1 To n)
+    ReDim ufParent(1 To n)
     ReDim ufSize(1 To n)
 
     For i = 1 To n
-        parent(i) = i
+        ufParent(i) = i
         ufSize(i) = 1
     Next i
 
@@ -292,7 +292,7 @@ NextRow:
             End Select
 
             If dist <= threshold Then
-                Call UnionSets(parent, ufSize, i, j)
+                Call UnionSets(ufParent, ufSize, i, j)
             End If
         Next j
     Next i
@@ -313,7 +313,7 @@ NextRow:
 
     Dim root As Long
     For i = 1 To n
-        root = FindRoot(parent, i)
+        root = FindRoot(ufParent, i)
         If rootToGroup(root) = 0 Then
             groupCount = groupCount + 1
             rootToGroup(root) = groupCount
@@ -431,19 +431,19 @@ End Function
 '===============================================================================
 ' Union-Find: Find root with path compression (iterative)
 '===============================================================================
-Private Function FindRoot(parent() As Long, ByVal x As Long) As Long
+Private Function FindRoot(ufParent() As Long, ByVal x As Long) As Long
     ' Walk to the root.
     Dim root As Long
     root = x
-    Do While parent(root) <> root
-        root = parent(root)
+    Do While ufParent(root) <> root
+        root = ufParent(root)
     Loop
     ' Path compression — point every node on the path directly to root.
-    Dim next As Long
-    Do While parent(x) <> root
-        next = parent(x)
-        parent(x) = root
-        x = next
+    Dim nxt As Long
+    Do While ufParent(x) <> root
+        nxt = ufParent(x)
+        ufParent(x) = root
+        x = nxt
     Loop
     FindRoot = root
 End Function
@@ -451,19 +451,19 @@ End Function
 '===============================================================================
 ' Union-Find: Union by size — attach smaller tree under larger
 '===============================================================================
-Private Sub UnionSets(parent() As Long, ufSize() As Long, _
+Private Sub UnionSets(ufParent() As Long, ufSize() As Long, _
                        ByVal a As Long, ByVal b As Long)
     Dim rootA As Long, rootB As Long
-    rootA = FindRoot(parent, a)
-    rootB = FindRoot(parent, b)
+    rootA = FindRoot(ufParent, a)
+    rootB = FindRoot(ufParent, b)
     If rootA = rootB Then Exit Sub   ' already in the same set
 
     ' Merge smaller into larger.
     If ufSize(rootA) < ufSize(rootB) Then
-        parent(rootA) = rootB
+        ufParent(rootA) = rootB
         ufSize(rootB) = ufSize(rootB) + ufSize(rootA)
     Else
-        parent(rootB) = rootA
+        ufParent(rootB) = rootA
         ufSize(rootA) = ufSize(rootA) + ufSize(rootB)
     End If
 End Sub
