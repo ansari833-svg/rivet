@@ -16,25 +16,33 @@ Attribute VB_Name = "ParcelAdjacencyGrouping"
 '      then select this .bas file.
 '   3. Close the editor, return to Excel, and press Alt+F8.
 '   4. Select "GroupParcels" and click Run. Follow the on-screen prompts.
+'   5. To see debug output, open the Immediate window first: Ctrl+G in the editor.
 '===============================================================================
 Option Explicit
 
 ' -----------------------------------------------------------------------
-' CONFIG BLOCK — adjust these constants to change grouping behaviour.
+' CONFIG BLOCK — adjust these constants to tune grouping behaviour.
 ' Column selections and the data-start row are picked at runtime via prompts.
 ' -----------------------------------------------------------------------
 
-' Adjacency threshold multiplier.
-'   1.0 = strict edge-sharing only (centroids exactly (s1+s2)/2 apart).
-'   1.25 = default, allows slight gaps / positional imprecision.
-'   ~1.4 also catches diagonal / corner neighbours.
-Private Const TOLERANCE As Double = 1.25
+' Adjacency threshold multiplier applied to PAIR_SIZE (see PAIR_RULE).
+'   1.0 = strict: two same-size squares sharing an edge have centroids
+'         exactly s apart, so 1.0 accepts only true edge-sharers.
+'   1.25–1.4 progressively catches diagonal/corner and near neighbours,
+'   but risks chaining unrelated parcels — lower first if groups are too big.
+Private Const TOLERANCE As Double = 1.0
 
-' Shape model used to estimate each parcel's extent from its acreage.
-'   "square"  — side length = Sqrt(area_m2);
-'               adjacent when dist <= TOLERANCE * (s1 + s2) / 2
-'   "circle"  — radius = Sqrt(area_m2 / Pi);
-'               adjacent when dist <= TOLERANCE * (r1 + r2)
+' How to compute PAIR_SIZE from the two parcels' equivalent sizes (s1, s2).
+'   "min" — uses Min(s1, s2).  A large parcel cannot reach out and link
+'           distant small ones; the small parcel's own size governs.
+'           DEFAULT — best defence against runaway groups.
+'   "avg" — uses (s1 + s2) / 2.  More permissive; matches the classic
+'           "shared-edge centroid distance" formula for equal-size squares.
+Private Const PAIR_RULE As String = "min"
+
+' Shape model used to derive each parcel's equivalent size from its acreage.
+'   "square" — side s = Sqrt(area_m2); adjacent when dist <= TOLERANCE * PAIR_SIZE(s1,s2)
+'   "circle" — radius r = Sqrt(area_m2 / Pi); s is reinterpreted as r
 Private Const SHAPE_MODEL As String = "square"
 
 ' Write a Group Size column immediately to the right of the Group ID column?
@@ -42,10 +50,22 @@ Private Const SHAPE_MODEL As String = "square"
 '   False = skip entirely.
 Private Const WRITE_GROUP_SIZE As Boolean = True
 
-' Unit-conversion and geometry constants — no need to touch these.
-Private Const ACRES_TO_M2 As Double = 4046.86
-Private Const EARTH_RADIUS_M As Double = 6371000#
-Private Const PI As Double = 3.14159265358979
+' Diagnostic / debug mode.
+'   True  = after the run, print a group-size distribution, the largest group,
+'           the 10 accepted links with the greatest centroid distances, and a
+'           sanity check on the first valid parcel's computed size.
+'           Output goes to the Immediate window (Ctrl+G in the VBA editor)
+'           and a summary MsgBox.
+'   False = silent; only the final summary MsgBox is shown.
+Private Const DEBUG_MODE As Boolean = True
+
+' Unit-conversion and geometry constants.
+Private Const ACRES_TO_M2  As Double = 4046.86
+Private Const EARTH_RADIUS As Double = 6371000#
+Private Const PI           As Double = 3.14159265358979
+
+' Number of "longest accepted links" to report in debug mode.
+Private Const DEBUG_TOP_LINKS As Long = 10
 
 '===============================================================================
 ' Main entry point
@@ -53,17 +73,20 @@ Private Const PI As Double = 3.14159265358979
 Public Sub GroupParcels()
 
     ' -----------------------------------------------------------------------
-    ' STAGE 1: Collect runtime inputs — column picks and data-start row.
+    ' STAGE 1: Collect runtime inputs — data-start row, then column picks.
     ' -----------------------------------------------------------------------
 
-    Dim ws As Worksheet
-    Dim rPick As Range
-    Dim colID As Long, colLat As Long, colLon As Long
-    Dim colAcre As Long, colOut As Long
-    Dim dataStartRow As Long
-    Dim userInput As String
+    Dim ws         As Worksheet
+    Dim rPick      As Range
+    Dim colID      As Long
+    Dim colLat     As Long
+    Dim colLon     As Long
+    Dim colAcre    As Long
+    Dim colOut     As Long
+    Dim dataStart  As Long
+    Dim userInput  As String
 
-    ' Ask for the data-start row (default 2, meaning row 1 is the header).
+    ' Data-start row (default 2 → row 1 is the header).
     userInput = InputBox( _
         "Enter the row number where parcel DATA starts." & vbCrLf & _
         "(Row 1 is typically the header row, so data starts at row 2.)", _
@@ -76,9 +99,9 @@ Public Sub GroupParcels()
         MsgBox "Invalid row number. Macro cancelled.", vbExclamation, "GroupParcels"
         Exit Sub
     End If
-    dataStartRow = CLng(userInput)
+    dataStart = CLng(userInput)
 
-    ' Helper: pick a column by clicking any cell in it.
+    ' Column pickers — each uses Application.InputBox Type:=8 (range picker).
     On Error GoTo UserCancelled
 
     Set rPick = Application.InputBox( _
@@ -115,51 +138,46 @@ Public Sub GroupParcels()
     On Error GoTo 0
 
     ' -----------------------------------------------------------------------
-    ' STAGE 2: Determine the data extent.
+    ' STAGE 2: Determine the data extent on the chosen sheet.
     ' -----------------------------------------------------------------------
 
     Dim lastRow As Long
     lastRow = ws.Cells(ws.Rows.Count, colID).End(xlUp).Row
-    If lastRow < dataStartRow Then
-        MsgBox "No data rows found below row " & dataStartRow & ". Macro cancelled.", _
+    If lastRow < dataStart Then
+        MsgBox "No data rows found at or below row " & dataStart & ". Macro cancelled.", _
                vbExclamation, "GroupParcels"
         Exit Sub
     End If
 
     Dim nRows As Long
-    nRows = lastRow - dataStartRow + 1   ' total rows including potential blanks
+    nRows = lastRow - dataStart + 1
 
     ' -----------------------------------------------------------------------
-    ' STAGE 3: Read the entire used block into memory in one shot.
-    ' We read columns for ID, Lat, Lon, Acre individually (each as a 2-D
-    ' single-column array) to avoid pulling the whole sheet width.
+    ' STAGE 3: Read each needed column into memory in one Range.Value call.
+    ' Reading non-contiguous columns separately avoids pulling unused data.
     ' -----------------------------------------------------------------------
-
-    ' Find the widest column index we need to read; we'll read that column
-    ' plus potentially colOut+1 for the size column.  Since columns are
-    ' non-contiguous we read each column separately.
 
     Dim arrID()   As Variant
     Dim arrLat()  As Variant
     Dim arrLon()  As Variant
     Dim arrAcre() As Variant
 
-    arrID   = ws.Range(ws.Cells(dataStartRow, colID),   ws.Cells(lastRow, colID)).Value
-    arrLat  = ws.Range(ws.Cells(dataStartRow, colLat),  ws.Cells(lastRow, colLat)).Value
-    arrLon  = ws.Range(ws.Cells(dataStartRow, colLon),  ws.Cells(lastRow, colLon)).Value
-    arrAcre = ws.Range(ws.Cells(dataStartRow, colAcre), ws.Cells(lastRow, colAcre)).Value
+    arrID   = ws.Range(ws.Cells(dataStart, colID),   ws.Cells(lastRow, colID)).Value
+    arrLat  = ws.Range(ws.Cells(dataStart, colLat),  ws.Cells(lastRow, colLat)).Value
+    arrLon  = ws.Range(ws.Cells(dataStart, colLon),  ws.Cells(lastRow, colLon)).Value
+    arrAcre = ws.Range(ws.Cells(dataStart, colAcre), ws.Cells(lastRow, colAcre)).Value
 
     ' -----------------------------------------------------------------------
-    ' STAGE 4: Guard — check if the output column already has data.
+    ' STAGE 4: Guard — warn before overwriting the output column.
     ' -----------------------------------------------------------------------
 
-    Dim outColRange As Range
-    Set outColRange = ws.Range(ws.Cells(dataStartRow, colOut), ws.Cells(lastRow, colOut))
-    If Application.WorksheetFunction.CountA(outColRange) > 0 Then
+    Dim outRange As Range
+    Set outRange = ws.Range(ws.Cells(dataStart, colOut), ws.Cells(lastRow, colOut))
+    If Application.WorksheetFunction.CountA(outRange) > 0 Then
         Dim ans As VbMsgBoxResult
         ans = MsgBox( _
             "The selected output column already contains data in rows " & _
-            dataStartRow & ":" & lastRow & "." & vbCrLf & vbCrLf & _
+            dataStart & ":" & lastRow & "." & vbCrLf & vbCrLf & _
             "Do you want to OVERWRITE it?", _
             vbQuestion + vbYesNo, "Output Column Not Empty")
         If ans = vbNo Then
@@ -168,83 +186,94 @@ Public Sub GroupParcels()
         End If
     End If
 
-    ' Check the Group Size neighbour column.
-    Dim colSize As Long
-    colSize = colOut + 1
+    ' Decide on the Group Size neighbour column.
+    Dim colSize   As Long
     Dim writeSize As Boolean
+    colSize   = colOut + 1
     writeSize = WRITE_GROUP_SIZE
     If writeSize Then
-        Dim sizeColRange As Range
-        Set sizeColRange = ws.Range(ws.Cells(dataStartRow, colSize), ws.Cells(lastRow, colSize))
-        If Application.WorksheetFunction.CountA(sizeColRange) > 0 Then
-            MsgBox "WRITE_GROUP_SIZE is enabled, but column " & _
-                   ColLetter(colSize) & " already contains data. " & _
-                   "Group Size will NOT be written to avoid overwriting.", _
+        Dim sizeRange As Range
+        Set sizeRange = ws.Range(ws.Cells(dataStart, colSize), ws.Cells(lastRow, colSize))
+        If Application.WorksheetFunction.CountA(sizeRange) > 0 Then
+            MsgBox "WRITE_GROUP_SIZE is on, but column " & ColLetter(colSize) & _
+                   " already contains data — Group Size will NOT be written.", _
                    vbInformation, "GroupParcels"
             writeSize = False
         End If
     End If
 
     ' -----------------------------------------------------------------------
-    ' STAGE 5: Parse rows — validate and build working arrays.
+    ' STAGE 5: Validate rows and build in-memory working arrays.
     ' -----------------------------------------------------------------------
 
-    ' Working arrays (1-based, length nRows; valid rows only tracked via mask).
-    Dim lat()   As Double
-    Dim lon()   As Double
-    Dim halfExt() As Double   ' half-extent: s/2 for square, r for circle
-    Dim valid() As Boolean
-    Dim srcRow() As Long      ' maps working index -> original array row
+    Dim latArr()    As Double   ' valid parcels only
+    Dim lonArr()    As Double
+    Dim sizeArr()   As Double   ' equivalent "size" (half-side or radius per SHAPE_MODEL)
+    Dim srcRow()    As Long     ' maps valid index -> 1-based position in arrID/arrLat/…
 
-    ReDim lat(1 To nRows)
-    ReDim lon(1 To nRows)
-    ReDim halfExt(1 To nRows)
-    ReDim valid(1 To nRows)
+    ReDim latArr(1 To nRows)
+    ReDim lonArr(1 To nRows)
+    ReDim sizeArr(1 To nRows)
     ReDim srcRow(1 To nRows)
 
+    Dim n       As Long     ' count of valid parcels
     Dim skipped As Long
-    skipped = 0
-    Dim n As Long   ' count of valid parcels
-    n = 0
-
-    Dim i As Long
-    Dim latV As Double, lonV As Double, acreV As Double, areaM2 As Double
+    Dim i       As Long
+    Dim latV    As Double
+    Dim lonV    As Double
+    Dim acreV   As Double
+    Dim areaM2  As Double
+    Dim firstValid As Boolean
+    firstValid = False
 
     For i = 1 To nRows
-        ' Validate lat
+
+        ' --- Latitude ---
         If IsEmpty(arrLat(i, 1)) Or Not IsNumeric(arrLat(i, 1)) Then
             skipped = skipped + 1: GoTo NextRow
         End If
         latV = CDbl(arrLat(i, 1))
         If latV < -90 Or latV > 90 Then skipped = skipped + 1: GoTo NextRow
 
-        ' Validate lon
+        ' --- Longitude ---
         If IsEmpty(arrLon(i, 1)) Or Not IsNumeric(arrLon(i, 1)) Then
             skipped = skipped + 1: GoTo NextRow
         End If
         lonV = CDbl(arrLon(i, 1))
         If lonV < -180 Or lonV > 180 Then skipped = skipped + 1: GoTo NextRow
 
-        ' Validate acreage
+        ' --- Acreage ---
         If IsEmpty(arrAcre(i, 1)) Or Not IsNumeric(arrAcre(i, 1)) Then
             skipped = skipped + 1: GoTo NextRow
         End If
         acreV = CDbl(arrAcre(i, 1))
         If acreV <= 0 Then skipped = skipped + 1: GoTo NextRow
 
-        ' All good — store.
+        ' --- Store valid parcel ---
         n = n + 1
         srcRow(n) = i
-        lat(n) = latV
-        lon(n) = lonV
+        latArr(n) = latV
+        lonArr(n) = lonV
         areaM2 = acreV * ACRES_TO_M2
 
         Select Case LCase(Trim(SHAPE_MODEL))
             Case "circle"
-                halfExt(n) = Sqr(areaM2 / PI)       ' radius
-            Case Else                                 ' "square" (default)
-                halfExt(n) = Sqr(areaM2) / 2         ' half-side = s/2
+                sizeArr(n) = Sqr(areaM2 / PI)      ' radius
+            Case Else                               ' "square" (default)
+                sizeArr(n) = Sqr(areaM2)            ' full side length
         End Select
+
+        ' Sanity line for the first valid parcel (debug mode).
+        If DEBUG_MODE And Not firstValid Then
+            firstValid = True
+            Debug.Print "--- GroupParcels sanity check (first valid parcel) ---"
+            Debug.Print "  Parcel ID : " & CStr(arrID(i, 1))
+            Debug.Print "  Acreage   : " & acreV & " acres"
+            Debug.Print "  Area      : " & Format(areaM2, "#,##0.0") & " m²"
+            Debug.Print "  Size (s)  : " & Format(sizeArr(n), "#,##0.0") & " m  " & _
+                        "(expect ~100–1000 m for typical parcels; " & _
+                        "if >10,000 m, acreage column may not be in acres)"
+        End If
 
 NextRow:
     Next i
@@ -256,62 +285,103 @@ NextRow:
     End If
 
     ' -----------------------------------------------------------------------
-    ' STAGE 6: Initialise union-find structures.
-    '   ufParent(i) = root of set containing i  (path-compressed lazily)
-    '   ufSize(i)   = size of set rooted at i   (union by size)
+    ' STAGE 6: Initialise union-find.
+    '   ufParent(i) = root of the set that contains i  (path-compressed lazily)
+    '   ufRank(i)   = rank of tree rooted at i          (union by rank)
     ' -----------------------------------------------------------------------
 
     Dim ufParent() As Long
-    Dim ufSize() As Long
+    Dim ufRank()   As Long
     ReDim ufParent(1 To n)
-    ReDim ufSize(1 To n)
+    ReDim ufRank(1 To n)
 
     For i = 1 To n
         ufParent(i) = i
-        ufSize(i) = 1
+        ufRank(i)   = 0
     Next i
 
     ' -----------------------------------------------------------------------
-    ' STAGE 7: O(n²) adjacency pass — union adjacent parcels.
+    ' STAGE 7: O(n²) adjacency pass with in-memory union-find.
+    '
+    ' For DEBUG_MODE we also track the accepted links sorted by distance so
+    ' we can report the top-N longest ones (most likely chaining culprits).
     ' -----------------------------------------------------------------------
 
-    Dim j As Long
-    Dim dist As Double, threshold As Double
+    Dim j         As Long
+    Dim dist      As Double
+    Dim threshold As Double
+    Dim pairSize  As Double
+
+    ' Debug link tracking: parallel arrays for the top accepted links.
+    Dim dbgDist()    As Double   ' distance in metres
+    Dim dbgThresh()  As Double   ' threshold that accepted it
+    Dim dbgIdxA()    As Long     ' index into valid-parcel arrays
+    Dim dbgIdxB()    As Long
+    Dim dbgCount     As Long     ' how many links recorded so far
+    Dim dbgCap       As Long     ' capacity (grows as needed)
+
+    If DEBUG_MODE Then
+        dbgCap = 64
+        ReDim dbgDist(1 To dbgCap)
+        ReDim dbgThresh(1 To dbgCap)
+        ReDim dbgIdxA(1 To dbgCap)
+        ReDim dbgIdxB(1 To dbgCap)
+        dbgCount = 0
+    End If
 
     For i = 1 To n - 1
         For j = i + 1 To n
-            dist = HaversineMeters(lat(i), lon(i), lat(j), lon(j))
+            dist = HaversineMeters(latArr(i), lonArr(i), latArr(j), lonArr(j))
 
-            Select Case LCase(Trim(SHAPE_MODEL))
-                Case "circle"
-                    ' threshold = TOLERANCE * (r_i + r_j)
-                    threshold = TOLERANCE * (halfExt(i) + halfExt(j))
-                Case Else
-                    ' threshold = TOLERANCE * (s_i/2 + s_j/2)
-                    threshold = TOLERANCE * (halfExt(i) + halfExt(j))
+            ' Compute PAIR_SIZE according to PAIR_RULE.
+            Select Case LCase(Trim(PAIR_RULE))
+                Case "avg"
+                    pairSize = (sizeArr(i) + sizeArr(j)) / 2
+                Case Else   ' "min" (default)
+                    If sizeArr(i) < sizeArr(j) Then
+                        pairSize = sizeArr(i)
+                    Else
+                        pairSize = sizeArr(j)
+                    End If
             End Select
 
+            threshold = TOLERANCE * pairSize
+
             If dist <= threshold Then
-                Call UnionSets(ufParent, ufSize, i, j)
+                Call UnionSets(ufParent, ufRank, i, j)
+
+                ' Record link for debug reporting.
+                If DEBUG_MODE Then
+                    dbgCount = dbgCount + 1
+                    If dbgCount > dbgCap Then
+                        dbgCap = dbgCap * 2
+                        ReDim Preserve dbgDist(1 To dbgCap)
+                        ReDim Preserve dbgThresh(1 To dbgCap)
+                        ReDim Preserve dbgIdxA(1 To dbgCap)
+                        ReDim Preserve dbgIdxB(1 To dbgCap)
+                    End If
+                    dbgDist(dbgCount)   = dist
+                    dbgThresh(dbgCount) = threshold
+                    dbgIdxA(dbgCount)   = i
+                    dbgIdxB(dbgCount)   = j
+                End If
             End If
         Next j
     Next i
 
     ' -----------------------------------------------------------------------
-    ' STAGE 8: Assign sequential group IDs and compute group sizes.
+    ' STAGE 8: Assign sequential group IDs and tally sizes.
     ' -----------------------------------------------------------------------
 
-    ' Map each root -> sequential group number (1, 2, 3, ...).
-    Dim rootToGroup() As Long
-    ReDim rootToGroup(1 To n)   ' sparse; index is root index
+    Dim rootToGroup() As Long   ' rootToGroup(root) = group number (1-based)
+    Dim groupID()     As Long   ' groupID(i) = group number for valid parcel i
+    ReDim rootToGroup(1 To n)
+    ReDim groupID(1 To n)
 
     Dim groupCount As Long
     groupCount = 0
-
-    Dim groupID() As Long     ' groupID(i) = group number for valid parcel i
-    ReDim groupID(1 To n)
-
     Dim root As Long
+
     For i = 1 To n
         root = FindRoot(ufParent, i)
         If rootToGroup(root) = 0 Then
@@ -321,71 +391,217 @@ NextRow:
         groupID(i) = rootToGroup(root)
     Next i
 
-    ' Tally group sizes.
     Dim groupSizes() As Long
     ReDim groupSizes(1 To groupCount)
+    Dim g As Long
     For i = 1 To n
         groupSizes(groupID(i)) = groupSizes(groupID(i)) + 1
     Next i
 
-    Dim maxGroupSize As Long
-    maxGroupSize = 0
-    Dim g As Long
+    Dim maxSize  As Long
+    Dim maxGrpID As Long
     For g = 1 To groupCount
-        If groupSizes(g) > maxGroupSize Then maxGroupSize = groupSizes(g)
+        If groupSizes(g) > maxSize Then
+            maxSize  = groupSizes(g)
+            maxGrpID = g
+        End If
     Next g
 
     ' -----------------------------------------------------------------------
-    ' STAGE 9: Build output arrays and write back in one operation.
+    ' STAGE 9: Build output arrays and write back in one shot.
     ' -----------------------------------------------------------------------
 
-    ' Output arrays span all nRows (including skipped); skipped rows get "".
     Dim outGrp()  As Variant
-    Dim outSize() As Variant
+    Dim outSz()   As Variant
     ReDim outGrp(1 To nRows, 1 To 1)
-    If writeSize Then ReDim outSize(1 To nRows, 1 To 1)
+    If writeSize Then ReDim outSz(1 To nRows, 1 To 1)
 
-    ' Initialise with empty string (skipped rows stay blank).
     For i = 1 To nRows
         outGrp(i, 1) = ""
-        If writeSize Then outSize(i, 1) = ""
+        If writeSize Then outSz(i, 1) = ""
     Next i
 
     For i = 1 To n
-        outGrp(srcRow(i), 1)  = "GRP-" & Format(groupID(i), "0000")
-        If writeSize Then outSize(srcRow(i), 1) = groupSizes(groupID(i))
+        outGrp(srcRow(i), 1) = "GRP-" & Format(groupID(i), "0000")
+        If writeSize Then outSz(srcRow(i), 1) = groupSizes(groupID(i))
     Next i
 
-    ' Write Group ID column.
-    ws.Range(ws.Cells(dataStartRow, colOut), ws.Cells(lastRow, colOut)).Value = outGrp
-
-    ' Write Group Size column if enabled and safe.
+    ws.Range(ws.Cells(dataStart, colOut), ws.Cells(lastRow, colOut)).Value = outGrp
     If writeSize Then
-        ws.Range(ws.Cells(dataStartRow, colSize), ws.Cells(lastRow, colSize)).Value = outSize
+        ws.Range(ws.Cells(dataStart, colSize), ws.Cells(lastRow, colSize)).Value = outSz
     End If
 
-    ' Write headers on header row (row dataStartRow - 1) if that row exists.
-    Dim headerRow As Long
-    headerRow = dataStartRow - 1
-    If headerRow >= 1 Then
-        If Trim(CStr(ws.Cells(headerRow, colOut).Value)) = "" Then
-            ws.Cells(headerRow, colOut).Value = "Group ID"
+    ' Write headers if the row above dataStart exists and is blank.
+    Dim hdrRow As Long
+    hdrRow = dataStart - 1
+    If hdrRow >= 1 Then
+        If Trim(CStr(ws.Cells(hdrRow, colOut).Value)) = "" Then
+            ws.Cells(hdrRow, colOut).Value = "Group ID"
         End If
         If writeSize Then
-            If Trim(CStr(ws.Cells(headerRow, colSize).Value)) = "" Then
-                ws.Cells(headerRow, colSize).Value = "Group Size"
+            If Trim(CStr(ws.Cells(hdrRow, colSize).Value)) = "" Then
+                ws.Cells(hdrRow, colSize).Value = "Group Size"
             End If
         End If
     End If
 
     ' -----------------------------------------------------------------------
-    ' STAGE 10: Summary report.
+    ' STAGE 10: Debug report (when DEBUG_MODE = True).
+    ' -----------------------------------------------------------------------
+
+    Dim debugMsg As String
+    debugMsg = ""
+
+    If DEBUG_MODE Then
+
+        ' -- Group-size distribution --
+        Dim b1 As Long, b2 As Long, b3 As Long, b4 As Long, b5 As Long
+        For g = 1 To groupCount
+            Select Case groupSizes(g)
+                Case 1:             b1 = b1 + 1
+                Case 2 To 5:        b2 = b2 + 1
+                Case 6 To 20:       b3 = b3 + 1
+                Case 21 To 100:     b4 = b4 + 1
+                Case Else:          b5 = b5 + 1
+            End Select
+        Next g
+
+        Debug.Print ""
+        Debug.Print "=== GroupParcels debug report ==="
+        Debug.Print "Parcels: " & n & "  |  Groups: " & groupCount & _
+                    "  |  Skipped: " & skipped
+        Debug.Print "Tolerance: " & TOLERANCE & "  |  PairRule: " & PAIR_RULE & _
+                    "  |  ShapeModel: " & SHAPE_MODEL
+        Debug.Print ""
+        Debug.Print "Group-size distribution:"
+        Debug.Print "  Size 1        : " & b1
+        Debug.Print "  Size 2–5      : " & b2
+        Debug.Print "  Size 6–20     : " & b3
+        Debug.Print "  Size 21–100   : " & b4
+        Debug.Print "  Size 101+     : " & b5
+        Debug.Print ""
+        Debug.Print "Largest group   : GRP-" & Format(maxGrpID, "0000") & _
+                    "  (" & maxSize & " parcels)"
+
+        debugMsg = "Group-size distribution:" & vbCrLf & _
+                   "  1       : " & b1 & vbCrLf & _
+                   "  2–5     : " & b2 & vbCrLf & _
+                   "  6–20    : " & b3 & vbCrLf & _
+                   "  21–100  : " & b4 & vbCrLf & _
+                   "  101+    : " & b5 & vbCrLf & vbCrLf & _
+                   "Largest group: GRP-" & Format(maxGrpID, "0000") & _
+                   " (" & maxSize & " parcels)"
+
+        ' -- Top accepted links by distance (insertion-sort into a small array) --
+        If dbgCount > 0 Then
+            Dim topN    As Long
+            topN = DEBUG_TOP_LINKS
+            If dbgCount < topN Then topN = dbgCount
+
+            ' Partial selection sort to find the topN largest distances.
+            Dim sortDist()   As Double
+            Dim sortThresh() As Double
+            Dim sortA()      As Long
+            Dim sortB()      As Long
+            ReDim sortDist(1 To topN)
+            ReDim sortThresh(1 To topN)
+            ReDim sortA(1 To topN)
+            ReDim sortB(1 To topN)
+
+            Dim k As Long, minPos As Long, minVal As Double
+            ' Fill first topN slots.
+            For k = 1 To topN
+                sortDist(k)   = dbgDist(k)
+                sortThresh(k) = dbgThresh(k)
+                sortA(k)      = dbgIdxA(k)
+                sortB(k)      = dbgIdxB(k)
+            Next k
+            ' Sort those topN descending by distance (selection sort — small N).
+            Dim p As Long, q As Long
+            Dim tmpD As Double, tmpT As Double, tmpA As Long, tmpB As Long
+            For p = 1 To topN - 1
+                Dim maxPos As Long
+                maxPos = p
+                For q = p + 1 To topN
+                    If sortDist(q) > sortDist(maxPos) Then maxPos = q
+                Next q
+                If maxPos <> p Then
+                    tmpD = sortDist(p): sortDist(p) = sortDist(maxPos): sortDist(maxPos) = tmpD
+                    tmpT = sortThresh(p): sortThresh(p) = sortThresh(maxPos): sortThresh(maxPos) = tmpT
+                    tmpA = sortA(p): sortA(p) = sortA(maxPos): sortA(maxPos) = tmpA
+                    tmpB = sortB(p): sortB(p) = sortB(maxPos): sortB(maxPos) = tmpB
+                End If
+            Next p
+            ' Now scan remaining links, replacing the minimum in our top-N list if larger.
+            For k = topN + 1 To dbgCount
+                minPos = 1
+                minVal = sortDist(1)
+                For p = 2 To topN
+                    If sortDist(p) < minVal Then minVal = sortDist(p): minPos = p
+                Next p
+                If dbgDist(k) > minVal Then
+                    sortDist(minPos)   = dbgDist(k)
+                    sortThresh(minPos) = dbgThresh(k)
+                    sortA(minPos)      = dbgIdxA(k)
+                    sortB(minPos)      = dbgIdxB(k)
+                End If
+            Next k
+            ' Final sort descending.
+            For p = 1 To topN - 1
+                maxPos = p
+                For q = p + 1 To topN
+                    If sortDist(q) > sortDist(maxPos) Then maxPos = q
+                Next q
+                If maxPos <> p Then
+                    tmpD = sortDist(p): sortDist(p) = sortDist(maxPos): sortDist(maxPos) = tmpD
+                    tmpT = sortThresh(p): sortThresh(p) = sortThresh(maxPos): sortThresh(maxPos) = tmpT
+                    tmpA = sortA(p): sortA(p) = sortA(maxPos): sortA(maxPos) = tmpA
+                    tmpB = sortB(p): sortB(p) = sortB(maxPos): sortB(maxPos) = tmpB
+                End If
+            Next p
+
+            Debug.Print ""
+            Debug.Print "Top " & topN & " accepted links by distance " & _
+                        "(these are the most likely chaining culprits):"
+            Debug.Print "  " & PadR("ParcelA", 20) & PadR("ParcelB", 20) & _
+                        PadL("Dist(m)", 10) & PadL("Thresh(m)", 12) & _
+                        PadL("sA(m)", 10) & PadL("sB(m)", 10)
+
+            Dim linkLine As String
+            For k = 1 To topN
+                Dim idxA As Long, idxB As Long
+                idxA = sortA(k)
+                idxB = sortB(k)
+                linkLine = "  " & _
+                    PadR(CStr(arrID(srcRow(idxA), 1)), 20) & _
+                    PadR(CStr(arrID(srcRow(idxB), 1)), 20) & _
+                    PadL(Format(sortDist(k), "#,##0.0"), 10) & _
+                    PadL(Format(sortThresh(k), "#,##0.0"), 12) & _
+                    PadL(Format(sizeArr(idxA), "#,##0.0"), 10) & _
+                    PadL(Format(sizeArr(idxB), "#,##0.0"), 10)
+                Debug.Print linkLine
+            Next k
+
+            debugMsg = debugMsg & vbCrLf & vbCrLf & _
+                       "Top " & topN & " longest accepted links printed" & vbCrLf & _
+                       "to the Immediate window (Ctrl+G in the VBA editor)." & vbCrLf & _
+                       "If groups look too large, those links are the first" & vbCrLf & _
+                       "place to look — try lowering TOLERANCE or switching" & vbCrLf & _
+                       "PAIR_RULE from ""avg"" to ""min""."
+        End If
+
+        Debug.Print "==================================="
+        MsgBox debugMsg, vbInformation, "GroupParcels — Debug Report"
+    End If
+
+    ' -----------------------------------------------------------------------
+    ' STAGE 11: Final summary.
     ' -----------------------------------------------------------------------
 
     MsgBox "GroupParcels complete." & vbCrLf & vbCrLf & _
            "  Parcels processed : " & n & vbCrLf & _
            "  Groups formed     : " & groupCount & vbCrLf & _
-           "  Largest group     : " & maxGroupSize & " parcel(s)" & vbCrLf & _
+           "  Largest group     : " & maxSize & " parcel(s)  (GRP-" & Format(maxGrpID, "0000") & ")" & vbCrLf & _
            "  Rows skipped      : " & skipped & " (bad / missing data)" & vbCrLf & vbCrLf & _
            "Results written to column " & ColLetter(colOut) & _
            IIf(writeSize, " (Group ID) and " & ColLetter(colSize) & " (Group Size).", "."), _
@@ -394,7 +610,7 @@ NextRow:
     Exit Sub
 
 ' -----------------------------------------------------------------------
-' Error handlers
+' Error / cancel handlers
 ' -----------------------------------------------------------------------
 UserCancelled:
     MsgBox "Column selection cancelled. Macro aborted.", vbInformation, "GroupParcels"
@@ -415,7 +631,7 @@ End Sub
 Public Function HaversineMeters(lat1 As Double, lon1 As Double, _
                                  lat2 As Double, lon2 As Double) As Double
     Dim dLat As Double, dLon As Double
-    Dim a As Double, c As Double
+    Dim a    As Double, c    As Double
 
     dLat = (lat2 - lat1) * PI / 180#
     dLon = (lon2 - lon1) * PI / 180#
@@ -423,62 +639,89 @@ Public Function HaversineMeters(lat1 As Double, lon1 As Double, _
     a = Sin(dLat / 2) ^ 2 + _
         Cos(lat1 * PI / 180#) * Cos(lat2 * PI / 180#) * Sin(dLon / 2) ^ 2
 
-    c = 2 * Atn(Sqr(a) / Sqr(1 - a))   ' atan2 equivalent: 2*atan2(sqrt(a),sqrt(1-a))
+    ' atan2(sqrt(a), sqrt(1-a)) via Atn — avoids domain error when a ≈ 0.
+    c = 2# * Atn(Sqr(a) / Sqr(1# - a))
 
-    HaversineMeters = EARTH_RADIUS_M * c
+    HaversineMeters = EARTH_RADIUS * c
 End Function
 
 '===============================================================================
-' Union-Find: Find root with path compression (iterative)
+' Union-Find: Find root with iterative path compression
 '===============================================================================
 Private Function FindRoot(ufParent() As Long, ByVal x As Long) As Long
-    ' Walk to the root.
     Dim root As Long
+    Dim nxt  As Long
+
+    ' Walk to root.
     root = x
     Do While ufParent(root) <> root
         root = ufParent(root)
     Loop
-    ' Path compression — point every node on the path directly to root.
-    Dim nxt As Long
+
+    ' Path compression — flatten every node on the path directly to root.
     Do While ufParent(x) <> root
-        nxt = ufParent(x)
+        nxt         = ufParent(x)
         ufParent(x) = root
-        x = nxt
+        x           = nxt
     Loop
+
     FindRoot = root
 End Function
 
 '===============================================================================
-' Union-Find: Union by size — attach smaller tree under larger
+' Union-Find: Union by rank — keeps trees shallow
 '===============================================================================
-Private Sub UnionSets(ufParent() As Long, ufSize() As Long, _
+Private Sub UnionSets(ufParent() As Long, ufRank() As Long, _
                        ByVal a As Long, ByVal b As Long)
-    Dim rootA As Long, rootB As Long
-    rootA = FindRoot(ufParent, a)
-    rootB = FindRoot(ufParent, b)
-    If rootA = rootB Then Exit Sub   ' already in the same set
+    Dim rA As Long, rB As Long
+    rA = FindRoot(ufParent, a)
+    rB = FindRoot(ufParent, b)
+    If rA = rB Then Exit Sub
 
-    ' Merge smaller into larger.
-    If ufSize(rootA) < ufSize(rootB) Then
-        ufParent(rootA) = rootB
-        ufSize(rootB) = ufSize(rootB) + ufSize(rootA)
+    ' Attach lower-rank tree under higher-rank root.
+    If ufRank(rA) < ufRank(rB) Then
+        ufParent(rA) = rB
+    ElseIf ufRank(rA) > ufRank(rB) Then
+        ufParent(rB) = rA
     Else
-        ufParent(rootB) = rootA
-        ufSize(rootA) = ufSize(rootA) + ufSize(rootB)
+        ufParent(rB) = rA
+        ufRank(rA)   = ufRank(rA) + 1
     End If
 End Sub
 
 '===============================================================================
-' Utility: convert a 1-based column number to its letter(s) (e.g. 28 -> "AB")
+' Utility: 1-based column number -> column letter(s)  (e.g. 28 -> "AB")
 '===============================================================================
-Private Function ColLetter(ByVal colNum As Long) As String
+Private Function ColLetter(ByVal c As Long) As String
     Dim s As String
     s = ""
-    Do While colNum > 0
-        Dim rem As Long
-        rem = (colNum - 1) Mod 26
-        s = Chr(65 + rem) & s
-        colNum = (colNum - 1 - rem) \ 26
+    Do While c > 0
+        Dim r As Long
+        r = (c - 1) Mod 26
+        s = Chr(65 + r) & s
+        c = (c - 1 - r) \ 26
     Loop
     ColLetter = s
+End Function
+
+'===============================================================================
+' Utility: right-pad a string to width w (for Immediate-window table alignment)
+'===============================================================================
+Private Function PadR(ByVal s As String, ByVal w As Long) As String
+    If Len(s) >= w Then
+        PadR = Left(s, w)
+    Else
+        PadR = s & Space(w - Len(s))
+    End If
+End Function
+
+'===============================================================================
+' Utility: left-pad a string to width w
+'===============================================================================
+Private Function PadL(ByVal s As String, ByVal w As Long) As String
+    If Len(s) >= w Then
+        PadL = Left(s, w)
+    Else
+        PadL = Space(w - Len(s)) & s
+    End If
 End Function
