@@ -36,12 +36,16 @@ Private Const REACH_MILES As Double = 2#
 Private Const TOLERANCE As Double = 1.0
 
 ' How to derive PAIR_BASE from the two parcels' half-extents (he1, he2).
-'   "min" — 2 × Min(he1, he2):  a large parcel cannot reach out and grab
-'            distant small ones; the smaller parcel's footprint governs.
-'            DEFAULT — best protection against runaway assemblages.
-'   "sum" — he1 + he2:          classic symmetric formula; more permissive
-'            when parcel sizes vary widely.
-Private Const PAIR_RULE As String = "min"
+'   "sum" — he1 + he2:  PAIR_BASE equals the centroid-to-centroid distance
+'            between two parcels that share an edge, regardless of their
+'            relative sizes. Two parcels that are truly edge-adjacent will
+'            always satisfy dist <= TOLERANCE * (he1+he2) at TOLERANCE=1.0.
+'            DEFAULT — connects mixed-size neighbours correctly.
+'   "min" — 2 × Min(he1, he2):  stricter; only links similarly-sized
+'            neighbours. Use only if you see runaway over-merging. It
+'            under-connects parcel sets where sizes vary widely, so it
+'            is not the default.
+Private Const PAIR_RULE As String = "sum"
 
 ' Shape model used to derive each parcel's half-extent from its acreage.
 '   "square" — half-extent = Sqrt(area_m2) / 2   (half-side of equiv. square)
