@@ -1,15 +1,15 @@
 Attribute VB_Name = "ParcelCoreFlag"
 '===============================================================================
 ' ParcelCoreFlag.bas
-' Flags each parcel 1 (core/interior) or 0 based on two conditions:
-'   (a) the parcel has at least one contiguous neighbor in each of N, S, E, W;
+' Flags each parcel 1 (core) or 0 based on two conditions:
+'   (a) the parcel has at least one contiguous neighbor (its block has >1 parcel);
 '   (b) the parcel's connected block totals >= MIN_BLOCK_ACRES.
 ' Rows with bad data receive a blank rather than a 0.
 '
-' CAVEAT: centroid + acreage only approximates contiguity and direction. It
-' assumes parcels are reasonably compact and near-square. Long, thin, or
-' irregular parcels can misclassify. True adjacency and direction require
-' actual parcel polygons (GIS). This is a fast screen, not ground truth.
+' CAVEAT: centroid + acreage only approximates contiguity. It assumes parcels
+' are reasonably compact and near-square. Long, thin, or irregular parcels can
+' misclassify. True adjacency requires actual parcel polygons (GIS). This is a
+' fast screen, not ground truth.
 '
 ' HOW TO IMPORT AND RUN:
 '   1. Press Alt+F11, right-click workbook > Import File > select this .bas.
@@ -42,13 +42,6 @@ Private Const DEBUG_MODE As Boolean = True
 Private Const ACRES_TO_M2  As Double = 4046.86
 Private Const EARTH_RADIUS As Double = 6371000#
 Private Const PI           As Double = 3.14159265358979
-
-' Cardinal-direction bitmasks packed into one Long per parcel.
-Private Const DIR_NORTH As Long = 1
-Private Const DIR_SOUTH As Long = 2
-Private Const DIR_EAST  As Long = 4
-Private Const DIR_WEST  As Long = 8
-Private Const DIR_ALL   As Long = 15   ' N OR S OR E OR W = all four
 
 '===============================================================================
 ' Main entry point
@@ -238,113 +231,72 @@ NextRow:
     End If
 
     ' -----------------------------------------------------------------------
-    ' STAGE 6: Initialise union-find and direction-coverage arrays.
+    ' STAGE 6: Initialise union-find for connected blocks.
     '
-    ' ufParent(i) / ufRank(i) — standard union-find for connected blocks.
-    ' dirBits(i)  — bitmask of the cardinal directions covered by parcel i's
-    '               contiguous neighbours. Set per-bit during Stage 7 and
-    '               tested in Stage 9: (dirBits(i) AND DIR_ALL) = DIR_ALL
-    '               means all four cardinals are covered.
+    ' ufParent(i) / ufRank(i) — standard union-find. Parcels linked by the
+    ' contiguity test in Stage 7 are merged into the same block.
     ' -----------------------------------------------------------------------
 
     Dim ufParent() As Long
     Dim ufRank()   As Long
-    Dim dirBits()  As Long
     ReDim ufParent(1 To n)
     ReDim ufRank(1 To n)
-    ReDim dirBits(1 To n)
 
     Dim i As Long, j As Long
     For i = 1 To n
         ufParent(i) = i
         ufRank(i)   = 0
-        dirBits(i)  = 0
     Next i
 
     ' -----------------------------------------------------------------------
-    ' STAGE 7: O(n²) contiguity pass — merge blocks and accumulate directions.
+    ' STAGE 7: O(n²) contiguity pass — merge blocks for every touching pair.
     '
-    ' For each ordered pair (i, j) with j > i:
-    '   1. Compute the Haversine centroid-to-centroid distance.
-    '   2. If dist <= TOLERANCE * (he_i + he_j), the parcels are contiguous:
-    '        • Merge their connected blocks with UnionSets.
-    '        • Compute the north-south and east-west offsets in metres:
-    '            ns_m = (latJ - latI) * 111320
-    '            ew_m = (lonJ - lonI) * 111320 * cos(latI)
-    '          The larger-magnitude axis determines whether j lies to the
-    '          N/S or E/W of i (±45° quadrant rule). Both i's and j's
-    '          dirBits are updated — i sees j in some direction, j sees i
-    '          in the opposite direction.
-    '
-    ' cosLatI is precomputed outside the inner loop to avoid repeating the
-    ' trig call n times for the same parcel i.
+    ' Parcels i and j are contiguous when their centroid distance is
+    ' <= TOLERANCE * (he_i + he_j). Each such pair is merged with UnionSets.
+    ' Condition (a), "has at least one neighbor," is captured implicitly:
+    ' a parcel that is never merged with anyone stays a block of one.
     ' -----------------------------------------------------------------------
 
-    Dim dist    As Double
-    Dim ns_m    As Double, ew_m As Double
-    Dim cosLatI As Double
+    Dim dist As Double
 
     For i = 1 To n - 1
-        cosLatI = Cos(latArr(i) * PI / 180#)
-
         For j = i + 1 To n
             dist = HaversineMeters(latArr(i), lonArr(i), latArr(j), lonArr(j))
-
             If dist <= TOLERANCE * (heArr(i) + heArr(j)) Then
-                ' Merge the two parcels into one connected block.
                 Call UnionSets(ufParent, ufRank, i, j)
-
-                ' Determine which cardinal direction j lies in from i.
-                ns_m = (latArr(j) - latArr(i)) * 111320#
-                ew_m = (lonArr(j) - lonArr(i)) * 111320# * cosLatI
-
-                If Abs(ns_m) >= Abs(ew_m) Then
-                    ' North-South is the dominant axis.
-                    If ns_m >= 0# Then
-                        dirBits(i) = dirBits(i) Or DIR_NORTH   ' j is north of i
-                        dirBits(j) = dirBits(j) Or DIR_SOUTH   ' i is south of j
-                    Else
-                        dirBits(i) = dirBits(i) Or DIR_SOUTH   ' j is south of i
-                        dirBits(j) = dirBits(j) Or DIR_NORTH   ' i is north of j
-                    End If
-                Else
-                    ' East-West is the dominant axis.
-                    If ew_m >= 0# Then
-                        dirBits(i) = dirBits(i) Or DIR_EAST    ' j is east of i
-                        dirBits(j) = dirBits(j) Or DIR_WEST    ' i is west of j
-                    Else
-                        dirBits(i) = dirBits(i) Or DIR_WEST    ' j is west of i
-                        dirBits(j) = dirBits(j) Or DIR_EAST    ' i is east of j
-                    End If
-                End If
             End If
         Next j
     Next i
 
     ' -----------------------------------------------------------------------
-    ' STAGE 8: Compute connected-block acreage totals.
+    ' STAGE 8: One-pass block tallies — acreage total and member count.
     '
     ' After all unions are complete, walk every valid parcel, find its root,
-    ' and accumulate its acreage into rootAcres(root). This is the one-pass
-    ' efficient method — O(n) after the O(n²) contiguity pass above.
-    ' Each parcel's block total is then rootAcres(FindRoot(ufParent, i)).
+    ' and accumulate into that root's acreage total and member count.
+    '   rootAcres(root) = total acreage of the block  (condition b)
+    '   rootCount(root) = number of parcels in the block (condition a:
+    '                     >1 means the parcel has at least one neighbor)
+    ' This is O(n) after the O(n²) contiguity pass — no per-parcel re-search.
     ' -----------------------------------------------------------------------
 
     Dim rootAcres() As Double
-    ReDim rootAcres(1 To n)   ' sparse: only entries at root indices matter
+    Dim rootCount() As Long
+    ReDim rootAcres(1 To n)   ' sparse: only root indices are meaningful
+    ReDim rootCount(1 To n)
 
     Dim r As Long
     For i = 1 To n
         r = FindRoot(ufParent, i)
         rootAcres(r) = rootAcres(r) + acreArr(i)
+        rootCount(r) = rootCount(r) + 1
     Next i
 
     ' -----------------------------------------------------------------------
     ' STAGE 9: Assign 1/0 flags.
     '
     ' Parcel i gets 1 if and only if both conditions hold:
-    '   (a) (dirBits(i) AND DIR_ALL) = DIR_ALL  — N, S, E, W all covered
-    '   (b) rootAcres(FindRoot(i)) >= MIN_BLOCK_ACRES
+    '   (a) rootCount(root) > 1              — has at least one contiguous neighbor
+    '   (b) rootAcres(root) >= MIN_BLOCK_ACRES
     ' -----------------------------------------------------------------------
 
     Dim flagArr() As Long
@@ -357,8 +309,7 @@ NextRow:
         r = FindRoot(ufParent, i)
         If rootAcres(r) > maxBlockAcres Then maxBlockAcres = rootAcres(r)
 
-        If (dirBits(i) And DIR_ALL) = DIR_ALL And _
-           rootAcres(r) >= MIN_BLOCK_ACRES Then
+        If rootCount(r) > 1 And rootAcres(r) >= MIN_BLOCK_ACRES Then
             flagArr(i) = 1
             oneCount   = oneCount + 1
         Else
@@ -400,16 +351,10 @@ NextRow:
     ' -----------------------------------------------------------------------
 
     If DEBUG_MODE Then
-        ' Count distinct connected blocks.
-        Dim blockSeen() As Boolean
-        ReDim blockSeen(1 To n)
+        ' Count distinct connected blocks (each unique root = one block).
         Dim blockCount As Long
         For i = 1 To n
-            r = FindRoot(ufParent, i)
-            If Not blockSeen(r) Then
-                blockSeen(r) = True
-                blockCount   = blockCount + 1
-            End If
+            If FindRoot(ufParent, i) = i Then blockCount = blockCount + 1
         Next i
 
         Debug.Print ""
