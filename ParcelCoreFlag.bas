@@ -33,6 +33,14 @@ Private Const MIN_BLOCK_ACRES As Double = 1000#
 '         that distance. Raise toward 1.2–1.4 to also catch near-misses.
 Private Const TOLERANCE As Double = 1.0
 
+' Only consider visible (non-filtered-out) rows?
+'   True  = ignore any row currently hidden (by AutoFilter or manually);
+'           hidden rows are excluded entirely — they cannot be a neighbor
+'           and do not count toward any block's acreage. Excluded rows get
+'           a blank output cell (not 0), same as bad-data rows.
+'   False = use every data row regardless of visibility.
+Private Const RESPECT_FILTER As Boolean = True
+
 ' Print diagnostics to the Immediate window after the run?
 Private Const DEBUG_MODE As Boolean = True
 
@@ -177,13 +185,22 @@ Public Sub FlagCoreParcels()
     ReDim heArr(1 To nRows)
     ReDim srcRow(1 To nRows)
 
-    Dim n       As Long
-    Dim skipped As Long
-    Dim k       As Long
+    Dim n        As Long
+    Dim skipped  As Long
+    Dim excluded As Long   ' rows dropped because they're filtered-out / hidden
+    Dim k        As Long
     Dim latV    As Double, lonV As Double, acreV As Double, areaM2 As Double
     Dim firstOK As Boolean
 
     For k = 1 To nRows
+
+        ' Exclude filtered-out / hidden rows entirely when RESPECT_FILTER is on.
+        ' The row's actual sheet position is dataStart + k - 1.
+        If RESPECT_FILTER Then
+            If ws.Rows(dataStart + k - 1).Hidden Then
+                excluded = excluded + 1: GoTo NextRow
+            End If
+        End If
 
         If IsEmpty(arrLat(k, 1)) Or Not IsNumeric(arrLat(k, 1)) Then
             skipped = skipped + 1: GoTo NextRow
@@ -361,7 +378,8 @@ NextRow:
         Debug.Print "=== FlagCoreParcels debug report ==="
         Debug.Print "Settings: MIN_BLOCK_ACRES=" & MIN_BLOCK_ACRES & _
                     "  TOLERANCE=" & TOLERANCE
-        Debug.Print "Valid parcels      : " & n & "  |  Skipped: " & skipped
+        Debug.Print "Valid parcels      : " & n & "  |  Skipped (bad data): " & skipped & _
+                    "  |  Excluded (filtered/hidden): " & excluded
         Debug.Print "Flagged 1 (core)   : " & oneCount
         Debug.Print "Flagged 0          : " & zeroCount
         Debug.Print "Connected blocks   : " & blockCount
