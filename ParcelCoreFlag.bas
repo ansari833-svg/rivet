@@ -33,13 +33,8 @@ Private Const MIN_BLOCK_ACRES As Double = 1000#
 '         that distance. Raise toward 1.2–1.4 to also catch near-misses.
 Private Const TOLERANCE As Double = 1.0
 
-' Only consider visible (non-filtered-out) rows?
-'   True  = ignore any row currently hidden (by AutoFilter or manually);
-'           hidden rows are excluded entirely — they cannot be a neighbor
-'           and do not count toward any block's acreage. Excluded rows get
-'           a blank output cell (not 0), same as bad-data rows.
-'   False = use every data row regardless of visibility.
-Private Const RESPECT_FILTER As Boolean = True
+' NOTE: filter-respect is chosen at runtime (Yes/No/Cancel prompt after the
+' column picks), not via a Const — see the local variable respectFilter below.
 
 ' Print diagnostics to the Immediate window after the run?
 Private Const DEBUG_MODE As Boolean = True
@@ -115,6 +110,30 @@ Public Sub FlagCoreParcels()
     colOut = rPick.Column
 
     On Error GoTo 0
+
+    ' -----------------------------------------------------------------------
+    ' STAGE 1b: Ask at runtime whether to respect the sheet's filter.
+    '   Yes    = respect the filter — skip hidden/filtered-out rows.
+    '   No     = include every data row regardless of visibility.
+    '   Cancel = quit.
+    ' The answer drives respectFilter for the rest of the run.
+    ' -----------------------------------------------------------------------
+
+    Dim respectFilter As Boolean
+    Dim filterAns     As VbMsgBoxResult
+    filterAns = MsgBox( _
+        "Only include currently visible (filtered) rows?" & vbCrLf & vbCrLf & _
+        "Yes = respect the filter and skip hidden rows" & vbCrLf & _
+        "No = include every row regardless of the filter" & vbCrLf & _
+        "Cancel = quit", _
+        vbQuestion + vbYesNoCancel, "Respect Filter?")
+    Select Case filterAns
+        Case vbYes:    respectFilter = True
+        Case vbNo:     respectFilter = False
+        Case Else
+            MsgBox "Cancelled.", vbInformation, "FlagCoreParcels"
+            Exit Sub
+    End Select
 
     ' -----------------------------------------------------------------------
     ' STAGE 2: Determine the data extent on the chosen sheet.
@@ -194,9 +213,9 @@ Public Sub FlagCoreParcels()
 
     For k = 1 To nRows
 
-        ' Exclude filtered-out / hidden rows entirely when RESPECT_FILTER is on.
+        ' Exclude filtered-out / hidden rows entirely when respectFilter is on.
         ' The row's actual sheet position is dataStart + k - 1.
-        If RESPECT_FILTER Then
+        If respectFilter Then
             If ws.Rows(dataStart + k - 1).Hidden Then
                 excluded = excluded + 1: GoTo NextRow
             End If
