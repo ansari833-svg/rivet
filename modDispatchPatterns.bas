@@ -77,49 +77,32 @@ Private mLogOrder As Collection        ' preserves insertion order for the RunLo
 '==============================================================================
 Public Sub RunDispatchAnalysis()
 
-    Dim t0 As Double: t0 = Timer
+    ' Every local is declared here, at the top, before any executable statement -
+    ' nothing is Dim'd inside a branch or after the Fail label. The current step
+    ' name lives in the module-level mProc, so the handler reports the failing
+    ' procedure without needing a local copy.
+    Dim t0 As Double
+    Dim cfg As Object                  ' validated config carrier
+    Dim rc As Object                   ' row-column carrier (typed arrays + counts)
+    Dim eNum As Long
+    Dim eDesc As String
 
+    t0 = Timer
     On Error GoTo Fail
     dp_InitLog
 
-    mProc = "dp_DisarmApp"
-    dp_DisarmApp
+    mProc = "dp_DisarmApp":            dp_DisarmApp
+    mProc = "dp_EnsureConfig":         dp_EnsureConfig
+    mProc = "dp_ReadConfig":           Set cfg = dp_ReadConfig()   ' raises on bad input
+    mProc = "dp_LoadData":             Set rc = dp_LoadData(cfg)
+    mProc = "dp_BuildDays":            dp_BuildDays rc, cfg
+    mProc = "dp_BuildPatterns":        dp_BuildPatterns rc, cfg
+    mProc = "dp_WriteHourlyProfile":   dp_WriteHourlyProfile rc, cfg
+    mProc = "dp_WritePatternIndex":    dp_WritePatternIndex rc, cfg
+    mProc = "dp_WritePatternHourly":   dp_WritePatternHourly rc, cfg
+    mProc = "dp_WriteDailyAssignment": dp_WriteDailyAssignment rc, cfg
 
-    '---- Config -------------------------------------------------------------
-    mProc = "dp_EnsureConfig"
-    dp_EnsureConfig
-
-    mProc = "dp_ReadConfig"
-    Dim cfg As Object
-    Set cfg = dp_ReadConfig()          ' validated here; raises on bad input
-
-    '---- Load ---------------------------------------------------------------
-    mProc = "dp_LoadData"
-    Dim rc As Object                   ' row-column carrier (typed arrays + counts)
-    Set rc = dp_LoadData(cfg)
-
-    '---- Days & signatures --------------------------------------------------
-    mProc = "dp_BuildDays"
-    dp_BuildDays rc, cfg
-
-    '---- Patterns -----------------------------------------------------------
-    mProc = "dp_BuildPatterns"
-    dp_BuildPatterns rc, cfg
-
-    '---- Output tables ------------------------------------------------------
-    mProc = "dp_WriteHourlyProfile"
-    dp_WriteHourlyProfile rc, cfg
-
-    mProc = "dp_WritePatternIndex"
-    dp_WritePatternIndex rc, cfg
-
-    mProc = "dp_WritePatternHourly"
-    dp_WritePatternHourly rc, cfg
-
-    mProc = "dp_WriteDailyAssignment"
-    dp_WriteDailyAssignment rc, cfg
-
-    '---- Charts (cosmetic failures are logged, not fatal) -------------------
+    ' Charts are best-effort: a cosmetic charting quirk must not fail the run.
     mProc = "dp_BuildCharts"
     On Error Resume Next
     dp_BuildCharts rc, cfg
@@ -129,7 +112,6 @@ Public Sub RunDispatchAnalysis()
     End If
     On Error GoTo Fail
 
-    '---- Run log + summary --------------------------------------------------
     mProc = "dp_Finish"
     dp_LogSet "runtime_seconds", Format$(Timer - t0, "0.00")
     dp_WriteRunLog cfg
@@ -138,16 +120,16 @@ Public Sub RunDispatchAnalysis()
     Exit Sub
 
 Fail:
-    Dim eNum As Long, eDesc As String, eProc As String
-    eNum = Err.Number: eDesc = Err.Description: eProc = mProc
+    eNum = Err.Number
+    eDesc = Err.Description
     dp_RearmApp
     On Error Resume Next
-    dp_LogSet "ERROR", "in " & eProc & ": [" & eNum & "] " & eDesc
+    dp_LogSet "ERROR", "in " & mProc & ": [" & eNum & "] " & eDesc
     dp_LogSet "runtime_seconds", Format$(Timer - t0, "0.00")
     dp_WriteRunLog Nothing
     On Error GoTo 0
     MsgBox "RunDispatchAnalysis failed." & vbCrLf & vbCrLf & _
-           "Procedure : " & eProc & vbCrLf & _
+           "Procedure : " & mProc & vbCrLf & _
            "Error     : [" & eNum & "] " & eDesc, _
            vbCritical, "modDispatchPatterns"
 End Sub
@@ -188,10 +170,12 @@ Private Sub dp_InitLog()
     Set mLogOrder = New Collection
 End Sub
 
-Private Sub dp_LogSet(ByVal label As String, ByVal val As Variant)
+' Params named logKey/logVal (not label/val) so they don't shadow the VBA
+' intrinsics Val() and the MSForms Label class.
+Private Sub dp_LogSet(ByVal logKey As String, ByVal logVal As Variant)
     If mLog Is Nothing Then dp_InitLog
-    If Not mLog.Exists(label) Then mLogOrder.Add label
-    mLog(label) = val
+    If Not mLog.Exists(logKey) Then mLogOrder.Add logKey
+    mLog(logKey) = logVal
 End Sub
 
 
