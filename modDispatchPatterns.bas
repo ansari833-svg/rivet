@@ -84,8 +84,8 @@ Public Sub RunDispatchAnalysis()
     Dim t0 As Double
     Dim cfg As Object                  ' validated config carrier
     Dim rc As Object                   ' row-column carrier (typed arrays + counts)
-    Dim eNum As Long
-    Dim eDesc As String
+    Dim lErrNum As Long                ' l-prefixed locals; failing-proc name is module-level mProc
+    Dim lErrDesc As String
 
     t0 = Timer
     On Error GoTo Fail
@@ -120,17 +120,17 @@ Public Sub RunDispatchAnalysis()
     Exit Sub
 
 Fail:
-    eNum = Err.Number
-    eDesc = Err.Description
+    lErrNum = Err.Number
+    lErrDesc = Err.Description
     dp_RearmApp
     On Error Resume Next
-    dp_LogSet "ERROR", "in " & mProc & ": [" & eNum & "] " & eDesc
+    dp_LogSet "ERROR", "in " & mProc & ": [" & lErrNum & "] " & lErrDesc
     dp_LogSet "runtime_seconds", Format$(Timer - t0, "0.00")
     dp_WriteRunLog Nothing
     On Error GoTo 0
     MsgBox "RunDispatchAnalysis failed." & vbCrLf & vbCrLf & _
            "Procedure : " & mProc & vbCrLf & _
-           "Error     : [" & eNum & "] " & eDesc, _
+           "Error     : [" & lErrNum & "] " & lErrDesc, _
            vbCritical, "modDispatchPatterns"
 End Sub
 
@@ -1759,7 +1759,7 @@ End Function
 '==== SECTION: COLOURS =========================================================
 '  Single source of truth so a pattern is the same colour everywhere.
 
-Public Function dp_PatternColor(ByVal rank As Long) As Long
+Private Function dp_PatternColor(ByVal rank As Long) As Long
     Select Case rank
         Case 1: dp_PatternColor = RGB(0, 114, 178)     ' blue
         Case 2: dp_PatternColor = RGB(213, 94, 0)      ' vermillion
@@ -1770,7 +1770,7 @@ Public Function dp_PatternColor(ByVal rank As Long) As Long
     End Select
 End Function
 
-Public Function dp_TintColor(ByVal baseColor As Long, ByVal pct As Double) As Long
+Private Function dp_TintColor(ByVal baseColor As Long, ByVal pct As Double) As Long
     ' Lighten baseColor toward white by pct (0..1).
     If pct < 0 Then pct = 0
     If pct > 1 Then pct = 1
