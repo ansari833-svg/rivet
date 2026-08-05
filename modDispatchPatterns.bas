@@ -204,7 +204,7 @@ Private Sub dp_EnsureConfig()
     Dim spec As Variant
     spec = Array( _
         Array("cfgDataSheet", "RawData", "Source worksheet holding the timeseries", ""), _
-        Array("cfgPriceCol", "energy_rt_price", "Price series used for VWAP/spread", "energy_rt_price,energy_da_price"), _
+        Array("cfgPriceCol", "energy_rt_price", "Price series used for means/spread", "energy_rt_price,energy_da_price"), _
         Array("cfgTopN", 3, "Number of patterns to isolate (rest -> Other)", ""), _
         Array("cfgClusterMethod", "Exact", "Exact 24h signature, or relaxed Window", "Exact,Window"), _
         Array("cfgHEConvention", "Ending", "Ending: 00:00->HE1 | Beginning: shifted", "Ending,Beginning"), _
@@ -651,36 +651,40 @@ Private Sub dp_BuildPatterns(rc As Object, cfg As Object)
     Dim method As String: method = cfg("method")
     Dim topN As Long: topN = cfg("topN")
 
-    ' Count days per group key.
+    ' Idle day = complete day whose signature has no charge/discharge/both.
+    Dim dayIdle() As Boolean: ReDim dayIdle(1 To dp_Max(nDays, 1))
+    Dim di As Long
+    For di = 1 To nDays
+        If dayComplete(di) Then
+            dayIdle(di) = (InStr(daySig(di), "C") = 0 And InStr(daySig(di), "D") = 0 _
+                           And InStr(daySig(di), "B") = 0)
+        End If
+    Next di
+
+    ' Count days per group key (idle days do not compete for a numbered rank).
     Dim keyCount As Object: Set keyCount = CreateObject("Scripting.Dictionary")
     keyCount.CompareMode = 1
     Dim dayKey() As String: ReDim dayKey(1 To dp_Max(nDays, 1))
 
-    Dim di As Long, gk As String
+    Dim gk As String
     Dim totalComplete As Long: totalComplete = 0
     For di = 1 To nDays
         If dayComplete(di) Then
-            If method = "window" Then
-                gk = dp_WindowKey(daySig(di))
-            Else
-                gk = daySig(di)
-            End If
-            dayKey(di) = gk
-            If keyCount.Exists(gk) Then keyCount(gk) = keyCount(gk) + 1 Else keyCount(gk) = 1
             totalComplete = totalComplete + 1
+            If Not dayIdle(di) Then
+                If method = "window" Then gk = dp_WindowKey(daySig(di)) Else gk = daySig(di)
+                dayKey(di) = gk
+                If keyCount.Exists(gk) Then keyCount(gk) = keyCount(gk) + 1 Else keyCount(gk) = 1
+            End If
         End If
     Next di
 
-    ' Rank keys by descending day count (stable-ish via count then key).
+    ' Rank keys by descending day count (ties broken by key for determinism).
     Dim keys() As String, cnts() As Long
     Dim nk As Long: nk = keyCount.Count
-    Dim rankLabelOf As Object: Set rankLabelOf = CreateObject("Scripting.Dictionary")
-    rankLabelOf.CompareMode = 1
-
-    Dim patRank As Object: Set patRank = CreateObject("Scripting.Dictionary")   ' key -> rank (1..topN)
+    Dim patRank As Object: Set patRank = CreateObject("Scripting.Dictionary")   ' key -> rank
     patRank.CompareMode = 1
-
-    Dim topKeys() As String                 ' rank -> group key
+    Dim topKeys() As String
     Dim nTop As Long: nTop = 0
 
     If nk > 0 Then
@@ -702,36 +706,35 @@ Private Sub dp_BuildPatterns(rc As Object, cfg As Object)
         Next rnk
     End If
 
-    ' Assign every complete day to a rank (1..nTop) or 0 => Other.
+    ' Slot model: 1..nTop patterns, Other = nTop+1, Idle = nTop+2.
+    Dim otherRank As Long: otherRank = nTop + 1
+    Dim idleRank As Long: idleRank = nTop + 2
+    Dim slots As Long: slots = idleRank
+
+    ' Assign each day: rank 1..nTop, 0 Other, -2 Idle, -1 excluded (incomplete).
     Dim dayRank() As Long: ReDim dayRank(1 To dp_Max(nDays, 1))
     Dim topCoverDays As Long: topCoverDays = 0
     For di = 1 To nDays
-        If dayComplete(di) Then
-            If patRank.Exists(dayKey(di)) Then
-                dayRank(di) = patRank(dayKey(di))
-                topCoverDays = topCoverDays + 1
-            Else
-                dayRank(di) = 0        ' Other
-            End If
+        If Not dayComplete(di) Then
+            dayRank(di) = -1
+        ElseIf dayIdle(di) Then
+            dayRank(di) = -2
+        ElseIf patRank.Exists(dayKey(di)) Then
+            dayRank(di) = patRank(dayKey(di))
+            topCoverDays = topCoverDays + 1
         Else
-            dayRank(di) = -1           ' excluded
+            dayRank(di) = 0
         End If
     Next di
 
-    ' Representative modal signature per rank (and for Other) from member days.
-    ' modalGrid(rank, HE) where rank 1..nTop, and Other stored at nTop+1.
-    Dim otherRank As Long: otherRank = nTop + 1
-    Dim modalGrid() As String: ReDim modalGrid(1 To dp_Max(otherRank, 1), 1 To 24)
-    Dim rankDayCount() As Long: ReDim rankDayCount(0 To dp_Max(otherRank, 1))
-
-    ' Tally state votes per (rankslot, HE, state).
+    ' Representative modal signature per slot from member days.
+    Dim modalGrid() As String: ReDim modalGrid(1 To dp_Max(slots, 1), 1 To 24)
     Dim votes As Object: Set votes = CreateObject("Scripting.Dictionary")
     votes.CompareMode = 1
     Dim hh As Long, slot As Long, st As String, vkey As String
     For di = 1 To nDays
-        If dayRank(di) >= 0 Then
-            slot = IIf(dayRank(di) = 0, otherRank, dayRank(di))
-            rankDayCount(dayRank(di)) = rankDayCount(dayRank(di)) + 1
+        slot = dp_SlotOf(dayRank(di), nTop)
+        If slot > 0 Then
             For hh = 1 To 24
                 st = dayStateGrid(di, hh)
                 vkey = slot & "|" & hh & "|" & st
@@ -742,7 +745,7 @@ Private Sub dp_BuildPatterns(rc As Object, cfg As Object)
 
     Dim states As Variant: states = Array("D", "C", "B", "-")
     Dim s As Long, bestSt As String, bestV As Long, vv As Long
-    For slot = 1 To otherRank
+    For slot = 1 To slots
         For hh = 1 To 24
             bestSt = "-": bestV = -1
             For s = LBound(states) To UBound(states)
@@ -754,16 +757,18 @@ Private Sub dp_BuildPatterns(rc As Object, cfg As Object)
         Next hh
     Next slot
 
-    ' Top-N coverage.
+    ' Top-N coverage (share of all complete days captured by numbered patterns).
     Dim coverage As Double
     If totalComplete > 0 Then coverage = topCoverDays / totalComplete Else coverage = 0
 
     rc("nTop") = nTop
     rc("otherRank") = otherRank
+    rc("idleRank") = idleRank
+    rc("slots") = slots
     rc("dayRank") = dayRank
+    rc("dayIdle") = dayIdle
     rc("dayKey") = dayKey
     rc("modalGrid") = modalGrid
-    rc("rankDayCount") = rankDayCount
     rc("totalComplete") = totalComplete
     rc("coverage") = coverage
     If nTop > 0 Then rc("topKeys") = topKeys
@@ -800,6 +805,55 @@ Private Function dp_WindowKey(ByVal sig As String) As String
     Next hh
     dp_WindowKey = fC & "-" & lC & "|" & fD & "-" & lD & "|" & nC & "|" & nD
 End Function
+
+' Map a dayRank to its aggregation slot: 1..nTop patterns, Other=nTop+1,
+' Idle=nTop+2, or 0 for an excluded (incomplete) day.
+Private Function dp_SlotOf(ByVal rk As Long, ByVal nTop As Long) As Long
+    Select Case rk
+        Case Is >= 1: dp_SlotOf = rk
+        Case 0:       dp_SlotOf = nTop + 1
+        Case -2:      dp_SlotOf = nTop + 2
+        Case Else:    dp_SlotOf = 0
+    End Select
+End Function
+
+Private Function dp_SlotLabel(ByVal slot As Long, ByVal nTop As Long) As String
+    If slot <= nTop Then
+        dp_SlotLabel = "P" & slot
+    ElseIf slot = nTop + 1 Then
+        dp_SlotLabel = "Other"
+    Else
+        dp_SlotLabel = "Idle"
+    End If
+End Function
+
+Private Function dp_SlotColor(ByVal slot As Long, ByVal nTop As Long) As Long
+    If slot <= nTop Then
+        dp_SlotColor = dp_PatternColor(slot)
+    ElseIf slot = nTop + 1 Then
+        dp_SlotColor = dp_PatternColor(-1)     ' Other grey
+    Else
+        dp_SlotColor = dp_PatternColor(-2)     ' Idle light grey
+    End If
+End Function
+
+' First/last charge and discharge HE within a 24-char signature (0 = none).
+Private Sub dp_DaySpan(ByVal sig As String, ByRef fC As Long, ByRef lC As Long, _
+                       ByRef fD As Long, ByRef lD As Long)
+    Dim hh As Long, ch As String
+    fC = 0: lC = 0: fD = 0: lD = 0
+    For hh = 1 To 24
+        ch = Mid$(sig, hh, 1)
+        If ch = "C" Or ch = "B" Then
+            If fC = 0 Then fC = hh
+            lC = hh
+        End If
+        If ch = "D" Or ch = "B" Then
+            If fD = 0 Then fD = hh
+            lD = hh
+        End If
+    Next hh
+End Sub
 
 
 '==== SECTION: DESCRIPTORS =====================================================
@@ -853,9 +907,9 @@ End Function
 
 '==== SECTION: OUTPUT - HOURLYPROFILE ==========================================
 '  One row per HE 1-24, aggregated over ALL kept rows (complete or not).
-'  VWAP = Sum(price x MWh) / Sum(MWh). gridcharge VWAP is cash cost; renewable
-'  charge VWAP is opportunity cost. Percentiles from PercentileInc on the
-'  distribution of prices across charging / discharging hours at that HE.
+'  Price statistics are UNWEIGHTED: mean and P10/P50/P90 of the market price
+'  across the charging / discharging hours at that HE (no MWh weighting).
+'  Charge MWh is split into its grid and renewable components.
 
 Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
     Dim n As Long: n = rc("n")
@@ -865,18 +919,13 @@ Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
     Dim grid() As Double:  grid = rc("grid")
     Dim ren() As Double:   ren = rc("ren")
     Dim state() As String: state = rc("state")
-    Dim renZero As Boolean: renZero = (cfg("renCost") = "zero")
-    Dim tol As Double: tol = cfg("tol")
 
     ' Accumulators per HE.
     Dim chgHrs(1 To 24) As Long, disHrs(1 To 24) As Long, idleHrs(1 To 24) As Long
     Dim dayCountHE(1 To 24) As Long
     Dim chgMWhTot(1 To 24) As Double, disMWhTot(1 To 24) As Double
     Dim gridMWhTot(1 To 24) As Double, renMWhTot(1 To 24) As Double
-    Dim blendPxMWh(1 To 24) As Double, blendMWh(1 To 24) As Double
-    Dim gridPxMWh(1 To 24) As Double
-    Dim renPxMWh(1 To 24) As Double
-    Dim disPxMWh(1 To 24) As Double
+    Dim chgPxSum(1 To 24) As Double, disPxSum(1 To 24) As Double   ' unweighted price sums
     Dim priceSum(1 To 24) As Double, priceCnt(1 To 24) As Long
 
     ' Percentile buffers: count per HE, lay out contiguous slices in ONE flat
@@ -914,16 +963,7 @@ Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
             chgMWhTot(hh) = chgMWhTot(hh) + chg
             gridMWhTot(hh) = gridMWhTot(hh) + grid(i)
             renMWhTot(hh) = renMWhTot(hh) + ren(i)
-            gridPxMWh(hh) = gridPxMWh(hh) + price(i) * grid(i)
-            renPxMWh(hh) = renPxMWh(hh) + price(i) * ren(i)
-            ' Blended charge VWAP: exclude renewable MWh when renewable cost = Zero.
-            If renZero Then
-                blendPxMWh(hh) = blendPxMWh(hh) + price(i) * grid(i)
-                blendMWh(hh) = blendMWh(hh) + grid(i)
-            Else
-                blendPxMWh(hh) = blendPxMWh(hh) + price(i) * chg
-                blendMWh(hh) = blendMWh(hh) + chg
-            End If
+            chgPxSum(hh) = chgPxSum(hh) + price(i)
             chgFill(hh) = chgFill(hh) + 1
             chgAll(chgOff(hh) + chgFill(hh)) = price(i)
         End If
@@ -931,7 +971,7 @@ Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
         If state(i) = "D" Or state(i) = "B" Then
             disHrs(hh) = disHrs(hh) + 1
             disMWhTot(hh) = disMWhTot(hh) + dis(i)
-            disPxMWh(hh) = disPxMWh(hh) + price(i) * dis(i)
+            disPxSum(hh) = disPxSum(hh) + price(i)
             disFill(hh) = disFill(hh) + 1
             disAll(disOff(hh) + disFill(hh)) = price(i)
         End If
@@ -944,14 +984,15 @@ Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
     Dim o() As Variant: ReDim o(1 To 25, 1 To nc)
     Dim hdr As Variant
     hdr = Array("he", "n_days", "charge_hours", "charge_freq_pct", "discharge_hours", _
-        "discharge_freq_pct", "idle_freq_pct", "charge_mwh_total", "discharge_mwh_total", _
-        "mean_charge_mwh_when_charging", "mean_discharge_mwh_when_discharging", _
-        "charge_vwap (blended)", "gridcharge_vwap (cash cost)", "renewable_charge_vwap (opp cost)", _
-        "discharge_vwap", "charge_price_p10", "charge_price_p50", "charge_price_p90", _
+        "discharge_freq_pct", "idle_freq_pct", "charge_mwh_total", "gridcharge_mwh_total", _
+        "renewable_charge_mwh_total", "discharge_mwh_total", "mean_charge_mwh_when_charging", _
+        "mean_discharge_mwh_when_discharging", "charge_price_mean", "discharge_price_mean", _
+        "charge_price_p10", "charge_price_p50", "charge_price_p90", _
         "discharge_price_p10", "discharge_price_p50", "discharge_price_p90", "mean_price_all_hours")
     Dim c As Long
     For c = 1 To nc: o(1, c) = hdr(c - 1): Next c
 
+    Dim netMean(1 To 24) As Variant
     Dim r As Long, dn As Long
     For hh = 1 To 24
         r = hh + 1
@@ -964,13 +1005,13 @@ Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
         o(r, 6) = dp_Div(disHrs(hh), dn)
         o(r, 7) = dp_Div(idleHrs(hh), dn)
         o(r, 8) = chgMWhTot(hh)
-        o(r, 9) = disMWhTot(hh)
-        o(r, 10) = dp_Div(chgMWhTot(hh), chgHrs(hh))
-        o(r, 11) = dp_Div(disMWhTot(hh), disHrs(hh))
-        o(r, 12) = dp_VWAP(blendPxMWh(hh), blendMWh(hh))
-        o(r, 13) = dp_VWAP(gridPxMWh(hh), gridMWhTot(hh))
-        o(r, 14) = dp_VWAP(renPxMWh(hh), renMWhTot(hh))
-        o(r, 15) = dp_VWAP(disPxMWh(hh), disMWhTot(hh))
+        o(r, 9) = gridMWhTot(hh)
+        o(r, 10) = renMWhTot(hh)
+        o(r, 11) = disMWhTot(hh)
+        o(r, 12) = dp_Div(chgMWhTot(hh), chgHrs(hh))
+        o(r, 13) = dp_Div(disMWhTot(hh), disHrs(hh))
+        If chgHrs(hh) > 0 Then o(r, 14) = dp_Div(chgPxSum(hh), chgHrs(hh)) Else o(r, 14) = ""
+        If disHrs(hh) > 0 Then o(r, 15) = dp_Div(disPxSum(hh), disHrs(hh)) Else o(r, 15) = ""
         If chgPxN(hh) > 0 Then
             dp_QuickSortDouble chgAll, chgOff(hh) + 1, chgOff(hh) + chgPxN(hh)
             o(r, 16) = dp_PercentileInc(chgAll, chgOff(hh) + 1, chgPxN(hh), 0.1)
@@ -984,6 +1025,7 @@ Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
             o(r, 21) = dp_PercentileInc(disAll, disOff(hh) + 1, disPxN(hh), 0.9)
         End If
         o(r, 22) = dp_Div(priceSum(hh), priceCnt(hh))
+        netMean(hh) = dp_Div(disMWhTot(hh) - chgMWhTot(hh), dn)
     Next hh
 
     Dim ws As Worksheet
@@ -991,16 +1033,15 @@ Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
     ws.Range("A1").Resize(25, nc).Value = o
     dp_MakeTable ws, "tblHourly", 25, nc
     dp_FormatCols ws, Array(4, 6, 7), FMT_PCT
-    dp_FormatCols ws, Array(8, 9, 10, 11), FMT_MWH
-    dp_FormatCols ws, Array(12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22), FMT_PRICE
+    dp_FormatCols ws, Array(8, 9, 10, 11, 12, 13), FMT_MWH
+    dp_FormatCols ws, Array(14, 15, 16, 17, 18, 19, 20, 21, 22), FMT_PRICE
     ws.Columns.AutoFit
 
-    ' Stash a few series for the charts.
+    ' Stash series for the charts (unweighted means and percentiles only).
     rc("hp_chgFreq") = dp_ColFrom(o, 4, 2, 25)
     rc("hp_disFreq") = dp_ColFrom(o, 6, 2, 25)
     rc("hp_meanPrice") = dp_ColFrom(o, 22, 2, 25)
-    rc("hp_chgVWAP") = dp_ColFrom(o, 12, 2, 25)
-    rc("hp_disVWAP") = dp_ColFrom(o, 15, 2, 25)
+    rc("hp_netMean") = netMean
     rc("hp_chgP10") = dp_ColFrom(o, 16, 2, 25)
     rc("hp_chgP50") = dp_ColFrom(o, 17, 2, 25)
     rc("hp_chgP90") = dp_ColFrom(o, 18, 2, 25)
@@ -1031,33 +1072,28 @@ Private Sub dp_AggregatePatterns(rc As Object, cfg As Object)
     Dim gridExp() As Double: gridExp = rc("gridExp")
     Dim dayRank() As Long: dayRank = rc("dayRank")
     Dim nTop As Long: nTop = rc("nTop")
-    Dim otherRank As Long: otherRank = rc("otherRank")
-    Dim renZero As Boolean: renZero = (cfg("renCost") = "zero")
+    Dim slots As Long: slots = rc("slots")   ' 1..nTop, Other=nTop+1, Idle=nTop+2
     Dim socPresent As Boolean: socPresent = rc("socPresent")
 
-    Dim slots As Long: slots = otherRank    ' 1..nTop plus Other at otherRank
-
-    ' Per (slot,HE) accumulators.
+    ' Per (slot,HE) accumulators. Price stats are UNWEIGHTED means: sum of the
+    ' market price over charging / discharging hours, divided by the hour count.
     Dim cCnt() As Long: ReDim cCnt(1 To slots, 1 To 24)
     Dim dCnt() As Long: ReDim dCnt(1 To slots, 1 To 24)
     Dim occ() As Long:  ReDim occ(1 To slots, 1 To 24)      ' day-hours observed
     Dim cM() As Double:  ReDim cM(1 To slots, 1 To 24)
     Dim dM() As Double:  ReDim dM(1 To slots, 1 To 24)
     Dim netM() As Double: ReDim netM(1 To slots, 1 To 24)
-    Dim cPxM() As Double: ReDim cPxM(1 To slots, 1 To 24)
-    Dim cWM() As Double:  ReDim cWM(1 To slots, 1 To 24)
-    Dim dPxM() As Double: ReDim dPxM(1 To slots, 1 To 24)
-    Dim dWM() As Double:  ReDim dWM(1 To slots, 1 To 24)
-    Dim pxSum() As Double: ReDim pxSum(1 To slots, 1 To 24)
+    Dim cPxSum() As Double: ReDim cPxSum(1 To slots, 1 To 24)   ' sum price | charging
+    Dim dPxSum() As Double: ReDim dPxSum(1 To slots, 1 To 24)   ' sum price | discharging
+    Dim pxSum() As Double: ReDim pxSum(1 To slots, 1 To 24)     ' sum price | all hours
     Dim socSum() As Double: ReDim socSum(1 To slots, 1 To 24)
     Dim socCnt() As Long:   ReDim socCnt(1 To slots, 1 To 24)
 
-    Dim i As Long, di As Long, rk As Long, slot As Long, hh As Long, chg As Double
+    Dim i As Long, di As Long, slot As Long, hh As Long, chg As Double
     For i = 1 To n
         di = rDay(i)
-        rk = dayRank(di)
-        If rk < 0 Then GoTo NextI          ' incomplete day - excluded from patterns
-        slot = IIf(rk = 0, otherRank, rk)
+        slot = dp_SlotOf(dayRank(di), nTop)
+        If slot = 0 Then GoTo NextI        ' incomplete day - excluded from patterns
         hh = he(i)
         chg = grid(i) + ren(i)
 
@@ -1069,31 +1105,17 @@ Private Sub dp_AggregatePatterns(rc As Object, cfg As Object)
         If state(i) = "C" Or state(i) = "B" Then
             cCnt(slot, hh) = cCnt(slot, hh) + 1
             cM(slot, hh) = cM(slot, hh) + chg
-            If renZero Then
-                cPxM(slot, hh) = cPxM(slot, hh) + price(i) * grid(i)
-                cWM(slot, hh) = cWM(slot, hh) + grid(i)
-            Else
-                cPxM(slot, hh) = cPxM(slot, hh) + price(i) * chg
-                cWM(slot, hh) = cWM(slot, hh) + chg
-            End If
+            cPxSum(slot, hh) = cPxSum(slot, hh) + price(i)
         End If
         If state(i) = "D" Or state(i) = "B" Then
             dCnt(slot, hh) = dCnt(slot, hh) + 1
             dM(slot, hh) = dM(slot, hh) + dis(i)
-            dPxM(slot, hh) = dPxM(slot, hh) + price(i) * dis(i)
-            dWM(slot, hh) = dWM(slot, hh) + dis(i)
+            dPxSum(slot, hh) = dPxSum(slot, hh) + price(i)
         End If
 NextI:
     Next i
 
-    ' Per-rank daily totals (for PatternIndex averages).
-    Dim rkDays() As Long: ReDim rkDays(0 To otherRank)
-    Dim rkChg() As Double: ReDim rkChg(0 To otherRank)
-    Dim rkDis() As Double: ReDim rkDis(0 To otherRank)
-    Dim rkCost() As Double: ReDim rkCost(0 To otherRank)
-    Dim rkRev() As Double: ReDim rkRev(0 To otherRank)
-
-    ' Accumulate per day then fold into rank (avoids double counting hours).
+    ' Per-slot daily totals (charge/discharge MWh and actual $ cost/revenue).
     Dim nDays As Long: nDays = rc("nDays")
     Dim dChg() As Double: ReDim dChg(1 To dp_Max(nDays, 1))
     Dim dDis() As Double: ReDim dDis(1 To dp_Max(nDays, 1))
@@ -1101,7 +1123,7 @@ NextI:
     Dim dRev() As Double: ReDim dRev(1 To dp_Max(nDays, 1))
     For i = 1 To n
         di = rDay(i)
-        If dayRank(di) < 0 Then GoTo NextI2
+        If dp_SlotOf(dayRank(di), nTop) = 0 Then GoTo NextI2
         chg = grid(i) + ren(i)
         dChg(di) = dChg(di) + chg
         dDis(di) = dDis(di) + dis(i)
@@ -1109,14 +1131,19 @@ NextI:
         dRev(di) = dRev(di) + disRev(i)
 NextI2:
     Next i
+    Dim slotDays() As Long: ReDim slotDays(1 To slots)
+    Dim slotChg() As Double: ReDim slotChg(1 To slots)
+    Dim slotDis() As Double: ReDim slotDis(1 To slots)
+    Dim slotCost() As Double: ReDim slotCost(1 To slots)
+    Dim slotRev() As Double: ReDim slotRev(1 To slots)
     For di = 1 To nDays
-        rk = dayRank(di)
-        If rk < 0 Then GoTo NextD
-        rkDays(rk) = rkDays(rk) + 1
-        rkChg(rk) = rkChg(rk) + dChg(di)
-        rkDis(rk) = rkDis(rk) + dDis(di)
-        rkCost(rk) = rkCost(rk) + dCost(di)
-        rkRev(rk) = rkRev(rk) + dRev(di)
+        slot = dp_SlotOf(dayRank(di), nTop)
+        If slot = 0 Then GoTo NextD
+        slotDays(slot) = slotDays(slot) + 1
+        slotChg(slot) = slotChg(slot) + dChg(di)
+        slotDis(slot) = slotDis(slot) + dDis(di)
+        slotCost(slot) = slotCost(slot) + dCost(di)
+        slotRev(slot) = slotRev(slot) + dRev(di)
 NextD:
     Next di
 
@@ -1131,14 +1158,105 @@ NextD:
     rc("pa_slots") = slots
     rc("pa_cCnt") = cCnt: rc("pa_dCnt") = dCnt: rc("pa_occ") = occ
     rc("pa_cM") = cM: rc("pa_dM") = dM: rc("pa_netM") = netM
-    rc("pa_cPxM") = cPxM: rc("pa_cWM") = cWM
-    rc("pa_dPxM") = dPxM: rc("pa_dWM") = dWM
-    rc("pa_pxSum") = pxSum
+    rc("pa_cPxSum") = cPxSum: rc("pa_dPxSum") = dPxSum: rc("pa_pxSum") = pxSum
     rc("pa_socSum") = socSum: rc("pa_socCnt") = socCnt
-    rc("pa_rkDays") = rkDays: rc("pa_rkChg") = rkChg: rc("pa_rkDis") = rkDis
-    rc("pa_rkCost") = rkCost: rc("pa_rkRev") = rkRev
+    rc("pa_slotDays") = slotDays: rc("pa_slotChg") = slotChg: rc("pa_slotDis") = slotDis
+    rc("pa_slotCost") = slotCost: rc("pa_slotRev") = slotRev
     rc("pa_capProxy") = capProxy
     rc("pa_done") = True
+End Sub
+
+
+'==== SECTION: MONTHLY AGGREGATES ==============================================
+'  Per-month day counts by slot (for the seasonal-mix chart) and per-month mean
+'  first/last charge & discharge HE (for the timing-drift chart). Months are in
+'  chronological order across the whole (filtered) timeseries.
+
+Private Sub dp_AggregateMonthly(rc As Object)
+    If rc.Exists("mo_done") Then Exit Sub
+    Dim nDays As Long: nDays = rc("nDays")
+    Dim dayDate() As Long: dayDate = rc("dayDate")
+    Dim daySig() As String: daySig = rc("daySig")
+    Dim dayComplete() As Boolean: dayComplete = rc("dayComplete")
+    Dim dayRank() As Long: dayRank = rc("dayRank")
+    Dim nTop As Long: nTop = rc("nTop")
+    Dim slots As Long: slots = rc("slots")
+
+    ' Distinct months keyed Year*12 + (Month-1), collected then sorted ascending.
+    Dim seen As Object: Set seen = CreateObject("Scripting.Dictionary")
+    Dim keysArr() As Long: ReDim keysArr(1 To dp_Max(nDays, 1))
+    Dim nMonths As Long: nMonths = 0
+    Dim di As Long, mk As Long, dt As Date
+    For di = 1 To nDays
+        If dayComplete(di) Then
+            dt = CDate(dayDate(di))
+            mk = Year(dt) * 12 + (Month(dt) - 1)
+            If Not seen.Exists(mk) Then
+                nMonths = nMonths + 1: seen(mk) = 1: keysArr(nMonths) = mk
+            End If
+        End If
+    Next di
+
+    Dim order() As Long: ReDim order(1 To dp_Max(nMonths, 1))
+    Dim a As Long, b As Long, tmp As Long
+    For a = 1 To nMonths: order(a) = keysArr(a): Next a
+    For a = 1 To nMonths - 1
+        For b = a + 1 To nMonths
+            If order(b) < order(a) Then tmp = order(a): order(a) = order(b): order(b) = tmp
+        Next b
+    Next a
+    Dim posOf As Object: Set posOf = CreateObject("Scripting.Dictionary")
+    Dim moLabels() As String: ReDim moLabels(1 To dp_Max(nMonths, 1))
+    For a = 1 To nMonths
+        posOf(order(a)) = a
+        moLabels(a) = Format$(DateSerial(order(a) \ 12, (order(a) Mod 12) + 1, 1), "yyyy-mm")
+    Next a
+
+    Dim moCount() As Long: ReDim moCount(1 To dp_Max(nMonths, 1), 1 To slots)
+    Dim fcS() As Double: ReDim fcS(1 To dp_Max(nMonths, 1))
+    Dim lcS() As Double: ReDim lcS(1 To dp_Max(nMonths, 1))
+    Dim fdS() As Double: ReDim fdS(1 To dp_Max(nMonths, 1))
+    Dim ldS() As Double: ReDim ldS(1 To dp_Max(nMonths, 1))
+    Dim cN() As Long: ReDim cN(1 To dp_Max(nMonths, 1))
+    Dim dN() As Long: ReDim dN(1 To dp_Max(nMonths, 1))
+    Dim slot As Long, mp As Long, fC As Long, lC As Long, fD As Long, lD As Long
+    For di = 1 To nDays
+        If Not dayComplete(di) Then GoTo NextDay
+        dt = CDate(dayDate(di))
+        mp = posOf(Year(dt) * 12 + (Month(dt) - 1))
+        slot = dp_SlotOf(dayRank(di), nTop)
+        If slot >= 1 Then moCount(mp, slot) = moCount(mp, slot) + 1
+        dp_DaySpan daySig(di), fC, lC, fD, lD
+        If fC > 0 Then fcS(mp) = fcS(mp) + fC: lcS(mp) = lcS(mp) + lC: cN(mp) = cN(mp) + 1
+        If fD > 0 Then fdS(mp) = fdS(mp) + fD: ldS(mp) = ldS(mp) + lD: dN(mp) = dN(mp) + 1
+NextDay:
+    Next di
+
+    Dim firstChg() As Variant: ReDim firstChg(1 To dp_Max(nMonths, 1))
+    Dim lastChg() As Variant:  ReDim lastChg(1 To dp_Max(nMonths, 1))
+    Dim firstDis() As Variant: ReDim firstDis(1 To dp_Max(nMonths, 1))
+    Dim lastDis() As Variant:  ReDim lastDis(1 To dp_Max(nMonths, 1))
+    For a = 1 To nMonths
+        If cN(a) > 0 Then
+            firstChg(a) = fcS(a) / cN(a): lastChg(a) = lcS(a) / cN(a)
+        Else
+            firstChg(a) = "": lastChg(a) = ""
+        End If
+        If dN(a) > 0 Then
+            firstDis(a) = fdS(a) / dN(a): lastDis(a) = ldS(a) / dN(a)
+        Else
+            firstDis(a) = "": lastDis(a) = ""
+        End If
+    Next a
+
+    rc("mo_nMonths") = nMonths
+    rc("mo_labels") = moLabels
+    rc("mo_count") = moCount
+    rc("mo_firstChg") = firstChg
+    rc("mo_lastChg") = lastChg
+    rc("mo_firstDis") = firstDis
+    rc("mo_lastDis") = lastDis
+    rc("mo_done") = True
 End Sub
 
 
@@ -1148,67 +1266,81 @@ Private Sub dp_WritePatternIndex(rc As Object, cfg As Object)
     dp_AggregatePatterns rc, cfg
     Dim nTop As Long: nTop = rc("nTop")
     Dim otherRank As Long: otherRank = rc("otherRank")
+    Dim slots As Long: slots = rc("slots")
     Dim modalGrid() As String: modalGrid = rc("modalGrid")
-    Dim rkDays() As Long: rkDays = rc("pa_rkDays")
-    Dim rkChg() As Double: rkChg = rc("pa_rkChg")
-    Dim rkDis() As Double: rkDis = rc("pa_rkDis")
+    Dim slotDays() As Long: slotDays = rc("pa_slotDays")
+    Dim slotChg() As Double: slotChg = rc("pa_slotChg")
+    Dim slotDis() As Double: slotDis = rc("pa_slotDis")
     Dim totalComplete As Long: totalComplete = rc("totalComplete")
     Dim capProxy As Double: capProxy = rc("pa_capProxy")
     Dim socPresent As Boolean: socPresent = rc("socPresent")
+    Dim cCnt() As Long: cCnt = rc("pa_cCnt")
+    Dim dCnt() As Long: dCnt = rc("pa_dCnt")
+    Dim cPxSum() As Double: cPxSum = rc("pa_cPxSum")
+    Dim dPxSum() As Double: dPxSum = rc("pa_dPxSum")
 
-    ' Per-rank charge/discharge VWAP from the (slot,HE) sums.
-    Dim cPxM() As Double: cPxM = rc("pa_cPxM")
-    Dim cWM() As Double:  cWM = rc("pa_cWM")
-    Dim dPxM() As Double: dPxM = rc("pa_dPxM")
-    Dim dWM() As Double:  dWM = rc("pa_dWM")
+    ' Per-slot rollups for EVERY slot (top-N, Other, Idle); cached for charts.
+    Dim slotLabel() As String: ReDim slotLabel(1 To slots)
+    Dim slotSig() As String:   ReDim slotSig(1 To slots)
+    Dim slotDesc() As String:  ReDim slotDesc(1 To slots)
+    Dim slotShare() As Double: ReDim slotShare(1 To slots)
+    Dim slotMeanChg() As Variant: ReDim slotMeanChg(1 To slots)   ' mean price | charging
+    Dim slotMeanDis() As Variant: ReDim slotMeanDis(1 To slots)   ' mean price | discharging
+    Dim slotSpread() As Variant:  ReDim slotSpread(1 To slots)
+    Dim slotCycles() As Variant:  ReDim slotCycles(1 To slots)
 
-    Dim nRowsOut As Long: nRowsOut = nTop + 1     ' top-N + Other
+    Dim slot As Long, hh As Long
+    Dim sig As String, cPx As Double, cCt As Long, dPx As Double, dCt As Long
+    For slot = 1 To slots
+        sig = "": cPx = 0: cCt = 0: dPx = 0: dCt = 0
+        For hh = 1 To 24
+            sig = sig & modalGrid(slot, hh)
+            cPx = cPx + cPxSum(slot, hh): cCt = cCt + cCnt(slot, hh)
+            dPx = dPx + dPxSum(slot, hh): dCt = dCt + dCnt(slot, hh)
+        Next hh
+        slotLabel(slot) = dp_SlotLabel(slot, nTop)
+        slotSig(slot) = sig
+        slotDesc(slot) = dp_Descriptor(sig)
+        slotShare(slot) = dp_Div(slotDays(slot), totalComplete)
+        Dim mChg As Double, mDis As Double
+        mChg = dp_Div(cPx, cCt): mDis = dp_Div(dPx, dCt)
+        If cCt > 0 Then slotMeanChg(slot) = mChg Else slotMeanChg(slot) = ""
+        If dCt > 0 Then slotMeanDis(slot) = mDis Else slotMeanDis(slot) = ""
+        If cCt > 0 And dCt > 0 Then slotSpread(slot) = mDis - mChg Else slotSpread(slot) = ""
+        If socPresent And capProxy > 0 Then
+            slotCycles(slot) = dp_Div(dp_Div(slotDis(slot), slotDays(slot)), capProxy)
+        Else
+            slotCycles(slot) = ""
+        End If
+    Next slot
+
+    ' Sheet shows top-N + Other (Idle omitted from the index table).
+    Dim nRowsOut As Long: nRowsOut = otherRank
     Dim nc As Long: nc = 12
     Dim o() As Variant: ReDim o(1 To nRowsOut + 1, 1 To nc)
     Dim hdr As Variant
     hdr = Array("pattern_rank", "pattern_label", "signature", "descriptor", "n_days", _
         "share_of_days_pct", "avg_daily_charge_mwh", "avg_daily_discharge_mwh", _
-        "charge_vwap", "discharge_vwap", "realized_spread", "implied_cycles_per_day")
+        "charge_price_mean", "discharge_price_mean", "price_spread", "implied_cycles_per_day")
     Dim c As Long
     For c = 1 To nc: o(1, c) = hdr(c - 1): Next c
 
-    Dim rk As Long, slot As Long, r As Long, hh As Long
-    Dim sig As String, cPx As Double, cW As Double, dPx As Double, dW As Double
-    For rk = 1 To otherRank                        ' 1..nTop then Other(otherRank)
-        r = rk + 1
-        slot = rk
-        Dim isOther As Boolean: isOther = (rk = otherRank)
-        Dim dayN As Long
-        If isOther Then dayN = rkDays(0) Else dayN = rkDays(rk)
-
-        ' Build representative signature from modal grid.
-        sig = "": cPx = 0: cW = 0: dPx = 0: dW = 0
-        For hh = 1 To 24
-            sig = sig & modalGrid(slot, hh)
-            cPx = cPx + cPxM(slot, hh): cW = cW + cWM(slot, hh)
-            dPx = dPx + dPxM(slot, hh): dW = dW + dWM(slot, hh)
-        Next hh
-
-        o(r, 1) = IIf(isOther, "Other", CStr(rk))
-        o(r, 2) = IIf(isOther, "Other", "P" & rk)
-        o(r, 3) = sig
-        o(r, 4) = dp_Descriptor(sig)
-        o(r, 5) = dayN
-        o(r, 6) = dp_Div(dayN, totalComplete)
-        o(r, 7) = dp_Div(IIf(isOther, rkChg(0), rkChg(rk)), dayN)
-        o(r, 8) = dp_Div(IIf(isOther, rkDis(0), rkDis(rk)), dayN)
-        ' VWAPs shown blank when there is no volume; spread only when both exist.
-        Dim cvn As Double, dvn As Double
-        cvn = dp_Div(cPx, cW): dvn = dp_Div(dPx, dW)
-        o(r, 9) = dp_VWAP(cPx, cW)
-        o(r, 10) = dp_VWAP(dPx, dW)
-        If cW > 0 And dW > 0 Then o(r, 11) = dvn - cvn Else o(r, 11) = ""
-        If socPresent And capProxy > 0 Then
-            o(r, 12) = dp_Div(dp_Div(IIf(isOther, rkDis(0), rkDis(rk)), dayN), capProxy)
-        Else
-            o(r, 12) = ""      ' capacity unknown -> cannot imply cycles
-        End If
-    Next rk
+    Dim r As Long
+    For slot = 1 To otherRank
+        r = slot + 1
+        o(r, 1) = IIf(slot = otherRank, "Other", CStr(slot))
+        o(r, 2) = slotLabel(slot)
+        o(r, 3) = slotSig(slot)
+        o(r, 4) = slotDesc(slot)
+        o(r, 5) = slotDays(slot)
+        o(r, 6) = slotShare(slot)
+        o(r, 7) = dp_Div(slotChg(slot), slotDays(slot))
+        o(r, 8) = dp_Div(slotDis(slot), slotDays(slot))
+        o(r, 9) = slotMeanChg(slot)
+        o(r, 10) = slotMeanDis(slot)
+        o(r, 11) = slotSpread(slot)
+        o(r, 12) = slotCycles(slot)
+    Next slot
 
     Dim ws As Worksheet
     Set ws = dp_FreshSheet(SH_PATIDX)
@@ -1220,21 +1352,18 @@ Private Sub dp_WritePatternIndex(rc As Object, cfg As Object)
     dp_FormatCols ws, Array(12), FMT_CYC
     ws.Columns.AutoFit
 
-    ' Colour the label cell per pattern colour (matches every chart).
-    For rk = 1 To otherRank
-        ws.Cells(rk + 1, 2).Interior.Color = dp_PatternColor(IIf(rk = otherRank, -1, rk))
-        ws.Cells(rk + 1, 2).Font.Color = dp_ContrastFont(dp_PatternColor(IIf(rk = otherRank, -1, rk)))
-    Next rk
+    For slot = 1 To otherRank
+        ws.Cells(slot + 1, 2).Interior.Color = dp_SlotColor(slot, nTop)
+        ws.Cells(slot + 1, 2).Font.Color = dp_ContrastFont(dp_SlotColor(slot, nTop))
+    Next slot
 
-    ' Cache descriptors/labels for the summary + charts.
-    Dim labels() As String: ReDim labels(1 To otherRank)
-    Dim descs() As String: ReDim descs(1 To otherRank)
-    For rk = 1 To otherRank
-        labels(rk) = CStr(o(rk + 1, 2))
-        descs(rk) = CStr(o(rk + 1, 4))
-    Next rk
-    rc("labels") = labels
-    rc("descs") = descs
+    rc("slotLabel") = slotLabel
+    rc("slotDesc") = slotDesc
+    rc("slotShare") = slotShare
+    rc("slotMeanChg") = slotMeanChg
+    rc("slotMeanDis") = slotMeanDis
+    rc("slotSpread") = slotSpread
+    rc("slotCycles") = slotCycles
     rc("piArray") = o
 End Sub
 
@@ -1244,6 +1373,7 @@ End Sub
 
 Private Sub dp_WritePatternHourly(rc As Object, cfg As Object)
     dp_AggregatePatterns rc, cfg
+    Dim nTop As Long: nTop = rc("nTop")
     Dim otherRank As Long: otherRank = rc("otherRank")
     Dim modalGrid() As String: modalGrid = rc("modalGrid")
     Dim occ() As Long: occ = rc("pa_occ")
@@ -1252,23 +1382,20 @@ Private Sub dp_WritePatternHourly(rc As Object, cfg As Object)
     Dim cM() As Double: cM = rc("pa_cM")
     Dim dM() As Double: dM = rc("pa_dM")
     Dim netM() As Double: netM = rc("pa_netM")
-    Dim cPxM() As Double: cPxM = rc("pa_cPxM")
-    Dim cWM() As Double: cWM = rc("pa_cWM")
-    Dim dPxM() As Double: dPxM = rc("pa_dPxM")
-    Dim dWM() As Double: dWM = rc("pa_dWM")
+    Dim cPxSum() As Double: cPxSum = rc("pa_cPxSum")
+    Dim dPxSum() As Double: dPxSum = rc("pa_dPxSum")
     Dim pxSum() As Double: pxSum = rc("pa_pxSum")
     Dim socSum() As Double: socSum = rc("pa_socSum")
     Dim socCnt() As Long: socCnt = rc("pa_socCnt")
-    Dim labels() As String: labels = rc("labels")
 
     Dim nc As Long: nc = 13
-    Dim nRowsOut As Long: nRowsOut = otherRank * 24
+    Dim nRowsOut As Long: nRowsOut = otherRank * 24     ' top-N + Other
     Dim o() As Variant: ReDim o(1 To nRowsOut + 1, 1 To nc)
     Dim hdr As Variant
     hdr = Array("pattern_rank", "pattern_label", "he", "modal_state", _
         "charge_freq_pct_within_pattern", "discharge_freq_pct_within_pattern", _
         "mean_charge_mwh", "mean_discharge_mwh", "mean_net_mwh", _
-        "charge_vwap", "discharge_vwap", "mean_price", "mean_soc")
+        "charge_price_mean", "discharge_price_mean", "mean_price", "mean_soc")
     Dim c As Long
     For c = 1 To nc: o(1, c) = hdr(c - 1): Next c
 
@@ -1277,7 +1404,7 @@ Private Sub dp_WritePatternHourly(rc As Object, cfg As Object)
         For hh = 1 To 24
             r = r + 1
             o(r, 1) = IIf(rk = otherRank, "Other", CStr(rk))
-            o(r, 2) = labels(rk)
+            o(r, 2) = dp_SlotLabel(rk, nTop)
             o(r, 3) = hh
             o(r, 4) = modalGrid(rk, hh)
             o(r, 5) = dp_Div(cCnt(rk, hh), occ(rk, hh))
@@ -1285,8 +1412,8 @@ Private Sub dp_WritePatternHourly(rc As Object, cfg As Object)
             o(r, 7) = dp_Div(cM(rk, hh), cCnt(rk, hh))
             o(r, 8) = dp_Div(dM(rk, hh), dCnt(rk, hh))
             o(r, 9) = dp_Div(netM(rk, hh), occ(rk, hh))
-            o(r, 10) = dp_VWAP(cPxM(rk, hh), cWM(rk, hh))
-            o(r, 11) = dp_VWAP(dPxM(rk, hh), dWM(rk, hh))
+            If cCnt(rk, hh) > 0 Then o(r, 10) = dp_Div(cPxSum(rk, hh), cCnt(rk, hh)) Else o(r, 10) = ""
+            If dCnt(rk, hh) > 0 Then o(r, 11) = dp_Div(dPxSum(rk, hh), dCnt(rk, hh)) Else o(r, 11) = ""
             o(r, 12) = dp_Div(pxSum(rk, hh), occ(rk, hh))
             If socCnt(rk, hh) > 0 Then o(r, 13) = dp_Div(socSum(rk, hh), socCnt(rk, hh)) Else o(r, 13) = ""
         Next hh
@@ -1316,8 +1443,7 @@ Private Sub dp_WriteDailyAssignment(rc As Object, cfg As Object)
     Dim daySig() As String: daySig = rc("daySig")
     Dim dayComplete() As Boolean: dayComplete = rc("dayComplete")
     Dim dayRank() As Long: dayRank = rc("dayRank")
-    Dim otherRank As Long: otherRank = rc("otherRank")
-    Dim labels() As String: labels = rc("labels")
+    Dim nTop As Long: nTop = rc("nTop")
 
     ' Daily totals rebuilt here from rows (kept local; small vs. n).
     Dim n As Long: n = rc("n")
@@ -1360,10 +1486,12 @@ Private Sub dp_WriteDailyAssignment(rc As Object, cfg As Object)
         If dayComplete(di) Then
             o(r, 3) = daySig(di)
             rk = dayRank(di)
-            If rk = 0 Then
-                o(r, 4) = "Other": o(r, 5) = "Other"
+            If rk >= 1 Then
+                o(r, 4) = rk: o(r, 5) = dp_SlotLabel(rk, nTop)
+            ElseIf rk = -2 Then
+                o(r, 4) = "Idle": o(r, 5) = "Idle"
             Else
-                o(r, 4) = rk: o(r, 5) = labels(rk)
+                o(r, 4) = "Other": o(r, 5) = "Other"
             End If
         Else
             o(r, 3) = "(incomplete)"
@@ -1421,160 +1549,60 @@ Private Sub dp_BuildCharts(rc As Object, cfg As Object)
     Set wsC = dp_FreshSheet(SH_CHARTS)
     Set wsD = dp_FreshSheet(SH_CHARTDATA)
 
-    ' Remove any leftover chart objects.
+    ' Delete every existing ChartObject so repeat runs do not accumulate charts.
     Dim co As ChartObject
-    For Each co In wsC.ChartObjects: co.Delete: Next co
+    For Each co In wsC.ChartObjects
+        co.Delete
+    Next co
 
-    Dim titleSfx As String
-    titleSfx = " (sim: " & IIf(Len(cfg("simFilter")) = 0, "all", cfg("simFilter")) & _
-               ", price: " & cfg("priceHdr") & ")"
-
-    ' ---- Stage: HE axis + hourly-profile series (block starting col 1) ------
-    Dim heCol As Variant: heCol = dp_HeCol()
-    dp_StageBlock wsD, 1, 1, Array("HE", "disFreq", "negChgFreq", "meanPrice", "chgVWAP", "disVWAP"), _
-        Array(heCol, rc("hp_disFreq"), dp_Negate(rc("hp_chgFreq")), rc("hp_meanPrice"), _
-              rc("hp_chgVWAP"), rc("hp_disVWAP"))
-
-    ' Chart 1: Frequency by hour (discharge up, charge down) + price/VWAP lines.
-    dp_ChartFreqByHour wsC, wsD, 1, titleSfx
-
-    ' ---- Stage: price distribution block (col 9) ----------------------------
-    dp_StageBlock wsD, 1, 9, Array("HE", "chgP10", "chgP50", "chgP90", "disP10", "disP50", "disP90", "meanPrice"), _
-        Array(heCol, rc("hp_chgP10"), rc("hp_chgP50"), rc("hp_chgP90"), _
-              rc("hp_disP10"), rc("hp_disP50"), rc("hp_disP90"), rc("hp_meanPrice"))
-    dp_ChartPriceDist wsC, wsD, 9, titleSfx
-
-    ' ---- Pattern-based charts need the aggregates -----------------------
     dp_AggregatePatterns rc, cfg
-    Dim otherRank As Long: otherRank = rc("otherRank")
+    dp_AggregateMonthly rc
+
+    Dim sfx As String
+    sfx = " (sim: " & IIf(Len(cfg("simFilter")) = 0, "all", cfg("simFilter")) & _
+          ", price: " & cfg("priceHdr") & ")"
+
     Dim nTop As Long: nTop = rc("nTop")
+    Dim otherRank As Long: otherRank = rc("otherRank")
+    Dim slots As Long: slots = rc("slots")
+    Dim heCol As Variant: heCol = dp_HeCol()
+
     Dim netM() As Double: netM = rc("pa_netM")
+    Dim occ() As Long: occ = rc("pa_occ")
     Dim socSum() As Double: socSum = rc("pa_socSum")
     Dim socCnt() As Long: socCnt = rc("pa_socCnt")
-    Dim occ() As Long: occ = rc("pa_occ")
-    Dim labels() As String: labels = rc("labels")
 
-    ' ---- Stage: net MWh by HE per rank (col 19) -----------------------------
-    Dim headsN() As String: ReDim headsN(0 To otherRank)
-    Dim colsN() As Variant: ReDim colsN(0 To otherRank)
-    headsN(0) = "HE": colsN(0) = heCol
+    ' Layout: 2 tiles per row, 460 x 290 pts, 20-pt gutters.
+    Const TW As Double = 460, TH As Double = 290, GUT As Double = 20
+    Const X0 As Double = 15, Y0 As Double = 15
     Dim rk As Long, hh As Long
-    For rk = 1 To otherRank
-        headsN(rk) = labels(rk)
-        Dim v As Variant: ReDim v(1 To 24)
-        For hh = 1 To 24                                  ' mean net MWh by HE
-            If occ(rk, hh) > 0 Then v(hh) = netM(rk, hh) / occ(rk, hh) Else v(hh) = 0
-        Next hh
-        colsN(rk) = v
-    Next rk
-    dp_StageBlock wsD, 1, 19, headsN, colsN
 
-    ' Chart 2 group: one profile chart per top-N pattern (comparable scales).
-    dp_ChartPatternProfiles wsC, wsD, 19, rc, cfg, titleSfx
+    On Error Resume Next        ' charts are best-effort; a quirk skips one, not all
 
-    ' ---- Stage: mean SOC by HE per rank (col 30), only if SOC present -------
-    If rc("socPresent") Then
-        Dim headsS() As String: ReDim headsS(0 To otherRank)
-        Dim colsS() As Variant: ReDim colsS(0 To otherRank)
-        headsS(0) = "HE": colsS(0) = heCol
-        For rk = 1 To otherRank
-            headsS(rk) = labels(rk)
-            Dim vs As Variant: ReDim vs(1 To 24)
-            For hh = 1 To 24
-                If socCnt(rk, hh) > 0 Then vs(hh) = socSum(rk, hh) / socCnt(rk, hh) Else vs(hh) = ""
-            Next hh
-            colsS(rk) = vs
-        Next rk
-        dp_StageBlock wsD, 1, 30, headsS, colsS
-        dp_ChartSocByPattern wsC, wsD, 30, rc, titleSfx
-    End If
+    ' ---- Chart 1: frequency by hour ---------------------------------------
+    dp_StageBlock wsD, 1, 1, Array("HE", "disFreq", "chgFreqNeg", "meanPrice"), _
+        Array(heCol, rc("hp_disFreq"), dp_Negate(rc("hp_chgFreq")), rc("hp_meanPrice")), 24
+    dp_Chart1Freq wsC, wsD, 1, X0, Y0, TW, TH, sfx
 
-    ' Chart 3: Pattern heatmap (cell-based, on the Charts sheet).
-    dp_BuildHeatmap wsC, rc
-
-    wsD.Visible = xlSheetVeryHidden
-End Sub
-
-Private Sub dp_ChartFreqByHour(wsC As Worksheet, wsD As Worksheet, ByVal col0 As Long, ByVal sfx As String)
-    Dim ch As Chart
-    Set ch = dp_NewChart(wsC, 0)
-    Dim rng As Range
-    Set rng = wsD.Cells(1, col0).Resize(25, 3)   ' HE, disFreq, negChgFreq
-    ch.SetSourceData Source:=rng, PlotBy:=xlColumns
-    ch.ChartType = xlColumnClustered
-    On Error Resume Next
-    ch.SeriesCollection(1).XValues = wsD.Cells(2, col0).Resize(24, 1)
-    ch.HasTitle = True
-    ch.ChartTitle.Text = "Charge / discharge frequency by hour-ending" & sfx
-    ch.SeriesCollection(1).Name = "Discharge freq"
-    ch.SeriesCollection(2).Name = "Charge freq (neg)"
-    ch.SeriesCollection(1).Format.Fill.ForeColor.RGB = dp_PatternColor(1)
-    ch.SeriesCollection(2).Format.Fill.ForeColor.RGB = dp_TintColor(dp_PatternColor(1), 0.5)
-
-    ' Secondary-axis mean price line + dashed VWAP lines.
-    Dim sMean As Series, sCv As Series, sDv As Series
-    Set sMean = ch.SeriesCollection.NewSeries
-    sMean.Name = "Mean price": sMean.Values = wsD.Cells(2, col0 + 3).Resize(24, 1)
-    sMean.XValues = wsD.Cells(2, col0).Resize(24, 1)
-    sMean.ChartType = xlLine: sMean.AxisGroup = xlSecondary
-    Set sCv = ch.SeriesCollection.NewSeries
-    sCv.Name = "Charge VWAP": sCv.Values = wsD.Cells(2, col0 + 4).Resize(24, 1)
-    sCv.ChartType = xlLine: sCv.AxisGroup = xlSecondary
-    sCv.Format.Line.DashStyle = msoLineDash: sCv.Format.Line.ForeColor.RGB = dp_TintColor(dp_PatternColor(1), 0.4)
-    Set sDv = ch.SeriesCollection.NewSeries
-    sDv.Name = "Discharge VWAP": sDv.Values = wsD.Cells(2, col0 + 5).Resize(24, 1)
-    sDv.ChartType = xlLine: sDv.AxisGroup = xlSecondary
-    sDv.Format.Line.DashStyle = msoLineDash: sDv.Format.Line.ForeColor.RGB = dp_PatternColor(1)
-
-    ch.Axes(xlCategory).HasTitle = True: ch.Axes(xlCategory).AxisTitle.Text = "Hour ending"
-    ch.Axes(xlValue, xlPrimary).HasTitle = True: ch.Axes(xlValue, xlPrimary).AxisTitle.Text = "Frequency (share of days)"
-    ch.Axes(xlValue, xlSecondary).HasTitle = True: ch.Axes(xlValue, xlSecondary).AxisTitle.Text = "Price ($/MWh)"
-    ch.HasLegend = True
-    On Error GoTo 0
-End Sub
-
-Private Sub dp_ChartPriceDist(wsC As Worksheet, wsD As Worksheet, ByVal col0 As Long, ByVal sfx As String)
-    Dim ch As Chart
-    Set ch = dp_NewChart(wsC, 1)
-    ch.ChartType = xlLine
-    On Error Resume Next
-    Dim names As Variant
-    names = Array("Charge P10", "Charge P50", "Charge P90", "Discharge P10", "Discharge P50", "Discharge P90", "Mean price")
-    Dim k As Long, s As Series
-    For k = 1 To 7
-        Set s = ch.SeriesCollection.NewSeries
-        s.Name = names(k - 1)
-        s.Values = wsD.Cells(2, col0 + k).Resize(24, 1)
-        s.XValues = wsD.Cells(2, col0).Resize(24, 1)
-        s.ChartType = xlLine
-        If k <= 3 Then
-            s.Format.Line.ForeColor.RGB = dp_TintColor(dp_PatternColor(1), 0.3)
-        ElseIf k <= 6 Then
-            s.Format.Line.ForeColor.RGB = dp_PatternColor(1)
+    ' ---- Chart 2: mean net MWh by hour ------------------------------------
+    Dim netPos As Variant, netNeg As Variant: netPos = rc("hp_netMean"): netNeg = rc("hp_netMean")
+    Dim nm As Variant: nm = rc("hp_netMean")
+    ReDim netPos(1 To 24): ReDim netNeg(1 To 24)
+    For hh = 1 To 24
+        Dim mv As Double: mv = 0
+        If IsNumeric(nm(hh)) Then mv = CDbl(nm(hh))
+        If mv >= 0 Then
+            netPos(hh) = mv: netNeg(hh) = 0
         Else
-            s.Format.Line.ForeColor.RGB = RGB(60, 60, 60)
-            s.Format.Line.DashStyle = msoLineDash
+            netPos(hh) = 0: netNeg(hh) = mv
         End If
-    Next k
-    ch.HasTitle = True
-    ch.ChartTitle.Text = "Price distribution by hour (charge vs discharge P10/P50/P90)" & sfx
-    ch.Axes(xlCategory).HasTitle = True: ch.Axes(xlCategory).AxisTitle.Text = "Hour ending"
-    ch.Axes(xlValue).HasTitle = True: ch.Axes(xlValue).AxisTitle.Text = "Price ($/MWh)"
-    ch.HasLegend = True
-    On Error GoTo 0
-End Sub
+    Next hh
+    dp_StageBlock wsD, 1, 7, Array("HE", "netDis", "netChg", "meanPrice"), _
+        Array(heCol, netPos, netNeg, rc("hp_meanPrice")), 24
+    dp_Chart2Net wsC, wsD, 7, X0 + TW + GUT, Y0, TW, TH, sfx
 
-Private Sub dp_ChartPatternProfiles(wsC As Worksheet, wsD As Worksheet, ByVal col0 As Long, _
-                                    rc As Object, cfg As Object, ByVal sfx As String)
-    Dim nTop As Long: nTop = rc("nTop")
-    Dim labels() As String: labels = rc("labels")
-    Dim piArray As Variant: piArray = rc("piArray")
-
-    ' Common y-scale across the top-N profile charts.
-    Dim netM() As Double: netM = rc("pa_netM")
-    Dim occ() As Long: occ = rc("pa_occ")
-    Dim lo As Double, hi As Double, rk As Long, hh As Long, mv As Double
-    lo = 0: hi = 0
+    ' ---- Chart 3: pattern profiles (one per top-N, comparable scales) ------
+    Dim lo As Double, hi As Double: lo = 0: hi = 0
     For rk = 1 To nTop
         For hh = 1 To 24
             If occ(rk, hh) > 0 Then
@@ -1584,147 +1612,504 @@ Private Sub dp_ChartPatternProfiles(wsC As Worksheet, wsD As Worksheet, ByVal co
             End If
         Next hh
     Next rk
-    If hi = lo Then hi = lo + 1
+    If hi <= lo Then hi = lo + 1
+    Dim headsP() As String: ReDim headsP(0 To 2 * nTop)
+    Dim colsP() As Variant: ReDim colsP(0 To 2 * nTop)
+    headsP(0) = "HE": colsP(0) = heCol
+    For rk = 1 To nTop
+        Dim vp As Variant, vn As Variant: ReDim vp(1 To 24): ReDim vn(1 To 24)
+        For hh = 1 To 24
+            mv = 0
+            If occ(rk, hh) > 0 Then mv = netM(rk, hh) / occ(rk, hh)
+            If mv >= 0 Then
+                vp(hh) = mv: vn(hh) = 0
+            Else
+                vp(hh) = 0: vn(hh) = mv
+            End If
+        Next hh
+        headsP(2 * rk - 1) = "P" & rk & " dis": colsP(2 * rk - 1) = vp
+        headsP(2 * rk) = "P" & rk & " chg": colsP(2 * rk) = vn
+    Next rk
+    If nTop > 0 Then
+        dp_StageBlock wsD, 1, 13, headsP, colsP, 24
+        dp_Chart3Profiles wsC, wsD, 13, rc, lo, hi, X0, Y0 + TH + GUT, sfx
+    End If
 
+    ' ---- Chart 4: price distribution by hour ------------------------------
+    Dim chgBand As Variant, disBand As Variant
+    chgBand = dp_BandCol(rc("hp_chgP10"), rc("hp_chgP90"))
+    disBand = dp_BandCol(rc("hp_disP10"), rc("hp_disP90"))
+    dp_StageBlock wsD, 1, 13 + (2 * nTop + 2), _
+        Array("HE", "chgP10", "chgBand", "disP10", "disBand", "chgP50", "chgP90", "disP50", "disP90", "meanPrice"), _
+        Array(heCol, rc("hp_chgP10"), chgBand, rc("hp_disP10"), disBand, _
+              rc("hp_chgP50"), rc("hp_chgP90"), rc("hp_disP50"), rc("hp_disP90"), rc("hp_meanPrice")), 24
+    dp_Chart4PriceDist wsC, wsD, 13 + (2 * nTop + 2), X0, Y0 + 2 * (TH + GUT), TW, TH, sfx
+
+    ' ---- Chart 5: mean SOC by pattern (only if SOC present) ---------------
+    If rc("socPresent") Then
+        Dim cSoc As Long: cSoc = 13 + (2 * nTop + 2) + 11
+        Dim headsS() As String: ReDim headsS(0 To otherRank)
+        Dim colsS() As Variant: ReDim colsS(0 To otherRank)
+        Dim maxSoc As Double: maxSoc = 0
+        headsS(0) = "HE": colsS(0) = heCol
+        For rk = 1 To otherRank
+            headsS(rk) = dp_SlotLabel(rk, nTop)
+            Dim vsoc As Variant: ReDim vsoc(1 To 24)
+            For hh = 1 To 24
+                If socCnt(rk, hh) > 0 Then
+                    vsoc(hh) = socSum(rk, hh) / socCnt(rk, hh)
+                    If vsoc(hh) > maxSoc Then maxSoc = vsoc(hh)
+                Else
+                    vsoc(hh) = ""
+                End If
+            Next hh
+            colsS(rk) = vsoc
+        Next rk
+        dp_StageBlock wsD, 1, cSoc, headsS, colsS, 24
+        dp_Chart5Soc wsC, wsD, cSoc, otherRank, nTop, maxSoc, X0 + TW + GUT, Y0 + 2 * (TH + GUT), TW, TH, sfx
+    End If
+
+    ' ---- Charts 6 & 7: monthly views --------------------------------------
+    Dim nMonths As Long: nMonths = rc("mo_nMonths")
+    If nMonths > 0 Then
+        Dim moLabels() As String: moLabels = rc("mo_labels")
+        Dim moCount() As Long: moCount = rc("mo_count")
+        Dim moLabV As Variant: ReDim moLabV(1 To nMonths)
+        Dim a As Long
+        For a = 1 To nMonths: moLabV(a) = moLabels(a): Next a
+
+        Dim headsM() As String: ReDim headsM(0 To slots)
+        Dim colsM() As Variant: ReDim colsM(0 To slots)
+        headsM(0) = "month": colsM(0) = moLabV
+        For rk = 1 To slots
+            headsM(rk) = dp_SlotLabel(rk, nTop)
+            Dim vc As Variant: ReDim vc(1 To nMonths)
+            For a = 1 To nMonths: vc(a) = moCount(a, rk): Next a
+            colsM(rk) = vc
+        Next rk
+        Dim cMix As Long: cMix = 13 + (2 * nTop + 2) + 11 + (otherRank + 2)
+        dp_StageBlock wsD, 1, cMix, headsM, colsM, nMonths
+        dp_Chart6MonthlyMix wsC, wsD, cMix, nMonths, slots, nTop, X0, Y0 + 3 * (TH + GUT), TW, TH, sfx
+
+        Dim cDrift As Long: cDrift = cMix + (slots + 2)
+        dp_StageBlock wsD, 1, cDrift, Array("month", "firstChg", "lastChg", "firstDis", "lastDis"), _
+            Array(moLabV, rc("mo_firstChg"), rc("mo_lastChg"), rc("mo_firstDis"), rc("mo_lastDis")), nMonths
+        dp_Chart7Drift wsC, wsD, cDrift, nMonths, X0 + TW + GUT, Y0 + 3 * (TH + GUT), TW, TH, sfx
+    End If
+
+    ' ---- Chart 8: pattern frequency ranking (horizontal bar) --------------
+    dp_Chart8Ranking wsC, wsD, rc, X0, Y0 + 4 * (TH + GUT), TW, TH, sfx
+
+    ' ---- Pattern heatmap (cell-based) -------------------------------------
+    dp_BuildHeatmap wsC, rc
+
+    On Error GoTo 0
+    wsD.Visible = xlSheetVeryHidden
+End Sub
+
+Private Sub dp_Chart1Freq(wsC As Worksheet, wsD As Worksheet, ByVal c0 As Long, _
+                          ByVal lft As Double, ByVal tp As Double, ByVal w As Double, _
+                          ByVal h As Double, ByVal sfx As String)
+    Dim ch As Chart: Set ch = dp_ChartAt(wsC, lft, tp, w, h)
+    ch.ChartType = xlColumnClustered
+    Dim xr As Range: Set xr = wsD.Cells(2, c0).Resize(24, 1)
+    Dim sD As Series, sC As Series, sP As Series
+    Set sD = dp_AddSeries(ch, "Discharge freq", xr, wsD.Cells(2, c0 + 1).Resize(24, 1))
+    sD.Format.Fill.ForeColor.RGB = dp_StateColor("D")
+    Set sC = dp_AddSeries(ch, "Charge freq (neg)", xr, wsD.Cells(2, c0 + 2).Resize(24, 1))
+    sC.Format.Fill.ForeColor.RGB = dp_StateColor("C")
+    Set sP = dp_AddSeries(ch, "Mean price", xr, wsD.Cells(2, c0 + 3).Resize(24, 1))
+    sP.ChartType = xlLine: sP.AxisGroup = xlSecondary
+    sP.Format.Line.ForeColor.RGB = RGB(80, 80, 80): sP.Format.Line.Weight = 1.75
+    dp_StyleChart ch, "Charge / discharge frequency by hour" & sfx, "Hour ending", "Frequency (share of days)"
+    On Error Resume Next
+    ch.ChartGroups(1).GapWidth = 40
+    ch.Axes(xlValue, xlPrimary).TickLabels.NumberFormat = "0%;0%"
+    ch.Axes(xlCategory).Format.Line.Weight = 1.5
+    ch.Axes(xlCategory).Format.Line.ForeColor.RGB = RGB(90, 90, 90)
+    ch.Axes(xlValue, xlSecondary).HasTitle = True
+    ch.Axes(xlValue, xlSecondary).AxisTitle.Text = "Price ($/MWh)"
+    ch.Axes(xlValue, xlSecondary).AxisTitle.Font.Size = 9
+    On Error GoTo 0
+End Sub
+
+Private Sub dp_Chart2Net(wsC As Worksheet, wsD As Worksheet, ByVal c0 As Long, _
+                         ByVal lft As Double, ByVal tp As Double, ByVal w As Double, _
+                         ByVal h As Double, ByVal sfx As String)
+    Dim ch As Chart: Set ch = dp_ChartAt(wsC, lft, tp, w, h)
+    ch.ChartType = xlColumnClustered
+    Dim xr As Range: Set xr = wsD.Cells(2, c0).Resize(24, 1)
+    Dim sD As Series, sC As Series, sP As Series
+    Set sD = dp_AddSeries(ch, "Net MWh (discharge)", xr, wsD.Cells(2, c0 + 1).Resize(24, 1))
+    sD.Format.Fill.ForeColor.RGB = dp_StateColor("D")
+    Set sC = dp_AddSeries(ch, "Net MWh (charge)", xr, wsD.Cells(2, c0 + 2).Resize(24, 1))
+    sC.Format.Fill.ForeColor.RGB = dp_StateColor("C")
+    Set sP = dp_AddSeries(ch, "Mean price", xr, wsD.Cells(2, c0 + 3).Resize(24, 1))
+    sP.ChartType = xlLine: sP.AxisGroup = xlSecondary
+    sP.Format.Line.ForeColor.RGB = RGB(80, 80, 80): sP.Format.Line.Weight = 1.75
+    dp_StyleChart ch, "Mean net MWh by hour (discharge +, charge -)" & sfx, "Hour ending", "Mean net MWh"
+    On Error Resume Next
+    ch.ChartGroups(1).GapWidth = 40
+    ch.Axes(xlValue, xlSecondary).HasTitle = True
+    ch.Axes(xlValue, xlSecondary).AxisTitle.Text = "Price ($/MWh)"
+    ch.Axes(xlValue, xlSecondary).AxisTitle.Font.Size = 9
+    On Error GoTo 0
+End Sub
+
+Private Sub dp_Chart3Profiles(wsC As Worksheet, wsD As Worksheet, ByVal c0 As Long, rc As Object, _
+                              ByVal lo As Double, ByVal hi As Double, ByVal x0 As Double, _
+                              ByVal tp As Double, ByVal sfx As String)
+    Dim nTop As Long: nTop = rc("nTop")
+    Dim slotDesc() As String: slotDesc = rc("slotDesc")
+    Dim slotShare() As Double: slotShare = rc("slotShare")
+    Dim slotMeanChg As Variant: slotMeanChg = rc("slotMeanChg")
+    Dim slotMeanDis As Variant: slotMeanDis = rc("slotMeanDis")
+    Dim slotSpread As Variant: slotSpread = rc("slotSpread")
+    Dim slotCycles As Variant: slotCycles = rc("slotCycles")
+    Dim piArray As Variant: piArray = rc("piArray")
+
+    Const PW As Double = 300, PH As Double = 290, GUT As Double = 20
     Dim k As Long
     For k = 1 To nTop
-        Dim ch As Chart
-        Set ch = dp_NewChart(wsC, 2 + (k - 1))
+        Dim ch As Chart: Set ch = dp_ChartAt(wsC, x0 + (k - 1) * (PW + GUT), tp, PW, PH)
         ch.ChartType = xlColumnClustered
+        Dim xr As Range: Set xr = wsD.Cells(2, c0).Resize(24, 1)
+        Dim sD As Series, sC As Series
+        Set sD = dp_AddSeries(ch, "discharge", xr, wsD.Cells(2, c0 + 2 * k - 1).Resize(24, 1))
+        sD.Format.Fill.ForeColor.RGB = dp_PatternColor(k)
+        Set sC = dp_AddSeries(ch, "charge", xr, wsD.Cells(2, c0 + 2 * k).Resize(24, 1))
+        sC.Format.Fill.ForeColor.RGB = dp_TintColor(dp_PatternColor(k), 0.4)
+        dp_StyleChart ch, "P" & k & ": " & slotDesc(k), "Hour ending", "Mean net MWh"
         On Error Resume Next
-        Dim s As Series
-        Set s = ch.SeriesCollection.NewSeries
-        s.Name = labels(k)
-        s.Values = wsD.Cells(2, col0 + k).Resize(24, 1)
-        s.XValues = wsD.Cells(2, col0).Resize(24, 1)
-        s.Format.Fill.ForeColor.RGB = dp_PatternColor(k)
-        ch.HasTitle = True
-        ch.ChartTitle.Text = labels(k) & ": mean net MWh by HE" & sfx
+        ch.ChartGroups(1).Overlap = 100
+        ch.ChartGroups(1).GapWidth = 30
         ch.Axes(xlValue).MinimumScale = lo
         ch.Axes(xlValue).MaximumScale = hi
-        ch.Axes(xlCategory).HasTitle = True: ch.Axes(xlCategory).AxisTitle.Text = "Hour ending"
-        ch.Axes(xlValue).HasTitle = True: ch.Axes(xlValue).AxisTitle.Text = "Mean net MWh (dis - chg)"
-        ch.HasLegend = False
-        ' Stats textbox.
         Dim tb As String
         tb = "n_days=" & piArray(k + 1, 5) & vbCrLf & _
-             "share=" & Format$(piArray(k + 1, 6), "0.0%") & vbCrLf & _
-             "chg VWAP=" & Format$(piArray(k + 1, 9), "0.00") & vbCrLf & _
-             "dis VWAP=" & Format$(piArray(k + 1, 10), "0.00") & vbCrLf & _
-             "spread=" & Format$(piArray(k + 1, 11), "0.00")
-        ch.Shapes.AddTextbox(msoTextOrientationHorizontal, 8, 18, 130, 80).TextFrame2.TextRange.Text = tb
+             "share=" & Format$(slotShare(k), "0.0%") & vbCrLf & _
+             "chg price=" & dp_FmtNum(slotMeanChg(k)) & vbCrLf & _
+             "dis price=" & dp_FmtNum(slotMeanDis(k)) & vbCrLf & _
+             "spread=" & dp_FmtNum(slotSpread(k)) & vbCrLf & _
+             "cycles=" & dp_FmtNum(slotCycles(k))
+        ch.Shapes.AddTextbox(msoTextOrientationHorizontal, 6, 16, 120, 92).TextFrame2.TextRange.Text = tb
         On Error GoTo 0
     Next k
 End Sub
 
-Private Sub dp_ChartSocByPattern(wsC As Worksheet, wsD As Worksheet, ByVal col0 As Long, _
-                                 rc As Object, ByVal sfx As String)
-    Dim otherRank As Long: otherRank = rc("otherRank")
-    Dim labels() As String: labels = rc("labels")
-    Dim ch As Chart
-    Set ch = dp_NewChart(wsC, 2 + rc("nTop"))
+Private Sub dp_Chart4PriceDist(wsC As Worksheet, wsD As Worksheet, ByVal c0 As Long, _
+                               ByVal lft As Double, ByVal tp As Double, ByVal w As Double, _
+                               ByVal h As Double, ByVal sfx As String)
+    ' Cols: HE, chgP10, chgBand, disP10, disBand, chgP50, chgP90, disP50, disP90, meanPrice
+    Dim ch As Chart: Set ch = dp_ChartAt(wsC, lft, tp, w, h)
     ch.ChartType = xlLine
+    Dim xr As Range: Set xr = wsD.Cells(2, c0).Resize(24, 1)
+
+    ' Charge band on the primary axis (stacked area: invisible base + tinted band).
+    dp_AddBand ch, xr, wsD.Cells(2, c0 + 1).Resize(24, 1), wsD.Cells(2, c0 + 2).Resize(24, 1), _
+               dp_StateColor("C"), xlPrimary
+    ' Discharge band on the secondary axis, scale-matched afterwards.
+    dp_AddBand ch, xr, wsD.Cells(2, c0 + 3).Resize(24, 1), wsD.Cells(2, c0 + 4).Resize(24, 1), _
+               dp_StateColor("D"), xlSecondary
+
+    Dim s As Series
+    Set s = dp_AddSeries(ch, "Charge P50", xr, wsD.Cells(2, c0 + 5).Resize(24, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("C")
+    Set s = dp_AddSeries(ch, "Charge P10", xr, wsD.Cells(2, c0 + 1).Resize(24, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("C"): s.Format.Line.DashStyle = msoLineDash
+    Set s = dp_AddSeries(ch, "Charge P90", xr, wsD.Cells(2, c0 + 6).Resize(24, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("C"): s.Format.Line.DashStyle = msoLineDash
+    Set s = dp_AddSeries(ch, "Discharge P50", xr, wsD.Cells(2, c0 + 7).Resize(24, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("D")
+    Set s = dp_AddSeries(ch, "Discharge P10", xr, wsD.Cells(2, c0 + 3).Resize(24, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("D"): s.Format.Line.DashStyle = msoLineDash
+    Set s = dp_AddSeries(ch, "Discharge P90", xr, wsD.Cells(2, c0 + 8).Resize(24, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("D"): s.Format.Line.DashStyle = msoLineDash
+    Set s = dp_AddSeries(ch, "Mean price", xr, wsD.Cells(2, c0 + 9).Resize(24, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = RGB(60, 60, 60): s.Format.Line.Weight = 2
+
+    dp_StyleChart ch, "Price distribution by hour (charge / discharge P10-P50-P90)" & sfx, _
+                  "Hour ending", "Price ($/MWh)"
     On Error Resume Next
+    ' Match the secondary axis to the primary so the discharge band aligns.
+    ch.Axes(xlValue, xlSecondary).MinimumScale = ch.Axes(xlValue, xlPrimary).MinimumScale
+    ch.Axes(xlValue, xlSecondary).MaximumScale = ch.Axes(xlValue, xlPrimary).MaximumScale
+    ch.Axes(xlValue, xlSecondary).MajorTickMark = xlNone
+    ch.Axes(xlValue, xlSecondary).TickLabelPosition = xlNone
+    On Error GoTo 0
+End Sub
+
+Private Sub dp_Chart5Soc(wsC As Worksheet, wsD As Worksheet, ByVal c0 As Long, ByVal otherRank As Long, _
+                         ByVal nTop As Long, ByVal maxSoc As Double, ByVal lft As Double, _
+                         ByVal tp As Double, ByVal w As Double, ByVal h As Double, ByVal sfx As String)
+    Dim ch As Chart: Set ch = dp_ChartAt(wsC, lft, tp, w, h)
+    ch.ChartType = xlLine
+    Dim xr As Range: Set xr = wsD.Cells(2, c0).Resize(24, 1)
     Dim rk As Long, s As Series
     For rk = 1 To otherRank
-        Set s = ch.SeriesCollection.NewSeries
-        s.Name = labels(rk)
-        s.Values = wsD.Cells(2, col0 + rk).Resize(24, 1)
-        s.XValues = wsD.Cells(2, col0).Resize(24, 1)
+        Set s = dp_AddSeries(ch, dp_SlotLabel(rk, nTop), xr, wsD.Cells(2, c0 + rk).Resize(24, 1))
         s.ChartType = xlLine
-        s.Format.Line.ForeColor.RGB = dp_PatternColor(IIf(rk = otherRank, -1, rk))
+        s.Format.Line.ForeColor.RGB = dp_SlotColor(rk, nTop)
         s.Format.Line.Weight = 2
     Next rk
-    ch.HasTitle = True
-    ch.ChartTitle.Text = "Mean SOC by hour-ending, per pattern" & sfx
-    ch.Axes(xlCategory).HasTitle = True: ch.Axes(xlCategory).AxisTitle.Text = "Hour ending"
-    ch.Axes(xlValue).HasTitle = True: ch.Axes(xlValue).AxisTitle.Text = "State of charge (MWh)"
-    ch.HasLegend = True
+    dp_StyleChart ch, "Mean SOC by hour, per pattern" & sfx, "Hour ending", "State of charge (MWh)"
+    On Error Resume Next
+    ch.Axes(xlValue).MinimumScale = 0
+    If maxSoc > 0 Then ch.Axes(xlValue).MaximumScale = maxSoc
+    On Error GoTo 0
+End Sub
+
+Private Sub dp_Chart6MonthlyMix(wsC As Worksheet, wsD As Worksheet, ByVal c0 As Long, ByVal nMonths As Long, _
+                                ByVal slots As Long, ByVal nTop As Long, ByVal lft As Double, _
+                                ByVal tp As Double, ByVal w As Double, ByVal h As Double, ByVal sfx As String)
+    Dim ch As Chart: Set ch = dp_ChartAt(wsC, lft, tp, w, h)
+    ch.ChartType = xlColumnStacked
+    Dim xr As Range: Set xr = wsD.Cells(2, c0).Resize(nMonths, 1)
+    Dim rk As Long, s As Series
+    For rk = 1 To slots
+        Set s = dp_AddSeries(ch, dp_SlotLabel(rk, nTop), xr, wsD.Cells(2, c0 + rk).Resize(nMonths, 1))
+        s.Format.Fill.ForeColor.RGB = dp_SlotColor(rk, nTop)
+    Next rk
+    dp_StyleChart ch, "Monthly pattern mix" & sfx, "Month", "Days"
+    On Error Resume Next
+    ch.ChartGroups(1).GapWidth = 30
+    On Error GoTo 0
+End Sub
+
+Private Sub dp_Chart7Drift(wsC As Worksheet, wsD As Worksheet, ByVal c0 As Long, ByVal nMonths As Long, _
+                           ByVal lft As Double, ByVal tp As Double, ByVal w As Double, _
+                           ByVal h As Double, ByVal sfx As String)
+    Dim ch As Chart: Set ch = dp_ChartAt(wsC, lft, tp, w, h)
+    ch.ChartType = xlLine
+    Dim xr As Range: Set xr = wsD.Cells(2, c0).Resize(nMonths, 1)
+    Dim s As Series
+    Set s = dp_AddSeries(ch, "First charge HE", xr, wsD.Cells(2, c0 + 1).Resize(nMonths, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("C")
+    Set s = dp_AddSeries(ch, "Last charge HE", xr, wsD.Cells(2, c0 + 2).Resize(nMonths, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("C"): s.Format.Line.DashStyle = msoLineDash
+    Set s = dp_AddSeries(ch, "First discharge HE", xr, wsD.Cells(2, c0 + 3).Resize(nMonths, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("D")
+    Set s = dp_AddSeries(ch, "Last discharge HE", xr, wsD.Cells(2, c0 + 4).Resize(nMonths, 1))
+    s.ChartType = xlLine: s.Format.Line.ForeColor.RGB = dp_StateColor("D"): s.Format.Line.DashStyle = msoLineDash
+    dp_StyleChart ch, "Dispatch timing drift by month" & sfx, "Month", "Hour ending"
+    On Error Resume Next
+    ch.Axes(xlValue).MinimumScale = 1
+    ch.Axes(xlValue).MaximumScale = 24
+    On Error GoTo 0
+End Sub
+
+Private Sub dp_Chart8Ranking(wsC As Worksheet, wsD As Worksheet, rc As Object, ByVal lft As Double, _
+                             ByVal tp As Double, ByVal w As Double, ByVal h As Double, ByVal sfx As String)
+    Dim nTop As Long: nTop = rc("nTop")
+    Dim otherRank As Long: otherRank = rc("otherRank")
+    Dim slotDesc() As String: slotDesc = rc("slotDesc")
+    Dim slotShare() As Double: slotShare = rc("slotShare")
+    Dim piArray As Variant: piArray = rc("piArray")
+
+    ' Build (label+descriptor, share, n_days) for top-N + Other, sort by share desc.
+    Dim m As Long: m = otherRank
+    Dim lab() As String: ReDim lab(1 To m)
+    Dim shr() As Double: ReDim shr(1 To m)
+    Dim nd() As Long: ReDim nd(1 To m)
+    Dim slotIx() As Long: ReDim slotIx(1 To m)
+    Dim rk As Long
+    For rk = 1 To m
+        lab(rk) = dp_SlotLabel(rk, nTop) & ": " & slotDesc(rk)
+        shr(rk) = slotShare(rk)
+        nd(rk) = CLng(piArray(rk + 1, 5))
+        slotIx(rk) = rk
+    Next rk
+    Dim a As Long, b As Long
+    For a = 1 To m - 1
+        For b = a + 1 To m
+            If shr(b) > shr(a) Then
+                dp_SwapS lab, a, b: dp_SwapD shr, a, b: dp_SwapL nd, a, b: dp_SwapL slotIx, a, b
+            End If
+        Next b
+    Next a
+
+    Dim labV As Variant: ReDim labV(1 To m)
+    Dim shrV As Variant: ReDim shrV(1 To m)
+    For a = 1 To m: labV(a) = lab(a): shrV(a) = shr(a): Next a
+    Dim cRank As Long: cRank = 200      ' isolated staging column, well clear of others
+    dp_StageBlock wsD, 1, cRank, Array("pattern", "share"), Array(labV, shrV), m
+
+    Dim ch As Chart: Set ch = dp_ChartAt(wsC, lft, tp, w, h)
+    ch.ChartType = xlBarClustered
+    Dim s As Series
+    Set s = dp_AddSeries(ch, "Share of days", wsD.Cells(2, cRank).Resize(m, 1), wsD.Cells(2, cRank + 1).Resize(m, 1))
+    dp_StyleChart ch, "Pattern frequency ranking" & sfx, "Share of days", "Pattern"
+    On Error Resume Next
+    ch.HasLegend = False
+    ch.Axes(xlValue).TickLabels.NumberFormat = "0%"
+    Dim pt As Point
+    For a = 1 To m
+        Set pt = s.Points(a)
+        pt.Format.Fill.ForeColor.RGB = dp_SlotColor(slotIx(a), nTop)
+        pt.HasDataLabel = True
+        pt.DataLabel.Text = nd(a) & " (" & Format$(shr(a), "0.0%") & ")"
+        pt.DataLabel.Font.Size = 8
+    Next a
     On Error GoTo 0
 End Sub
 
 Private Sub dp_BuildHeatmap(wsC As Worksheet, rc As Object)
-    ' Cell-based heatmap under the charts: rows = patterns, cols = HE1..24.
-    Dim otherRank As Long: otherRank = rc("otherRank")
+    ' Cell-based heatmap: rows = patterns (top-N, Other, Idle), cols = HE1..24.
+    ' Fill = pattern colour (discharge full, charge tinted by within-pattern
+    ' frequency, idle white). Text = the pattern's mean price at that HE.
+    Dim nTop As Long: nTop = rc("nTop")
+    Dim slots As Long: slots = rc("slots")
     Dim modalGrid() As String: modalGrid = rc("modalGrid")
     Dim cCnt() As Long: cCnt = rc("pa_cCnt")
-    Dim dCnt() As Long: dCnt = rc("pa_dCnt")
     Dim occ() As Long: occ = rc("pa_occ")
-    Dim cPxM() As Double: cPxM = rc("pa_cPxM")
-    Dim cWM() As Double: cWM = rc("pa_cWM")
-    Dim dPxM() As Double: dPxM = rc("pa_dPxM")
-    Dim dWM() As Double: dWM = rc("pa_dWM")
-    Dim labels() As String: labels = rc("labels")
+    Dim pxSum() As Double: pxSum = rc("pa_pxSum")
 
-    Dim top As Long: top = 2      ' anchor row on the Charts sheet
+    Dim topR As Long: topR = 100        ' anchor well below the floating charts
     Dim leftC As Long: leftC = 1
-    wsC.Cells(top, leftC).Value = "Pattern heatmap - fill = state (discharge solid, charge tinted); text = hour VWAP"
-    wsC.Cells(top, leftC).Font.Bold = True
 
-    Dim hh As Long
-    For hh = 1 To 24
-        wsC.Cells(top + 1, leftC + hh).Value = "HE" & hh
-        wsC.Cells(top + 1, leftC + hh).Font.Bold = True
-    Next hh
-
-    Dim rk As Long, st As String, cell As Range, base As Long, tint As Double, vwap As Double
-    For rk = 1 To otherRank
-        wsC.Cells(top + 1 + rk, leftC).Value = labels(rk)
-        wsC.Cells(top + 1 + rk, leftC).Font.Bold = True
-        base = dp_PatternColor(IIf(rk = otherRank, -1, rk))
+    ' Precompute the text array, then write it in one shot.
+    Dim txt() As Variant: ReDim txt(1 To slots + 1, 1 To 25)
+    txt(1, 1) = "Pattern \ HE"
+    Dim hh As Long, rk As Long
+    For hh = 1 To 24: txt(1, hh + 1) = "HE" & hh: Next hh
+    For rk = 1 To slots
+        txt(rk + 1, 1) = dp_SlotLabel(rk, nTop)
         For hh = 1 To 24
-            Set cell = wsC.Cells(top + 1 + rk, leftC + hh)
+            Dim mp As Double: mp = dp_Div(pxSum(rk, hh), occ(rk, hh))
+            If occ(rk, hh) > 0 Then txt(rk + 1, hh + 1) = mp Else txt(rk + 1, hh + 1) = ""
+        Next hh
+    Next rk
+    wsC.Cells(topR, leftC).Resize(slots + 1, 25).Value = txt
+    wsC.Range(wsC.Cells(topR, leftC), wsC.Cells(topR, leftC + 24)).Font.Bold = True
+    wsC.Range(wsC.Cells(topR + 1, leftC), wsC.Cells(topR + slots, leftC)).Font.Bold = True
+
+    ' Colour the value cells.
+    Dim st As String, cell As Range, base As Long, tint As Double
+    For rk = 1 To slots
+        base = dp_SlotColor(rk, nTop)
+        For hh = 1 To 24
+            Set cell = wsC.Cells(topR + rk, leftC + hh)
             st = modalGrid(rk, hh)
             Select Case st
                 Case "D", "B"
                     cell.Interior.Color = base
-                    vwap = dp_Div(dPxM(rk, hh), dWM(rk, hh))
                 Case "C"
-                    ' Tint scaled by within-pattern charge frequency.
-                    tint = 0.7 - 0.5 * dp_Div(cCnt(rk, hh), occ(rk, hh))
+                    tint = 0.75 - 0.55 * dp_Div(cCnt(rk, hh), occ(rk, hh))
                     cell.Interior.Color = dp_TintColor(base, tint)
-                    vwap = dp_Div(cPxM(rk, hh), cWM(rk, hh))
                 Case Else
                     cell.Interior.Color = RGB(255, 255, 255)
-                    vwap = 0
             End Select
-            If vwap <> 0 Then
-                cell.Value = vwap
-                cell.NumberFormat = "0"
-            End If
+            cell.NumberFormat = "0"
             cell.Font.Color = dp_ContrastFont(cell.Interior.Color)
             cell.HorizontalAlignment = xlCenter
         Next hh
     Next rk
+
+    ' Legend block beneath the grid.
+    Dim lr As Long: lr = topR + slots + 2
+    wsC.Cells(lr, leftC).Value = "Legend"
+    wsC.Cells(lr, leftC).Font.Bold = True
+    wsC.Cells(lr + 1, leftC).Value = "Fill = modal state per HE: discharge = solid pattern colour, " & _
+        "charge = tinted (lighter = less frequent), idle = white."
+    wsC.Cells(lr + 2, leftC).Value = "Cell text = the pattern's mean price at that HE ($/MWh)."
     wsC.Columns.AutoFit
 End Sub
 
-Private Function dp_NewChart(ws As Worksheet, ByVal idx As Long) As Chart
-    ' Non-overlapping grid: 2 columns of chart tiles below the heatmap band.
-    Const W As Double = 460, H As Double = 260
-    Const X0 As Double = 20, Y0 As Double = 160
-    Dim col As Long, row As Long
-    col = idx Mod 2
-    row = idx \ 2
+
+'==== SECTION: CHART HELPERS ===================================================
+
+Private Function dp_ChartAt(wsC As Worksheet, ByVal lft As Double, ByVal tp As Double, _
+                            ByVal w As Double, ByVal h As Double) As Chart
     Dim co As ChartObject
-    Set co = ws.ChartObjects.Add(X0 + col * (W + 20), Y0 + row * (H + 20), W, H)
-    Set dp_NewChart = co.Chart
+    Set co = wsC.ChartObjects.Add(lft, tp, w, h)
+    Set dp_ChartAt = co.Chart
 End Function
+
+Private Function dp_AddSeries(ch As Chart, ByVal nm As String, xRng As Range, yRng As Range) As Series
+    Dim s As Series
+    Set s = ch.SeriesCollection.NewSeries
+    s.Name = nm
+    s.Values = yRng
+    s.XValues = xRng
+    Set dp_AddSeries = s
+End Function
+
+Private Sub dp_StyleChart(ch As Chart, ByVal ttl As String, ByVal xt As String, ByVal yt As String)
+    On Error Resume Next
+    ch.HasTitle = True
+    ch.ChartTitle.Text = ttl
+    ch.ChartTitle.Font.Size = 10
+    ch.HasLegend = True
+    ch.Legend.Position = xlLegendPositionBottom
+    ch.ChartArea.Format.Line.Visible = msoFalse
+    Dim axc As Axis, axv As Axis
+    Set axc = ch.Axes(xlCategory)
+    axc.HasTitle = True: axc.AxisTitle.Text = xt: axc.AxisTitle.Font.Size = 9
+    Set axv = ch.Axes(xlValue)
+    axv.HasTitle = True: axv.AxisTitle.Text = yt: axv.AxisTitle.Font.Size = 9
+    axv.MajorGridlines.Border.Color = RGB(225, 225, 225)
+    On Error GoTo 0
+End Sub
+
+' Shaded percentile band via the stacked-area trick: an invisible base series
+' at the low percentile plus a tinted band series of (high - low) stacked on it.
+Private Sub dp_AddBand(ch As Chart, xRng As Range, loRng As Range, bandRng As Range, _
+                       ByVal clr As Long, ByVal grp As XlAxisGroup)
+    On Error Resume Next
+    Dim sBase As Series, sBand As Series
+    Set sBase = ch.SeriesCollection.NewSeries
+    sBase.Name = "_base": sBase.Values = loRng: sBase.XValues = xRng
+    sBase.ChartType = xlAreaStacked: sBase.AxisGroup = grp
+    sBase.Format.Fill.Visible = msoFalse: sBase.Format.Line.Visible = msoFalse
+    Set sBand = ch.SeriesCollection.NewSeries
+    sBand.Name = "P10-P90 band": sBand.Values = bandRng: sBand.XValues = xRng
+    sBand.ChartType = xlAreaStacked: sBand.AxisGroup = grp
+    sBand.Format.Fill.ForeColor.RGB = clr: sBand.Format.Fill.Transparency = 0.78
+    sBand.Format.Line.Visible = msoFalse
+    On Error GoTo 0
+End Sub
+
+Private Function dp_BandCol(loCol As Variant, hiCol As Variant) As Variant
+    ' (high - low) per HE, or 0 when either bound is blank.
+    Dim v As Variant: ReDim v(1 To 24)
+    Dim i As Long
+    For i = 1 To 24
+        If IsNumeric(loCol(i)) And IsNumeric(hiCol(i)) Then
+            v(i) = CDbl(hiCol(i)) - CDbl(loCol(i))
+        Else
+            v(i) = 0
+        End If
+    Next i
+    dp_BandCol = v
+End Function
+
+Private Function dp_FmtNum(ByVal v As Variant) As String
+    If IsNumeric(v) Then dp_FmtNum = Format$(CDbl(v), "0.00") Else dp_FmtNum = "n/a"
+End Function
+
+Private Sub dp_SwapS(arr() As String, ByVal i As Long, ByVal j As Long)
+    Dim t As String: t = arr(i): arr(i) = arr(j): arr(j) = t
+End Sub
+Private Sub dp_SwapD(arr() As Double, ByVal i As Long, ByVal j As Long)
+    Dim t As Double: t = arr(i): arr(i) = arr(j): arr(j) = t
+End Sub
+Private Sub dp_SwapL(arr() As Long, ByVal i As Long, ByVal j As Long)
+    Dim t As Long: t = arr(i): arr(i) = arr(j): arr(j) = t
+End Sub
 
 
 '==== SECTION: STAGING HELPERS =================================================
 
 Private Sub dp_StageBlock(ws As Worksheet, ByVal r0 As Long, ByVal c0 As Long, _
-                          heads As Variant, cols As Variant)
+                          heads As Variant, cols As Variant, ByVal nRows As Long)
     Dim nCols As Long: nCols = UBound(cols) - LBound(cols) + 1
-    Dim nRows As Long: nRows = 24
     Dim o() As Variant: ReDim o(1 To nRows + 1, 1 To nCols)
     Dim j As Long, i As Long
     For j = 1 To nCols
         o(1, j) = heads(LBound(heads) + j - 1)
         Dim col As Variant: col = cols(LBound(cols) + j - 1)
         For i = 1 To nRows
-            o(i + 1, j) = col(i)
+            o(i + 1, j) = col(LBound(col) + i - 1)
         Next i
     Next j
     ws.Cells(r0, c0).Resize(nRows + 1, nCols).Value = o
@@ -1738,10 +2123,10 @@ Private Function dp_HeCol() As Variant
 End Function
 
 Private Function dp_Negate(col As Variant) As Variant
-    Dim v As Variant: v = col
+    Dim v As Variant: ReDim v(1 To 24)
     Dim i As Long
-    For i = LBound(v) To UBound(v)
-        If IsNumeric(v(i)) Then v(i) = -CDbl(v(i))
+    For i = 1 To 24
+        If IsNumeric(col(LBound(col) + i - 1)) Then v(i) = -CDbl(col(LBound(col) + i - 1)) Else v(i) = 0
     Next i
     dp_Negate = v
 End Function
@@ -1761,12 +2146,22 @@ End Function
 
 Private Function dp_PatternColor(ByVal rank As Long) As Long
     Select Case rank
-        Case 1: dp_PatternColor = RGB(0, 114, 178)     ' blue
-        Case 2: dp_PatternColor = RGB(213, 94, 0)      ' vermillion
-        Case 3: dp_PatternColor = RGB(0, 158, 115)     ' bluish green
+        Case 1: dp_PatternColor = RGB(0, 114, 178)     ' P1 blue
+        Case 2: dp_PatternColor = RGB(213, 94, 0)      ' P2 vermillion
+        Case 3: dp_PatternColor = RGB(0, 158, 115)     ' P3 bluish green
         Case 4: dp_PatternColor = RGB(230, 159, 0)     ' orange (extra ranks)
         Case 5: dp_PatternColor = RGB(204, 121, 167)   ' pink
-        Case Else: dp_PatternColor = CLR_OTHER         ' Other / -1
+        Case -2: dp_PatternColor = RGB(220, 220, 220)  ' Idle light grey
+        Case Else: dp_PatternColor = CLR_OTHER         ' Other grey RGB(150,150,150)
+    End Select
+End Function
+
+' State colour for non-pattern charts: discharge blue, charge vermillion.
+Private Function dp_StateColor(ByVal stt As String) As Long
+    Select Case UCase$(stt)
+        Case "D": dp_StateColor = RGB(0, 114, 178)
+        Case "C": dp_StateColor = RGB(213, 94, 0)
+        Case Else: dp_StateColor = RGB(150, 150, 150)
     End Select
 End Function
 
@@ -1807,10 +2202,6 @@ End Function
 
 Private Function dp_Div(ByVal num As Double, ByVal den As Double) As Double
     If den = 0 Then dp_Div = 0 Else dp_Div = num / den
-End Function
-
-Private Function dp_VWAP(ByVal pxMWh As Double, ByVal mwh As Double) As Variant
-    If mwh = 0 Then dp_VWAP = "" Else dp_VWAP = pxMWh / mwh
 End Function
 
 Private Function dp_Max(ByVal a As Long, ByVal b As Long) As Long
@@ -1955,7 +2346,7 @@ End Sub
 Private Sub dp_ShowSummary(rc As Object, cfg As Object)
     Dim piArray As Variant: piArray = rc("piArray")
     Dim nTop As Long: nTop = rc("nTop")
-    Dim descs() As String: descs = rc("descs")
+    Dim slotDesc() As String: slotDesc = rc("slotDesc")
 
     Dim msg As String
     msg = "Dispatch pattern analysis complete." & vbCrLf & _
@@ -1964,12 +2355,12 @@ Private Sub dp_ShowSummary(rc As Object, cfg As Object)
 
     Dim k As Long
     For k = 1 To nTop
-        msg = msg & "P" & k & "  " & descs(k) & vbCrLf & _
+        msg = msg & "P" & k & "  " & slotDesc(k) & vbCrLf & _
               "     days=" & piArray(k + 1, 5) & _
               "  share=" & Format$(piArray(k + 1, 6), "0.0%") & _
-              "  chgVWAP=" & Format$(piArray(k + 1, 9), "0.00") & _
-              "  disVWAP=" & Format$(piArray(k + 1, 10), "0.00") & _
-              "  spread=" & Format$(piArray(k + 1, 11), "0.00") & vbCrLf
+              "  chg price=" & dp_FmtNum(piArray(k + 1, 9)) & _
+              "  dis price=" & dp_FmtNum(piArray(k + 1, 10)) & _
+              "  spread=" & dp_FmtNum(piArray(k + 1, 11)) & vbCrLf
     Next k
 
     msg = msg & String(42, "-") & vbCrLf & _
