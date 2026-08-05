@@ -869,12 +869,10 @@ Private Sub dn_BuildCharts()
     Dim dLeft As Double, dTop As Double
     Dim lPos As Long: lPos = 0
 
-    ' common axis bounds (5% headroom around the aggregated global range)
-    Dim dRange As Double: dRange = mAggMax - mAggMin
-    If dRange <= 0 Then dRange = IIf(mAggMax = 0, 1, Abs(mAggMax))
+    ' common axis bounds: validated 5% headroom around the aggregated global range
     Dim dYMin As Double, dYMax As Double
-    dYMin = mAggMin - 0.05 * dRange
-    dYMax = mAggMax + 0.05 * dRange
+    Dim bDoScale As Boolean
+    bDoScale = dn_CommonScale(dYMin, dYMax)
 
     Dim colCharts As Object: Set colCharts = CreateObject("Scripting.Dictionary")
 
@@ -904,17 +902,21 @@ Private Sub dn_BuildCharts()
     lPos = lPos + 1
 
     ' ---- apply common Y scale to the annual + overlay charts ----
-    If UCase$(mCfgYAxisMode) = "COMMON" Then
+    ' (all series are already plotted on every chart at this point, so the value
+    '  axis exists and scale properties will take)
+    If UCase$(mCfgYAxisMode) = "COMMON" And bDoScale Then
         Dim vKey As Variant
         For Each vKey In colCharts.Keys
             Dim cc As ChartObject
             Set cc = wsCharts.ChartObjects(colCharts(vKey))
-            With cc.Chart.Axes(xlValue)
-                .MinimumScale = dYMin
-                .MaximumScale = dYMax
-            End With
+            ' MinimumScale BEFORE MaximumScale: the reverse order can transiently
+            ' invert the range and fail. Both routed through the safe setter.
+            dn_SafeAxis cc.Chart.Axes(xlValue), "MinimumScale", dYMin
+            dn_SafeAxis cc.Chart.Axes(xlValue), "MaximumScale", dYMax
         Next vKey
         dn_LogLine "Y-axis mode|Common [" & Format$(dYMin, "0.00") & " , " & Format$(dYMax, "0.00") & "]"
+    ElseIf UCase$(mCfgYAxisMode) = "COMMON" Then
+        dn_LogLine "Y-axis mode|Common requested but scaling skipped (invalid/zero range)"
     Else
         dn_LogLine "Y-axis mode|PerYear (auto-scaled)"
     End If
@@ -1061,6 +1063,45 @@ Private Function dn_NewLineChart(ws As Worksheet, ByVal dLeft As Double, ByVal d
     Set dn_NewLineChart = co
 End Function
 
+' -- validated common Y-scale bounds; returns False if scaling should be skipped
+Private Function dn_CommonScale(ByRef dYMin As Double, ByRef dYMax As Double) As Boolean
+    dn_CommonScale = False
+    dYMin = 0: dYMax = 0
+
+    If mAggMin > mAggMax Then Exit Function                 ' no valid aggregated values
+    If mAggMin = 0 And mAggMax = 0 Then
+        dn_LogLine "Y-axis|global range 0 to 0 - explicit scaling skipped"
+        Exit Function
+    End If
+
+    Dim dRange As Double: dRange = mAggMax - mAggMin
+    If dRange <= 0 Then dRange = IIf(mAggMax = 0, 1, Abs(mAggMax) * 0.1)
+    dYMin = mAggMin - 0.05 * dRange
+    dYMax = mAggMax + 0.05 * dRange
+
+    ' equal or inverted -> pad by +/-10% of the absolute value
+    If dYMin >= dYMax Then
+        Dim dPad As Double: dPad = IIf(dYMax = 0, 1, Abs(dYMax) * 0.1)
+        dYMin = dYMax - dPad
+        dYMax = dYMax + dPad
+    End If
+    If dYMin >= dYMax Then Exit Function                    ' still bad -> auto-scale
+
+    dn_CommonScale = True
+End Function
+
+' -- route every axis property assignment through here: one unsupported property
+'    logs a warning instead of aborting the whole run
+Private Sub dn_SafeAxis(ByVal ax As Object, ByVal sProp As String, ByVal vVal As Variant)
+    On Error Resume Next
+    CallByName ax, sProp, VbLet, vVal
+    If Err.Number <> 0 Then
+        dn_LogWarn "Axis property " & sProp & " not supported: " & Err.Description
+        Err.Clear
+    End If
+    On Error GoTo 0
+End Sub
+
 ' -- titles, axes, legend, gridlines, optional zero line ---------------------
 Private Sub dn_StyleChart(co As ChartObject, ByVal sTitle As String, ByVal sSub As String, _
         ByVal bAddZero As Boolean, wsStg As Worksheet, ByVal lC0 As Long)
@@ -1072,15 +1113,17 @@ Private Sub dn_StyleChart(co As ChartObject, ByVal sTitle As String, ByVal sSub 
         .ChartTitle.Font.Size = 11
         On Error GoTo 0
 
-        ' X axis
+        ' X axis is a CATEGORY axis (HE1..HE24 are text labels): use tick SPACING,
+        ' never MajorUnit / MinimumScale / MaximumScale (those are value-axis only).
         With .Axes(xlCategory)
             .HasTitle = True
             .AxisTitle.Text = IIf(UCase$(mCfgHEConv) = "BEGINNING", "Hour Beginning", "Hour Ending")
-            .MajorUnit = 2
             On Error Resume Next
             .MajorGridlines.Delete        ' category gridlines may not exist
             On Error GoTo 0
         End With
+        dn_SafeAxis .Axes(xlCategory), "TickLabelSpacing", 2
+        dn_SafeAxis .Axes(xlCategory), "TickMarkSpacing", 2
 
         ' Y axis
         With .Axes(xlValue)
@@ -1539,6 +1582,11 @@ End Function
 Private Sub dn_LogLine(ByVal sLine As String)
     If mLog Is Nothing Then Set mLog = CreateObject("Scripting.Dictionary")
     mLog.Add mLog.Count + 1, sLine
+End Sub
+
+' non-fatal warning collected into RunLog rather than raised
+Private Sub dn_LogWarn(ByVal sMsg As String)
+    dn_LogLine "WARN|" & sMsg
 End Sub
 
 Private Sub dn_Fail(ByVal sMsg As String)
