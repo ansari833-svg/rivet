@@ -88,6 +88,15 @@ Public Sub RunDispatchAnalysis()
     Dim lErrDesc As String
 
     t0 = Timer
+
+    ' Fail fast on workbook structure protection (adding/clearing sheets would
+    ' error deep in the run otherwise) with an actionable message.
+    If ThisWorkbook.ProtectStructure Then
+        MsgBox "Workbook structure is protected. Unprotect via " & _
+               "Review > Protect Workbook, then rerun.", vbExclamation, "modDispatchPatterns"
+        Exit Sub
+    End If
+
     On Error GoTo Fail
     dp_InitLog
 
@@ -102,15 +111,10 @@ Public Sub RunDispatchAnalysis()
     mProc = "dp_WritePatternHourly":   dp_WritePatternHourly rc, cfg
     mProc = "dp_WriteDailyAssignment": dp_WriteDailyAssignment rc, cfg
 
-    ' Charts are best-effort: a cosmetic charting quirk must not fail the run.
-    mProc = "dp_BuildCharts"
-    On Error Resume Next
-    dp_BuildCharts rc, cfg
-    If Err.Number <> 0 Then
-        dp_LogSet "charts_warning", "Chart build skipped: " & Err.Description
-        Err.Clear
-    End If
-    On Error GoTo Fail
+    ' dp_BuildCharts isolates each chart internally (per-chart error logged to
+    ' RunLog, failure counted) - so a single bad chart no longer costs them all,
+    ' while a genuine setup failure still propagates to the Fail handler.
+    mProc = "dp_BuildCharts":          dp_BuildCharts rc, cfg
 
     mProc = "dp_Finish"
     dp_LogSet "runtime_seconds", Format$(Timer - t0, "0.00")
@@ -1029,7 +1033,7 @@ Private Sub dp_WriteHourlyProfile(rc As Object, cfg As Object)
     Next hh
 
     Dim ws As Worksheet
-    Set ws = dp_FreshSheet(SH_HOURLY)
+    Set ws = dp_GetOrResetSheet(SH_HOURLY)
     ws.Range("A1").Resize(25, nc).Value = o
     dp_MakeTable ws, "tblHourly", 25, nc
     dp_FormatCols ws, Array(4, 6, 7), FMT_PCT
@@ -1343,7 +1347,7 @@ Private Sub dp_WritePatternIndex(rc As Object, cfg As Object)
     Next slot
 
     Dim ws As Worksheet
-    Set ws = dp_FreshSheet(SH_PATIDX)
+    Set ws = dp_GetOrResetSheet(SH_PATIDX)
     ws.Range("A1").Resize(nRowsOut + 1, nc).Value = o
     dp_MakeTable ws, "tblPatternIndex", nRowsOut + 1, nc
     dp_FormatCols ws, Array(6), FMT_PCT
@@ -1420,7 +1424,7 @@ Private Sub dp_WritePatternHourly(rc As Object, cfg As Object)
     Next rk
 
     Dim ws As Worksheet
-    Set ws = dp_FreshSheet(SH_PATHOURLY)
+    Set ws = dp_GetOrResetSheet(SH_PATHOURLY)
     ws.Range("A1").Resize(nRowsOut + 1, nc).Value = o
     dp_MakeTable ws, "tblPatternHourly", nRowsOut + 1, nc
     dp_FormatCols ws, Array(5, 6), FMT_PCT
@@ -1507,7 +1511,7 @@ Private Sub dp_WriteDailyAssignment(rc As Object, cfg As Object)
     Next di
 
     Dim ws As Worksheet
-    Set ws = dp_FreshSheet(SH_DAILY)
+    Set ws = dp_GetOrResetSheet(SH_DAILY)
     ws.Range("A1").Resize(nDays + 1, nc).Value = o
     dp_MakeTable ws, "tblDailyAssignment", nDays + 1, nc
     dp_FormatCols ws, Array(2), FMT_DATE
@@ -1522,7 +1526,7 @@ End Sub
 Private Sub dp_WriteRunLog(cfg As Object)
     On Error Resume Next
     Dim ws As Worksheet
-    Set ws = dp_FreshSheet(SH_RUNLOG)
+    Set ws = dp_GetOrResetSheet(SH_RUNLOG)
 
     Dim nRowsOut As Long: nRowsOut = mLogOrder.Count + 1
     Dim o() As Variant: ReDim o(1 To nRowsOut, 1 To 2)
@@ -1546,15 +1550,13 @@ End Sub
 
 Private Sub dp_BuildCharts(rc As Object, cfg As Object)
     Dim wsC As Worksheet, wsD As Worksheet
-    Set wsC = dp_FreshSheet(SH_CHARTS)
-    Set wsD = dp_FreshSheet(SH_CHARTDATA)
+    Set wsC = dp_GetOrResetSheet(SH_CHARTS)
+    Set wsD = dp_GetOrResetSheet(SH_CHARTDATA)
 
-    ' Delete every existing ChartObject so repeat runs do not accumulate charts.
-    Dim co As ChartObject
-    For Each co In wsC.ChartObjects
-        co.Delete
-    Next co
-
+    ' The Charts sheet was reset (its ChartObjects already cleared by the reset
+    ' helper) BEFORE ChartData, so no chart holds a reference to a cleared
+    ' staging range. ChartData is visible now (reset helper) and is hidden again
+    ' only at the very end, after every chart is built.
     dp_AggregatePatterns rc, cfg
     dp_AggregateMonthly rc
 
@@ -1576,16 +1578,24 @@ Private Sub dp_BuildCharts(rc As Object, cfg As Object)
     Const TW As Double = 460, TH As Double = 290, GUT As Double = 20
     Const X0 As Double = 15, Y0 As Double = 15
     Dim rk As Long, hh As Long
+    Dim chartFails As Long: chartFails = 0
 
-    On Error Resume Next        ' charts are best-effort; a quirk skips one, not all
+    ' Each chart is isolated: On Error Resume Next stays active across the whole
+    ' block; Err is cleared before each chart and inspected right after, so a
+    ' single failing chart is logged to RunLog and skipped instead of taking
+    ' down every remaining chart.
+    On Error Resume Next
 
     ' ---- Chart 1: frequency by hour ---------------------------------------
+    Err.Clear
     dp_StageBlock wsD, 1, 1, Array("HE", "disFreq", "chgFreqNeg", "meanPrice"), _
         Array(heCol, rc("hp_disFreq"), dp_Negate(rc("hp_chgFreq")), rc("hp_meanPrice")), 24
     dp_Chart1Freq wsC, wsD, 1, X0, Y0, TW, TH, sfx
+    dp_ChartErr "1 Frequency by hour", chartFails
 
     ' ---- Chart 2: mean net MWh by hour ------------------------------------
-    Dim netPos As Variant, netNeg As Variant: netPos = rc("hp_netMean"): netNeg = rc("hp_netMean")
+    Err.Clear
+    Dim netPos As Variant, netNeg As Variant
     Dim nm As Variant: nm = rc("hp_netMean")
     ReDim netPos(1 To 24): ReDim netNeg(1 To 24)
     For hh = 1 To 24
@@ -1600,8 +1610,10 @@ Private Sub dp_BuildCharts(rc As Object, cfg As Object)
     dp_StageBlock wsD, 1, 7, Array("HE", "netDis", "netChg", "meanPrice"), _
         Array(heCol, netPos, netNeg, rc("hp_meanPrice")), 24
     dp_Chart2Net wsC, wsD, 7, X0 + TW + GUT, Y0, TW, TH, sfx
+    dp_ChartErr "2 Mean net MWh by hour", chartFails
 
     ' ---- Chart 3: pattern profiles (one per top-N, comparable scales) ------
+    Err.Clear
     Dim lo As Double, hi As Double: lo = 0: hi = 0
     For rk = 1 To nTop
         For hh = 1 To 24
@@ -1634,8 +1646,10 @@ Private Sub dp_BuildCharts(rc As Object, cfg As Object)
         dp_StageBlock wsD, 1, 13, headsP, colsP, 24
         dp_Chart3Profiles wsC, wsD, 13, rc, lo, hi, X0, Y0 + TH + GUT, sfx
     End If
+    dp_ChartErr "3 Pattern profiles", chartFails
 
     ' ---- Chart 4: price distribution by hour ------------------------------
+    Err.Clear
     Dim chgBand As Variant, disBand As Variant
     chgBand = dp_BandCol(rc("hp_chgP10"), rc("hp_chgP90"))
     disBand = dp_BandCol(rc("hp_disP10"), rc("hp_disP90"))
@@ -1644,9 +1658,11 @@ Private Sub dp_BuildCharts(rc As Object, cfg As Object)
         Array(heCol, rc("hp_chgP10"), chgBand, rc("hp_disP10"), disBand, _
               rc("hp_chgP50"), rc("hp_chgP90"), rc("hp_disP50"), rc("hp_disP90"), rc("hp_meanPrice")), 24
     dp_Chart4PriceDist wsC, wsD, 13 + (2 * nTop + 2), X0, Y0 + 2 * (TH + GUT), TW, TH, sfx
+    dp_ChartErr "4 Price distribution", chartFails
 
     ' ---- Chart 5: mean SOC by pattern (only if SOC present) ---------------
     If rc("socPresent") Then
+        Err.Clear
         Dim cSoc As Long: cSoc = 13 + (2 * nTop + 2) + 11
         Dim headsS() As String: ReDim headsS(0 To otherRank)
         Dim colsS() As Variant: ReDim colsS(0 To otherRank)
@@ -1667,17 +1683,20 @@ Private Sub dp_BuildCharts(rc As Object, cfg As Object)
         Next rk
         dp_StageBlock wsD, 1, cSoc, headsS, colsS, 24
         dp_Chart5Soc wsC, wsD, cSoc, otherRank, nTop, maxSoc, X0 + TW + GUT, Y0 + 2 * (TH + GUT), TW, TH, sfx
+        dp_ChartErr "5 Mean SOC by pattern", chartFails
     End If
 
     ' ---- Charts 6 & 7: monthly views --------------------------------------
     Dim nMonths As Long: nMonths = rc("mo_nMonths")
     If nMonths > 0 Then
         Dim moLabels() As String: moLabels = rc("mo_labels")
-        Dim moCount() As Long: moCount = rc("mo_count")
         Dim moLabV As Variant: ReDim moLabV(1 To nMonths)
         Dim a As Long
         For a = 1 To nMonths: moLabV(a) = moLabels(a): Next a
 
+        ' Chart 6: monthly pattern mix
+        Err.Clear
+        Dim moCount() As Long: moCount = rc("mo_count")
         Dim headsM() As String: ReDim headsM(0 To slots)
         Dim colsM() As Variant: ReDim colsM(0 To slots)
         headsM(0) = "month": colsM(0) = moLabV
@@ -1690,21 +1709,41 @@ Private Sub dp_BuildCharts(rc As Object, cfg As Object)
         Dim cMix As Long: cMix = 13 + (2 * nTop + 2) + 11 + (otherRank + 2)
         dp_StageBlock wsD, 1, cMix, headsM, colsM, nMonths
         dp_Chart6MonthlyMix wsC, wsD, cMix, nMonths, slots, nTop, X0, Y0 + 3 * (TH + GUT), TW, TH, sfx
+        dp_ChartErr "6 Monthly pattern mix", chartFails
 
+        ' Chart 7: dispatch timing drift by month
+        Err.Clear
         Dim cDrift As Long: cDrift = cMix + (slots + 2)
         dp_StageBlock wsD, 1, cDrift, Array("month", "firstChg", "lastChg", "firstDis", "lastDis"), _
             Array(moLabV, rc("mo_firstChg"), rc("mo_lastChg"), rc("mo_firstDis"), rc("mo_lastDis")), nMonths
         dp_Chart7Drift wsC, wsD, cDrift, nMonths, X0 + TW + GUT, Y0 + 3 * (TH + GUT), TW, TH, sfx
+        dp_ChartErr "7 Dispatch timing drift", chartFails
     End If
 
     ' ---- Chart 8: pattern frequency ranking (horizontal bar) --------------
+    Err.Clear
     dp_Chart8Ranking wsC, wsD, rc, X0, Y0 + 4 * (TH + GUT), TW, TH, sfx
+    dp_ChartErr "8 Pattern frequency ranking", chartFails
 
     ' ---- Pattern heatmap (cell-based) -------------------------------------
+    Err.Clear
     dp_BuildHeatmap wsC, rc
+    dp_ChartErr "Pattern heatmap", chartFails
 
     On Error GoTo 0
+    dp_LogSet "charts_failed", chartFails
+    rc("chart_fail_count") = chartFails
     wsD.Visible = xlSheetVeryHidden
+End Sub
+
+' Log a per-chart failure (if Err is set) to RunLog and bump the failure count,
+' then clear Err so the next chart starts clean. Called under On Error Resume Next.
+Private Sub dp_ChartErr(ByVal chartName As String, ByRef fails As Long)
+    If Err.Number <> 0 Then
+        dp_LogSet "chart_error [" & chartName & "]", "[" & Err.Number & "] " & Err.Description
+        fails = fails + 1
+        Err.Clear
+    End If
 End Sub
 
 Private Sub dp_Chart1Freq(wsC As Worksheet, wsD As Worksheet, ByVal c0 As Long, _
@@ -2306,17 +2345,39 @@ Private Function dp_SheetByName(ByVal nm As String) As Worksheet
     Set dp_SheetByName = Nothing
 End Function
 
-Private Function dp_FreshSheet(ByVal nm As String) As Worksheet
-    ' Delete-and-rebuild: returns an empty sheet named nm at the end of the book.
-    Dim ws As Worksheet
-    Set ws = dp_SheetByName(nm)
-    Application.DisplayAlerts = False
-    If Not ws Is Nothing Then ws.Delete
-    ' Keep alerts suppressed for the remainder of the run; dp_RearmApp restores
-    ' the user's original setting at the end.
-    Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
-    ws.Name = nm
-    Set dp_FreshSheet = ws
+' Return an output sheet ready to (re)build, WITHOUT ever deleting a worksheet.
+' Deleting sheets trips workbook-structure protection, the last-visible-sheet
+' rule, stale references and collection re-indexing - so instead we create the
+' sheet on first use and, on later runs, strip its contents in place.
+Private Function dp_GetOrResetSheet(ByVal sName As String) As Worksheet
+    Dim ws As Worksheet, lo As ListObject, co As ChartObject
+    Dim i As Long
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sName)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:= _
+            ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = sName
+    Else
+        If ws.Visible <> xlSheetVisible Then ws.Visible = xlSheetVisible
+        If ws.ProtectContents Then ws.Unprotect
+        For Each co In ws.ChartObjects
+            co.Delete
+        Next co
+        ' Backward: forward iteration skips elements as the collection re-indexes.
+        For i = ws.Shapes.Count To 1 Step -1
+            ws.Shapes(i).Delete
+        Next i
+        For Each lo In ws.ListObjects
+            lo.Unlist
+        Next lo
+        ws.Cells.Clear
+        ws.Cells.Interior.Pattern = xlNone
+        If ws.AutoFilterMode Then ws.AutoFilterMode = False
+    End If
+    Set dp_GetOrResetSheet = ws
 End Function
 
 Private Sub dp_MakeTable(ws As Worksheet, ByVal tblName As String, ByVal nRows As Long, ByVal nCols As Long)
@@ -2368,6 +2429,12 @@ Private Sub dp_ShowSummary(rc As Object, cfg As Object)
           "Days complete: " & mLog("days_complete") & "   excluded: " & mLog("days_excluded_incomplete") & vbCrLf & _
           "'B' (charge+discharge) hours: " & mLog("B_hour_count") & vbCrLf & _
           "Text timestamps coerced: " & mLog("text_timestamps_coerced")
+
+    Dim nFail As Long: nFail = 0
+    If rc.Exists("chart_fail_count") Then nFail = CLng(rc("chart_fail_count"))
+    If nFail > 0 Then
+        msg = msg & vbCrLf & "Charts failed: " & nFail & " (see RunLog for details)"
+    End If
 
     If rc("recommendWindow") Then
         msg = msg & vbCrLf & vbCrLf & ">> Exact coverage < 50%. Consider cfgClusterMethod = Window."
