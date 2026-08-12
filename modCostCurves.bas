@@ -42,6 +42,15 @@ Private Const SEG_TOL         As Double = 0.005   ' relative T tolerance for "sa
 Private Const MAX_SEGMENTS    As Long = 8         ' above this, fall back to a power-law fit
 Private Const SLOWDOWN_TOL    As Double = 1500#   ' $/MW per MW: marginal-slowdown slope threshold
 
+' Rank B (slope) direction. Steepest first reads a steep slope as the
+' curve still capturing scale economies (incremental MW still buying
+' meaningful unit-cost reduction); flattest first reads the opposite
+' (curve already flattened, site near efficient size). Both are
+' legitimate, so the direction is a constant rather than a hardcoded sort.
+' 1 = steepest first (largest magnitude gets rank 1)
+' 2 = flattest first (smallest magnitude gets rank 1)
+Private Const SLOPE_RANK_MODE As Long = 1
+
 ' Layout anchors (change these to move the whole layout)
 Private Const TITLE_ROW       As Long = 1
 Private Const TABLE_HDR_ROW   As Long = 3         ' Block A headers; data begins on the next row
@@ -101,11 +110,21 @@ Public Sub BuildCostCurveAnalysis()
     ' ---- Stage 2: run the analysis fully in memory -----------
     mStage = "analysis"
     Dim nt As Long: nt = UBound(GetThresholds()) - LBound(GetThresholds()) + 1
-    Dim totalCols As Long: totalCols = N_FIXED_COLS + 2 * nt
+    ' Each threshold now occupies FOUR columns: range, slope, Rank A, Rank B.
+    ' The column anchors are derived from GetThresholds() so adding or
+    ' removing a threshold shifts the whole layout with no other edit.
+    Dim totalCols As Long: totalCols = N_FIXED_COLS + 4 * nt
+
+    ' Cross-substation rankings, one Rank A and one Rank B per threshold.
+    Dim rkCount() As Long, rkMaxMW() As Double, rkCostMax() As Double
+    Dim rkSlope() As Double, rkHasSlope() As Boolean
+    Dim rankA() As Long, rankB() As Long
+    ComputeRankings mw, names, costM, n, m, _
+                    rkCount, rkMaxMW, rkCostMax, rkSlope, rkHasSlope, rankA, rankB
 
     Dim aTable() As Variant
     ReDim aTable(1 To n, 1 To totalCols)
-    AnalyseAll mw, names, costM, n, m, aTable
+    AnalyseAll mw, names, costM, n, m, aTable, rankA, rankB
 
     ' ---- Stage 3: create the output sheet --------------------
     mStage = "sheet creation"
@@ -117,6 +136,7 @@ Public Sub BuildCostCurveAnalysis()
     Dim srcMWRow As Long, srcFirstDataRow As Long
     Dim hlpMWCol As Long, hlpFirstThreshCol As Long, hlpFirstRow As Long, hlpRows As Long
     WriteSheet wsOut, mw, names, costM, n, m, aTable, totalCols, _
+               rkCount, rkMaxMW, rkSlope, rankA, rankB, _
                srcMWRow, srcFirstDataRow, _
                hlpMWCol, hlpFirstThreshCol, hlpFirstRow, hlpRows
 
@@ -303,9 +323,10 @@ End Function
 
 Private Sub AnalyseAll(ByRef mw() As Double, ByRef names() As String, _
                        ByRef costM() As Double, ByVal n As Long, ByVal m As Long, _
-                       ByRef aTable() As Variant)
+                       ByRef aTable() As Variant, _
+                       ByRef rankA() As Long, ByRef rankB() As Long)
     Dim thr As Variant: thr = GetThresholds()
-    Dim i As Long, j As Long, tCol As Long
+    Dim i As Long, j As Long, tt As Long
 
     Dim c() As Double: ReDim c(1 To m)
     Dim T() As Double: ReDim T(1 To m)
@@ -335,14 +356,215 @@ Private Sub AnalyseAll(ByRef mw() As Double, ByRef names() As String, _
         aTable(i, 6) = -Tlong / (xstar * xstar)          ' slope at knee, -T / x*^2
         aTable(i, 7) = SlowdownPoint(Tlong, x1, x2)
 
-        ' Threshold pairs, ascending order, starting at column H
-        For tCol = LBound(thr) To UBound(thr)
-            Dim baseCol As Long: baseCol = N_FIXED_COLS + 1 + 2 * (tCol - LBound(thr))
-            aTable(i, baseCol) = ThresholdRangeStr(T, mw, m, CDbl(thr(tCol)))
-            aTable(i, baseCol + 1) = ThresholdSlope(c, mw, T, m, CDbl(thr(tCol)))
-        Next tCol
+        ' Four columns per threshold, ascending order, starting at column H:
+        '   +0 range   +1 slope   +2 Rank by MW breadth   +3 Rank by slope
+        For tt = 0 To UBound(thr) - LBound(thr)
+            Dim baseCol As Long: baseCol = N_FIXED_COLS + 1 + 4 * tt
+            Dim L As Double: L = CDbl(thr(LBound(thr) + tt))
+            aTable(i, baseCol) = ThresholdRangeStr(T, mw, m, L)
+            aTable(i, baseCol + 1) = ThresholdSlope(c, mw, T, m, L)
+            ' Rank 0 means "not ranked" (no qualifying points, or a single
+            ' point for slope). Write n/a rather than a last-place rank.
+            aTable(i, baseCol + 2) = IIf(rankA(i, tt + 1) = 0, "n/a", CLng(rankA(i, tt + 1)))
+            aTable(i, baseCol + 3) = IIf(rankB(i, tt + 1) = 0, "n/a", CLng(rankB(i, tt + 1)))
+        Next tt
     Next i
 End Sub
+
+' ============================================================
+'  RANKINGS
+'  Two independent ranks per substation per threshold band, never
+'  blended and never computed across thresholds:
+'    Rank A  by MW breadth   (more qualifying MW is better)
+'    Rank B  by slope        (direction set by SLOPE_RANK_MODE)
+'
+'  Both use COMPETITION ranking on the metric key only: equal metrics
+'  share the lower rank and the next distinct value skips ahead
+'  (1, 2, 2, 4 - not dense 1, 2, 2, 3). The alphabetical backstop is a
+'  deterministic DISPLAY order within a metric tie, not a rank
+'  differentiator, so genuinely equal metrics stay tied.
+'
+'  Rank A tiebreak chain (metric key): higher qualifying count, then
+'  higher maximum qualifying MW, then LOWER cost per MW at that maximum
+'  qualifying MW. Tiebreak 3 is load bearing - e.g. many substations
+'  qualify at every MW point and share the same max MW, and cost at the
+'  largest affordable size is what separates them.
+'
+'  Rank B tiebreak: equal slope to $0.1, then higher qualifying count.
+'  Substations with zero qualifying points (Rank A) or fewer than two
+'  (Rank B, slope undefined) are excluded from the population entirely
+'  and get rank 0 (written as n/a), so ranks run 1..k over the rankable
+'  set, not 1..n.
+' ============================================================
+
+Private Sub ComputeRankings(ByRef mw() As Double, ByRef names() As String, _
+                            ByRef costM() As Double, ByVal n As Long, ByVal m As Long, _
+                            ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                            ByRef rkCostMax() As Double, ByRef rkSlope() As Double, _
+                            ByRef rkHasSlope() As Boolean, _
+                            ByRef rankA() As Long, ByRef rankB() As Long)
+    Dim thr As Variant: thr = GetThresholds()
+    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
+
+    ReDim rkCount(1 To n, 1 To nt)
+    ReDim rkMaxMW(1 To n, 1 To nt)
+    ReDim rkCostMax(1 To n, 1 To nt)
+    ReDim rkSlope(1 To n, 1 To nt)
+    ReDim rkHasSlope(1 To n, 1 To nt)
+    ReDim rankA(1 To n, 1 To nt)
+    ReDim rankB(1 To n, 1 To nt)
+
+    ' ---- Per-substation, per-threshold metrics ---------------
+    Dim i As Long, j As Long, tt As Long
+    Dim c() As Double: ReDim c(1 To m)
+    Dim T() As Double: ReDim T(1 To m)
+    For i = 1 To n
+        For j = 1 To m: c(j) = costM(i, j): T(j) = c(j) * mw(j): Next j
+        For tt = 1 To nt
+            Dim L As Double: L = CDbl(thr(LBound(thr) + tt - 1))
+            Dim cnt As Long: cnt = 0
+            Dim lastJ As Long: lastJ = 0
+            Dim sx As Double, sy As Double, sxx As Double, sxy As Double
+            sx = 0: sy = 0: sxx = 0: sxy = 0
+            For j = 1 To m
+                If T(j) <= L Then
+                    cnt = cnt + 1: lastJ = j
+                    sx = sx + mw(j): sy = sy + c(j)
+                    sxx = sxx + mw(j) * mw(j): sxy = sxy + mw(j) * c(j)
+                End If
+            Next j
+            rkCount(i, tt) = cnt
+            If cnt >= 1 Then
+                rkMaxMW(i, tt) = mw(lastJ)
+                rkCostMax(i, tt) = c(lastJ)
+            End If
+            If cnt >= 2 Then
+                rkHasSlope(i, tt) = True
+                rkSlope(i, tt) = (cnt * sxy - sx * sy) / (cnt * sxx - sx * sx)
+            End If
+        Next tt
+    Next i
+
+    ' ---- Competition ranking within each threshold -----------
+    Dim ord() As Long: ReDim ord(1 To n)
+    Dim popN As Long, p As Long
+    For tt = 1 To nt
+        ' Rank A population: substations with >=1 qualifying point.
+        popN = 0
+        For i = 1 To n
+            If rkCount(i, tt) >= 1 Then popN = popN + 1: ord(popN) = i
+        Next i
+        If popN > 0 Then
+            SortIdx ord, popN, tt, True, rkCount, rkMaxMW, rkCostMax, rkSlope, names
+            For p = 1 To popN
+                If p = 1 Then
+                    rankA(ord(p), tt) = 1
+                ElseIf EqRankA(ord(p), ord(p - 1), tt, rkCount, rkMaxMW, rkCostMax) Then
+                    rankA(ord(p), tt) = rankA(ord(p - 1), tt)
+                Else
+                    rankA(ord(p), tt) = p
+                End If
+            Next p
+        End If
+
+        ' Rank B population: substations with a defined slope (>=2 points).
+        popN = 0
+        For i = 1 To n
+            If rkHasSlope(i, tt) Then popN = popN + 1: ord(popN) = i
+        Next i
+        If popN > 0 Then
+            SortIdx ord, popN, tt, False, rkCount, rkMaxMW, rkCostMax, rkSlope, names
+            For p = 1 To popN
+                If p = 1 Then
+                    rankB(ord(p), tt) = 1
+                ElseIf EqRankB(ord(p), ord(p - 1), tt, rkCount, rkSlope) Then
+                    rankB(ord(p), tt) = rankB(ord(p - 1), tt)
+                Else
+                    rankB(ord(p), tt) = p
+                End If
+            Next p
+        End If
+    Next tt
+End Sub
+
+' Insertion sort of the index array ord(1..popN) for one threshold.
+' isRankA selects the ordering; the alphabetical name comparison is the
+' final DISPLAY tiebreak so the order is deterministic without making
+' otherwise-equal metrics count as distinct for ranking.
+Private Sub SortIdx(ByRef ord() As Long, ByVal popN As Long, ByVal tt As Long, _
+                    ByVal isRankA As Boolean, _
+                    ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                    ByRef rkCostMax() As Double, ByRef rkSlope() As Double, _
+                    ByRef names() As String)
+    Dim a As Long, b As Long, keyIdx As Long
+    For a = 2 To popN
+        keyIdx = ord(a): b = a - 1
+        Do While b >= 1
+            If LessThan(keyIdx, ord(b), tt, isRankA, rkCount, rkMaxMW, rkCostMax, rkSlope, names) Then
+                ord(b + 1) = ord(b): b = b - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        ord(b + 1) = keyIdx
+    Next a
+End Sub
+
+' True when substation i1 sorts before i2 for the given rank type.
+Private Function LessThan(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Long, _
+                          ByVal isRankA As Boolean, _
+                          ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                          ByRef rkCostMax() As Double, ByRef rkSlope() As Double, _
+                          ByRef names() As String) As Boolean
+    If isRankA Then
+        If rkCount(i1, tt) <> rkCount(i2, tt) Then
+            LessThan = rkCount(i1, tt) > rkCount(i2, tt): Exit Function      ' more MW is better
+        End If
+        If rkMaxMW(i1, tt) <> rkMaxMW(i2, tt) Then
+            LessThan = rkMaxMW(i1, tt) > rkMaxMW(i2, tt): Exit Function       ' higher max MW
+        End If
+        If Round(rkCostMax(i1, tt), 2) <> Round(rkCostMax(i2, tt), 2) Then
+            LessThan = rkCostMax(i1, tt) < rkCostMax(i2, tt): Exit Function    ' lower cost at max MW
+        End If
+    Else
+        Dim s1 As Double, s2 As Double
+        s1 = Round(rkSlope(i1, tt), 1): s2 = Round(rkSlope(i2, tt), 1)
+        If s1 <> s2 Then
+            If SLOPE_RANK_MODE = 2 Then
+                LessThan = Abs(s1) < Abs(s2)                                  ' flattest first
+            Else
+                LessThan = Abs(s1) > Abs(s2)                                  ' steepest first
+            End If
+            Exit Function
+        End If
+        If rkCount(i1, tt) <> rkCount(i2, tt) Then
+            LessThan = rkCount(i1, tt) > rkCount(i2, tt): Exit Function
+        End If
+    End If
+    LessThan = (StrComp(names(i1), names(i2), vbTextCompare) < 0)             ' display backstop
+End Function
+
+Private Function EqRankA(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Long, _
+                         ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                         ByRef rkCostMax() As Double) As Boolean
+    EqRankA = (rkCount(i1, tt) = rkCount(i2, tt)) And _
+              (rkMaxMW(i1, tt) = rkMaxMW(i2, tt)) And _
+              (Round(rkCostMax(i1, tt), 2) = Round(rkCostMax(i2, tt), 2))
+End Function
+
+Private Function EqRankB(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Long, _
+                         ByRef rkCount() As Long, ByRef rkSlope() As Double) As Boolean
+    EqRankB = (Round(rkSlope(i1, tt), 1) = Round(rkSlope(i2, tt), 1)) And _
+              (rkCount(i1, tt) = rkCount(i2, tt))
+End Function
+
+Private Function SlopeRankHeader() As String
+    If SLOPE_RANK_MODE = 2 Then
+        SlopeRankHeader = "Rank by Slope (flattest first)"
+    Else
+        SlopeRankHeader = "Rank by Slope (steepest first)"
+    End If
+End Function
 
 ' ============================================================
 '  SEGMENTATION
@@ -712,6 +934,8 @@ Private Sub WriteSheet(ByVal ws As Worksheet, ByRef mw() As Double, _
                        ByRef names() As String, ByRef costM() As Double, _
                        ByVal n As Long, ByVal m As Long, ByRef aTable() As Variant, _
                        ByVal totalCols As Long, _
+                       ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                       ByRef rkSlope() As Double, ByRef rankA() As Long, ByRef rankB() As Long, _
                        ByRef srcMWRow As Long, ByRef srcFirstDataRow As Long, _
                        ByRef hlpMWCol As Long, ByRef hlpFirstThreshCol As Long, _
                        ByRef hlpFirstRow As Long, ByRef hlpRows As Long)
@@ -734,10 +958,12 @@ Private Sub WriteSheet(ByVal ws As Worksheet, ByRef mw() As Double, _
     hdr(1, 5) = "Knee / Flattening Point (MW)"
     hdr(1, 6) = "Slope at Knee ($/MW per MW)"
     hdr(1, 7) = "Marginal Slowdown Point (MW)"
-    For t = LBound(thr) To UBound(thr)
-        Dim bc As Long: bc = N_FIXED_COLS + 1 + 2 * (t - LBound(thr))
-        hdr(1, bc) = "MW Range <= " & ThreshLabel(CDbl(thr(t)))
+    For t = 0 To nt - 1
+        Dim bc As Long: bc = N_FIXED_COLS + 1 + 4 * t
+        hdr(1, bc) = "MW Range <= " & ThreshLabel(CDbl(thr(LBound(thr) + t)))
         hdr(1, bc + 1) = "Slope over Range ($/MW per MW)"
+        hdr(1, bc + 2) = "Rank by MW Breadth"
+        hdr(1, bc + 3) = SlopeRankHeader()
     Next t
     ws.Cells(TABLE_HDR_ROW, 1).Resize(1, totalCols).Value = hdr
 
@@ -751,16 +977,39 @@ Private Sub WriteSheet(ByVal ws As Worksheet, ByRef mw() As Double, _
     ws.Cells(dataTop, 6).Resize(n, 1).NumberFormat = FMT_SLOPE               ' slope at knee
     ws.Cells(dataTop, 7).Resize(n, 1).NumberFormat = FMT_MW1                 ' slowdown MW
     For t = 0 To nt - 1
-        Dim scol As Long: scol = N_FIXED_COLS + 2 + 2 * t                    ' slope columns
+        Dim scol As Long: scol = N_FIXED_COLS + 2 + 4 * t                    ' slope over range
         ws.Cells(dataTop, scol).Resize(n, 1).NumberFormat = FMT_SLOPE
+        ' Rank columns: centred, plain integer, no colour scale (rank is
+        ' ordinal, so a gradient would imply a magnitude it does not have).
+        ' n/a cells shown as centred grey text.
+        Dim rc As Long
+        For rc = scol + 1 To scol + 2
+            With ws.Cells(dataTop, rc).Resize(n, 1)
+                .NumberFormat = "0"
+                .HorizontalAlignment = xlCenter
+            End With
+            For i = 1 To n
+                If ws.Cells(dataTop + i - 1, rc).Value = "n/a" Then
+                    ws.Cells(dataTop + i - 1, rc).Font.Color = RGB(150, 150, 150)
+                End If
+            Next i
+        Next rc
     Next t
 
     StyleHeaderRow ws.Cells(TABLE_HDR_ROW, 1).Resize(1, totalCols)
 
-    ' ---- Block C: Source Data copy (chart reads THIS) --------
+    ' ---- Block E: Threshold Rankings leaderboard -------------
+    ' Two rows below the chart. Pushes the source-data / helper blocks
+    ' further down so nothing overlaps; chart series still reference the
+    ' source-data copy wherever it lands.
     Dim tableLastRow As Long: tableLastRow = TABLE_HDR_ROW + n
     Dim chartTopRow As Long: chartTopRow = tableLastRow + CHART_GAP_ROWS
-    Dim srcHdrTextRow As Long: srcHdrTextRow = chartTopRow + CHART_ROWS
+    Dim lbTopRow As Long: lbTopRow = chartTopRow + CHART_ROWS + 2
+    Dim lbLastRow As Long
+    BuildLeaderboard ws, lbTopRow, names, n, rkCount, rkMaxMW, rkSlope, rankA, rankB, lbLastRow
+
+    ' ---- Block C: Source Data copy (chart reads THIS) --------
+    Dim srcHdrTextRow As Long: srcHdrTextRow = lbLastRow + 2
     srcMWRow = srcHdrTextRow + 1
     srcFirstDataRow = srcMWRow + 1
 
@@ -843,6 +1092,117 @@ Private Sub StyleHeaderRow(ByVal rng As Range)
         .Weight = xlMedium
     End With
 End Sub
+
+' ============================================================
+'  LEADERBOARD  (Block E, "Threshold Rankings")
+'  Two side-by-side sorted lists per threshold - by MW breadth and by
+'  slope - for reading, complementing the inline rank lookup columns.
+'  Sorted in memory (never write-then-Range.Sort). A monospace font
+'  keeps the two columns aligned. Rank-1 rows are bold; a zero-qualifier
+'  threshold collapses to a single explanatory line.
+' ============================================================
+
+Private Sub BuildLeaderboard(ByVal ws As Worksheet, ByVal topRow As Long, _
+                             ByRef names() As String, ByVal n As Long, _
+                             ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                             ByRef rkSlope() As Double, _
+                             ByRef rankA() As Long, ByRef rankB() As Long, _
+                             ByRef lastRow As Long)
+    Dim thr As Variant: thr = GetThresholds()
+    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
+
+    Dim r As Long: r = topRow
+    ws.Cells(r, 1).Value = "Threshold Rankings"
+    ws.Cells(r, 1).Font.Bold = True
+    ws.Cells(r, 1).Font.Size = 12
+    r = r + 2
+
+    Dim tt As Long, i As Long
+    For tt = 1 To nt
+        Dim L As Double: L = CDbl(thr(LBound(thr) + tt - 1))
+        Dim qcnt As Long: qcnt = 0
+        For i = 1 To n
+            If rkCount(i, tt) >= 1 Then qcnt = qcnt + 1
+        Next i
+
+        ws.Cells(r, 1).Value = "<= " & ThreshLabel(L) & "   (" & qcnt & " of " & n & " substations qualify)"
+        ws.Cells(r, 1).Font.Bold = True
+        r = r + 1
+
+        If qcnt = 0 Then
+            ws.Cells(r, 2).Value = "No substations qualify at this threshold"
+            r = r + 2
+        Else
+            ws.Cells(r, 2).Value = "By MW Breadth"
+            ws.Cells(r, 6).Value = "By Slope, " & IIf(SLOPE_RANK_MODE = 2, "flattest", "steepest") & " first"
+            ws.Cells(r, 2).Font.Bold = True: ws.Cells(r, 6).Font.Bold = True
+            r = r + 1
+
+            Dim ordA() As Long, kA As Long: LeaderOrder rankA, names, n, tt, ordA, kA
+            Dim ordB() As Long, kB As Long: LeaderOrder rankB, names, n, tt, ordB, kB
+            Dim rows As Long: rows = kA: If kB > rows Then rows = kB
+
+            Dim rr As Long
+            For rr = 1 To rows
+                If rr <= kA Then
+                    i = ordA(rr)
+                    ws.Cells(r, 1).Value = rankA(i, tt)
+                    ws.Cells(r, 2).Value = names(i)
+                    ws.Cells(r, 3).Value = rkCount(i, tt) & " pts, max " & Format(rkMaxMW(i, tt), FMT_MW)
+                    If rankA(i, tt) = 1 Then ws.Cells(r, 1).Resize(1, 3).Font.Bold = True
+                End If
+                If rr <= kB Then
+                    i = ordB(rr)
+                    ws.Cells(r, 5).Value = rankB(i, tt)
+                    ws.Cells(r, 6).Value = names(i)
+                    ws.Cells(r, 7).Value = Format(rkSlope(i, tt), "#,##0.0")
+                    If rankB(i, tt) = 1 Then ws.Cells(r, 5).Resize(1, 3).Font.Bold = True
+                End If
+                r = r + 1
+            Next rr
+            r = r + 1                           ' spacer between sub-blocks
+        End If
+    Next tt
+
+    lastRow = r
+    ' Monospace so the two side-by-side lists line up (font name only,
+    ' preserves the bold already applied to rank-1 and header rows).
+    ws.Range(ws.Cells(topRow, 1), ws.Cells(lastRow, 7)).Font.Name = "Consolas"
+End Sub
+
+' Population indices (rank > 0) for one threshold, sorted for display by
+' (rank asc, name asc). The rank already encodes the full metric order
+' with competition ties, so sorting on it reproduces the ranked order.
+Private Sub LeaderOrder(ByRef rank() As Long, ByRef names() As String, ByVal n As Long, _
+                        ByVal tt As Long, ByRef ord() As Long, ByRef k As Long)
+    ReDim ord(1 To n)
+    k = 0
+    Dim i As Long
+    For i = 1 To n
+        If rank(i, tt) > 0 Then k = k + 1: ord(k) = i
+    Next i
+    If k = 0 Then Exit Sub
+    Dim a As Long, b As Long, keyIdx As Long
+    For a = 2 To k
+        keyIdx = ord(a): b = a - 1
+        Do While b >= 1
+            If LeaderBefore(keyIdx, ord(b), tt, rank, names) Then
+                ord(b + 1) = ord(b): b = b - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        ord(b + 1) = keyIdx
+    Next a
+End Sub
+
+Private Function LeaderBefore(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Long, _
+                              ByRef rank() As Long, ByRef names() As String) As Boolean
+    If rank(i1, tt) <> rank(i2, tt) Then
+        LeaderBefore = rank(i1, tt) < rank(i2, tt): Exit Function
+    End If
+    LeaderBefore = (StrComp(names(i1), names(i2), vbTextCompare) < 0)
+End Function
 
 ' ============================================================
 '  CHART BUILDER
@@ -1180,6 +1540,92 @@ Public Sub SelfTest()
     Assert Round(gMinT, 0) = 47633000#, "Global: min implied total = 47,633,000", passCount, failCount
     Assert segSumOK, "Global: segment point counts sum to m for every substation", passCount, failCount
 
+    ' ---- Ranking assertions (spec section 8) ------------------
+    Dim rkCount() As Long, rkMaxMW() As Double, rkCostMax() As Double
+    Dim rkSlope() As Double, rkHasSlope() As Boolean
+    Dim rankA() As Long, rankB() As Long
+    ComputeRankings mw, names, costM, n, m, _
+                    rkCount, rkMaxMW, rkCostMax, rkSlope, rkHasSlope, rankA, rankB
+
+    Dim xCun As Long: xCun = NameIndex(names, n, "Cunningham")
+    Dim xHob As Long: xHob = NameIndex(names, n, "Hobbs")
+    Dim xCha As Long: xCha = NameIndex(names, n, "Chaves County")
+    Dim xEC As Long:  xEC = NameIndex(names, n, "Eddy County")
+    Dim xEN As Long:  xEN = NameIndex(names, n, "Eddy North")
+    Dim xKio As Long: xKio = NameIndex(names, n, "Kiowa")
+    Dim xOa As Long:  xOa = NameIndex(names, n, "Oasis")
+    Dim xPH As Long:  xPH = NameIndex(names, n, "Pleasant Hill")
+    Dim xRoo As Long: xRoo = NameIndex(names, n, "Roosevelt")
+    Dim xCD As Long:  xCD = NameIndex(names, n, "China Draw")
+    Dim xRR As Long:  xRR = NameIndex(names, n, "Roadrunner")
+
+    ' $25MM: zero qualify, all ranks n/a
+    Assert CountRanked(rankA, n, 1) = 0 And CountRanked(rankB, n, 1) = 0, _
+           "$25MM: no substation ranked (all n/a)", passCount, failCount
+
+    ' $50MM: 8 qualify
+    Assert CountRanked(rankA, n, 2) = 8, "$50MM: 8 qualify", passCount, failCount
+    Assert rankA(xCun, 2) = 1 And rankA(xHob, 2) = 1, "$50MM A: Cun/Hob rank 1", passCount, failCount
+    Assert rankA(xEC, 2) = 3, "$50MM A: Eddy County rank 3", passCount, failCount
+    Assert rankA(xEN, 2) = 4, "$50MM A: Eddy North rank 4", passCount, failCount
+    Assert rankA(xCha, 2) = 5, "$50MM A: Chaves rank 5", passCount, failCount
+    Assert rankA(xOa, 2) = 6 And rankA(xPH, 2) = 6 And rankA(xRoo, 2) = 6, _
+           "$50MM A: Oasis/PH/Roosevelt tie rank 6", passCount, failCount
+    Assert rkCount(xEC, 2) = 19 And rkCount(xEN, 2) = 18 And rkCount(xCha, 2) = 10, _
+           "$50MM: EddyC 19 / EddyN 18 / Chaves 10 pts", passCount, failCount
+    Assert rankB(xOa, 2) = 1 And rankB(xPH, 2) = 1 And rankB(xRoo, 2) = 1, _
+           "$50MM B: Oasis/PH/Roosevelt tie rank 1", passCount, failCount
+    Assert rankB(xCha, 2) = 4 And rankB(xEN, 2) = 5 And rankB(xEC, 2) = 6, _
+           "$50MM B: Chaves 4 / EddyN 5 / EddyC 6", passCount, failCount
+    Assert rankB(xCun, 2) = 7 And rankB(xHob, 2) = 7, "$50MM B: Cun/Hob tie rank 7", passCount, failCount
+    Assert Round(rkSlope(xOa, 2), 1) = -2754.6 And Round(rkSlope(xCha, 2), 1) = -2531.7 _
+       And Round(rkSlope(xEN, 2), 1) = -1691# And Round(rkSlope(xEC, 2), 1) = -1559.2 _
+       And Round(rkSlope(xCun, 2), 1) = -1435.4, "$50MM B: slope values", passCount, failCount
+
+    ' $75MM: 15 qualify
+    Assert CountRanked(rankA, n, 3) = 15, "$75MM: 15 qualify", passCount, failCount
+    Assert rkCount(xCun, 3) = 21 And rkCount(xEC, 3) = 21 And rkCount(xEN, 3) = 21 _
+       And rkCount(xHob, 3) = 21 And rkCount(xKio, 3) = 21, "$75MM: five substations at 21 pts", passCount, failCount
+    Assert rankA(xCun, 3) = 1 And rankA(xHob, 3) = 1, "$75MM A: Cun/Hob rank 1", passCount, failCount
+    Assert rankA(xEC, 3) = 3 And rankA(xKio, 3) = 3, "$75MM A: EddyC/Kiowa tie rank 3 (equal cost@300)", passCount, failCount
+    Assert rankA(xEN, 3) = 5, "$75MM A: Eddy North rank 5", passCount, failCount
+    Assert rkCount(xCD, 3) = 8 And rankA(xCD, 3) = MaxRankVal(rankA, n, 3), _
+           "$75MM A: China Draw last on breadth at 8 pts", passCount, failCount
+    Assert rankB(xCD, 3) = 1 And Round(rkSlope(xCD, 3), 1) = -4227.6, _
+           "$75MM B: China Draw first on slope -4227.6 (inversion)", passCount, failCount
+    Assert rkCount(xCha, 3) = 10 And Round(rkSlope(xCha, 3), 1) = -2531.7, _
+           "$75MM: Chaves 10 pts slope -2531.7", passCount, failCount
+
+    ' $100MM: 17 qualify, 13 tie at 21 pts
+    Assert CountRanked(rankA, n, 4) = 17, "$100MM: 17 qualify", passCount, failCount
+    Dim c21 As Long: c21 = 0
+    For i = 1 To n
+        If rkCount(i, 4) = 21 Then c21 = c21 + 1
+    Next i
+    Assert c21 = 13, "$100MM: 13 tie at 21 qualifying points", passCount, failCount
+    Assert rkCount(xRR, 4) = 12 And rankA(xRR, 4) = 16 And rankB(xRR, 4) = 1, _
+           "$100MM: Roadrunner 16th breadth / 1st slope (inversion)", passCount, failCount
+    Assert Round(rkSlope(xRR, 4), 1) = -4428.9, "$100MM B: Roadrunner -4428.9", passCount, failCount
+    Assert rkCount(xCha, 4) = 11 And rankA(xCha, 4) = 17 And rankA(xCha, 4) = MaxRankVal(rankA, n, 4), _
+           "$100MM A: Chaves last on breadth at 11 pts", passCount, failCount
+    Assert rankB(xCha, 4) = 14 And Round(rkSlope(xCha, 4), 1) = -1287.8, _
+           "$100MM B: Chaves 14th slope -1287.8", passCount, failCount
+    Assert Round(rkSlope(xOa, 4), 1) = -730.3 And Round(rkSlope(xPH, 4), 1) = -687.7 _
+       And Round(rkSlope(xRoo, 4), 1) = -687.7, "$100MM B: Oasis/PH/Roosevelt flattest", passCount, failCount
+
+    ' Structural: non-na Rank A count == qualifier count; max rank <= count
+    Dim tt As Long
+    For tt = 1 To 4
+        Dim qc As Long: qc = 0
+        For i = 1 To n
+            If rkCount(i, tt) >= 1 Then qc = qc + 1
+        Next i
+        Assert CountRanked(rankA, n, tt) = qc, _
+               "Struct t" & tt & ": non-na Rank A count == qualifier count", passCount, failCount
+        Assert MaxRankVal(rankA, n, tt) <= qc, _
+               "Struct t" & tt & ": max Rank A <= qualifier count", passCount, failCount
+    Next tt
+
     Debug.Print "=== SelfTest done: " & passCount & " passed, " & failCount & " failed ==="
     If failCount = 0 Then
         Debug.Print "ALL TESTS PASSED"
@@ -1220,12 +1666,37 @@ Private Function GetName(ByRef names() As String, ByVal i As Long) As String
     If i >= LBound(names) And i <= UBound(names) Then GetName = names(i) Else GetName = "?"
 End Function
 
+Private Function CountRanked(ByRef rank() As Long, ByVal n As Long, ByVal tt As Long) As Long
+    Dim i As Long, c As Long
+    For i = 1 To n
+        If rank(i, tt) > 0 Then c = c + 1
+    Next i
+    CountRanked = c
+End Function
+
+Private Function MaxRankVal(ByRef rank() As Long, ByVal n As Long, ByVal tt As Long) As Long
+    Dim i As Long, mx As Long
+    For i = 1 To n
+        If rank(i, tt) > mx Then mx = rank(i, tt)
+    Next i
+    MaxRankVal = mx
+End Function
+
 ' ------------------------------------------------------------
 '  Fixture loader. Tries substation_cost_per_mw.csv in the workbook
-'  folder; falls back to a hardcoded 17 x 21 matrix that reproduces
-'  the reference cases from section 9 (Cunningham & Hobbs single-tier,
-'  Chaves County five-tier, min implied total 47,633,000, and no point
-'  at or below $25MM anywhere).
+'  folder; otherwise builds the hardcoded 17 x 21 reference matrix.
+'
+'  Each substation is a piecewise-constant total-cost profile
+'  T(MW); cost per MW = T / MW. The tier totals are chosen so the
+'  matrix reproduces every reference case in the ranking spec:
+'    * Cunningham & Hobbs and Pleasant Hill & Roosevelt are identical
+'      pairs (the only genuine ties left after the full tiebreak chain).
+'    * Chaves County is the five-tier case.
+'    * The $25MM band has no qualifier anywhere (global min = 47,633,000);
+'      8 qualify at $50MM, 15 at $75MM, all 17 at $100MM with 13 tied at
+'      21 qualifying points; China Draw and Roadrunner are the
+'      breadth-vs-slope inversions.
+'  Cielo..House are the fillers that complete those aggregate counts.
 ' ------------------------------------------------------------
 
 Private Sub LoadFixture(ByRef mw() As Double, ByRef names() As String, _
@@ -1240,59 +1711,40 @@ Private Sub LoadFixture(ByRef mw() As Double, ByRef names() As String, _
     ReDim names(1 To n)
     ReDim costM(1 To n, 1 To m)
 
-    ' Per-substation total-cost tier profile T(j). cost(j) = T(j)/mw(j).
-    Dim T() As Double: ReDim T(1 To m)
-
-    ' 1) Cunningham  - single tier 47,633,000
-    names(1) = "Cunningham": FillConst T, m, 47633000#: SetRow costM, mw, T, 1, m
-
-    ' 2) Hobbs       - identical single tier
-    names(2) = "Hobbs": FillConst T, m, 47633000#: SetRow costM, mw, T, 2, m
-
-    ' 3) Chaves County - five tiers
-    '    100-190: 49,473,000 | 200: 98,003,000 | 210-230: 185,783,000
-    '    240-270: 205,353,000 | 280-300: 207,843,000
-    For j = 1 To m
-        Select Case mw(j)
-            Case Is <= 190: T(j) = 49473000#
-            Case 200: T(j) = 98003000#
-            Case 210, 220, 230: T(j) = 185783000#
-            Case 240, 250, 260, 270: T(j) = 205353000#
-            Case Else: T(j) = 207843000#
-        End Select
-    Next j
-    names(3) = "Chaves County": SetRow costM, mw, T, 3, m
-
-    ' 4..17) Filler substations, all single- or two-tier, every total
-    ' strictly above 47,633,000 so the global minimum stays 47,633,000
-    ' and no point falls at or below $25MM.
-    Dim fillNames As Variant
-    fillNames = Array("Artesia", "Roswell", "Carlsbad", "Lovington", "Portales", _
-                      "Clovis", "Tucumcari", "Ruidoso", "Alamogordo", "Deming", _
-                      "Silver City", "Socorro", "Las Cruces", "Truth or Consequences")
-    Dim fillBase As Variant
-    fillBase = Array(55000000#, 62000000#, 70000000#, 78000000#, 85000000#, _
-                     92000000#, 100000000#, 110000000#, 120000000#, 135000000#, _
-                     150000000#, 165000000#, 180000000#, 195000000#)
-    Dim f As Long
-    For f = 0 To 13
-        Dim base As Double: base = fillBase(f)
-        For j = 1 To m
-            ' single upward tier step at 250 MW for variety (still all > 47.633M)
-            If mw(j) >= 250 Then
-                T(j) = base * 1.15
-            Else
-                T(j) = base
-            End If
-        Next j
-        names(4 + f) = fillNames(f)
-        SetRow costM, mw, T, 4 + f, m
-    Next f
+    ' name;  tier breakpoints (upper MW of each tier);  tier totals
+    names(1) = "Cunningham":    SetProfile costM, mw, 1, m, Array(300), Array(47633000#)
+    names(2) = "Hobbs":         SetProfile costM, mw, 2, m, Array(300), Array(47633000#)
+    names(3) = "Chaves County": SetProfile costM, mw, 3, m, _
+                    Array(190, 200, 230, 270, 300), _
+                    Array(49473000#, 98003000#, 185783000#, 205353000#, 207843000#)
+    names(4) = "Eddy County":   SetProfile costM, mw, 4, m, Array(280, 300), Array(47633000#, 64033000#)
+    names(5) = "Eddy North":    SetProfile costM, mw, 5, m, Array(270, 300), Array(49473000#, 65873000#)
+    names(6) = "Kiowa":         SetProfile costM, mw, 6, m, Array(300), Array(64033000#)
+    names(7) = "Oasis":         SetProfile costM, mw, 7, m, Array(170, 240, 300), Array(47633000#, 60000000#, 79083142#)
+    names(8) = "Pleasant Hill": SetProfile costM, mw, 8, m, Array(170, 240, 300), Array(47633000#, 60000000#, 81108681#)
+    names(9) = "Roosevelt":     SetProfile costM, mw, 9, m, Array(170, 240, 300), Array(47633000#, 60000000#, 81108681#)
+    names(10) = "China Draw":   SetProfile costM, mw, 10, m, Array(170, 230, 300), Array(73103436#, 92000000#, 150000000#)
+    names(11) = "Roadrunner":   SetProfile costM, mw, 11, m, Array(210, 300), Array(96832165#, 160000000#)
+    names(12) = "Cielo":        SetProfile costM, mw, 12, m, Array(250, 300), Array(71000000#, 86000000#)
+    names(13) = "Datil":        SetProfile costM, mw, 13, m, Array(250, 300), Array(72000000#, 89000000#)
+    names(14) = "Encino":       SetProfile costM, mw, 14, m, Array(250, 300), Array(73000000#, 91000000#)
+    names(15) = "Fence Lake":   SetProfile costM, mw, 15, m, Array(250, 300), Array(74000000#, 95000000#)
+    names(16) = "Grama":        SetProfile costM, mw, 16, m, Array(250, 300), Array(75000000#, 97000000#)
+    names(17) = "House":        SetProfile costM, mw, 17, m, Array(220, 300), Array(90000000#, 140000000#)
 End Sub
 
-Private Sub FillConst(ByRef T() As Double, ByVal m As Long, ByVal v As Double)
-    Dim j As Long
-    For j = 1 To m: T(j) = v: Next j
+' Fill row i from a piecewise-constant tier profile: for each MW point,
+' T is the total of the first tier whose upper-MW bound it falls within.
+Private Sub SetProfile(ByRef costM() As Double, ByRef mw() As Double, ByVal i As Long, _
+                       ByVal m As Long, ByVal ups As Variant, ByVal ts As Variant)
+    Dim T() As Double: ReDim T(1 To m)
+    Dim j As Long, k As Long
+    For j = 1 To m
+        For k = LBound(ups) To UBound(ups)
+            If mw(j) <= CDbl(ups(k)) Then T(j) = CDbl(ts(k)): Exit For
+        Next k
+    Next j
+    SetRow costM, mw, T, i, m
 End Sub
 
 Private Sub SetRow(ByRef costM() As Double, ByRef mw() As Double, ByRef T() As Double, _

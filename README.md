@@ -90,18 +90,57 @@ inserted immediately after the source sheet.
 
 Then **one pair of columns per threshold** (H onward, ascending threshold order):
 
-| Col | Header | Meaning |
-|-----|--------|---------|
-| H | MW Range ≤ $25MM | MW range(s) where `T ≤ threshold` — e.g. `100-280 MW`, `100-170, 210-240 MW`, `None`, or `All (100-300 MW)` |
-| I | Slope over Range ($/MW per MW) | OLS slope of cost vs MW over the qualifying points (`n/a` / `n/a (single point)` when too few qualify) |
-| … | (repeats for $50MM, $75MM, $100MM) | |
+Each threshold occupies **four** columns (H–K for the first threshold, then L–O,
+and so on — the anchors are derived from `GetThresholds()`, so adding or removing a
+threshold shifts the whole block automatically):
+
+| Offset | Header | Meaning |
+|--------|--------|---------|
+| +0 | MW Range ≤ $XXMM | MW range(s) where `T ≤ threshold` — e.g. `100-280 MW`, `100-170, 210-240 MW`, `None`, or `All (100-300 MW)` |
+| +1 | Slope over Range ($/MW per MW) | OLS slope of cost vs MW over the qualifying points (`n/a` / `n/a (single point)` when too few qualify) |
+| +2 | Rank by MW Breadth | **Rank A** — position within this band by how much of the size range fits under budget (`n/a` if nothing qualifies) |
+| +3 | Rank by Slope (steepest/flattest first) | **Rank B** — position within this band by slope steepness; the header states which end is rank 1, per `SLOPE_RANK_MODE` (`n/a` if fewer than two points qualify) |
+
+The two ranks are **independent** — never blended into a composite, never computed
+across thresholds. A substation gets one Rank A and one Rank B per band.
+
+### How the two ranks work
+
+**Rank A — MW breadth.** Ranks by the *count* of qualifying MW points (count, not
+`max − min` span, because a qualifying set can be non-contiguous when a tier step
+pushes a curve above the threshold and a later tier does not recover it — a span
+measure would silently credit the gap). More qualifying MW is better; the highest
+count is rank 1. Tiebreak chain, in order: (1) higher qualifying count, (2) higher
+maximum qualifying MW, (3) **lower cost per MW at that maximum qualifying MW**, (4)
+alphabetical as a deterministic display backstop. Tiebreak 3 is the load-bearing
+one: when many substations qualify at every MW point and share the same max MW,
+cost at the largest affordable size is what separates them commercially.
+
+**Rank B — slope.** Steepness is magnitude (slopes are negative throughout).
+Direction is set by `SLOPE_RANK_MODE` (see below). Tiebreak: equal slope to $0.1,
+then higher qualifying count, then alphabetical.
+
+**Competition ranking.** Equal metric values share the lower rank number and the
+next distinct value skips ahead — `1, 2, 2, 4`, never dense `1, 2, 2, 3`. The
+alphabetical backstop only fixes *display order* within a tie; it does not split a
+genuine metric tie into distinct ranks. Substations that do not qualify (Rank A) —
+or qualify at only one point, leaving slope undefined (Rank B) — are excluded from
+the population entirely and shown as `n/a`, so ranks run `1..k` over the rankable
+set rather than `1..n`. A non-qualifier is never given a last-place rank.
+
+**Leaderboard (Block E, "Threshold Rankings").** Below the chart, a sorted block
+for reading: per threshold, two side-by-side lists (by MW breadth and by slope),
+each showing rank, substation and the ranking metric, with the qualifier count in
+the sub-block header. A threshold with no qualifiers collapses to a single
+`No substations qualify at this threshold` line. Rank-1 rows are bold; the block is
+monospaced so the two columns align.
 
 > Note on column E vs G: `x*` depends only on the segment endpoints, not on `T`,
 > so column E separates substations by *where their segments break*, not by cost
-> level. Column G is the one that reflects cost magnitude. The threshold slope in
-> the I/K/M/O columns is a *secant-style average* across the qualifying window;
-> because the curve is convex it understates steepness at the low-MW end and
-> overstates it at the high-MW end.
+> level. Column G is the one that reflects cost magnitude. The threshold slope
+> column is a *secant-style average* across the qualifying window; because the
+> curve is convex it understates steepness at the low-MW end and overstates it at
+> the high-MW end.
 
 **Block B — chart:** an XY scatter-with-lines chart (`xlXYScatterLines`, so MW sits
 on a true numeric axis). One line per substation, plus one dashed gray→black
@@ -127,6 +166,7 @@ All tunable values sit in a single block at the top of the module:
 | `SEG_TOL` | `0.005` | Relative `T` tolerance for treating two points as the same segment (absorbs cent-level rounding) |
 | `MAX_SEGMENTS` | `8` | Above this many segments, fall back to a global power-law fit |
 | `SLOWDOWN_TOL` | `1500` | Slope magnitude ($/MW per MW) defining the marginal-slowdown point |
+| `SLOPE_RANK_MODE` | `1` | Rank B direction. `1` = **steepest first** (largest magnitude gets rank 1) — reads a steep slope as the curve still capturing scale economies, so incremental MW is still buying meaningful unit-cost reduction. `2` = **flattest first** — reads it as the curve already flattened, the site near its efficient size. Both are legitimate depending on the question; the column header updates to match the active mode. |
 | `CHART_W`, `CHART_H` | `1100`, `620` | Chart dimensions in points |
 | `TITLE_ROW`, `TABLE_HDR_ROW`, `CHART_GAP_ROWS`, `CHART_ROWS`, `COLB_WIDTH` | — | Layout anchors, adjustable in one place |
 
