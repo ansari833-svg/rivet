@@ -305,7 +305,7 @@ Private Sub AnalyseAll(ByRef mw() As Double, ByRef names() As String, _
                        ByRef costM() As Double, ByVal n As Long, ByVal m As Long, _
                        ByRef aTable() As Variant)
     Dim thr As Variant: thr = GetThresholds()
-    Dim i As Long, j As Long, t As Long
+    Dim i As Long, j As Long, tCol As Long
 
     Dim c() As Double: ReDim c(1 To m)
     Dim T() As Double: ReDim T(1 To m)
@@ -336,11 +336,11 @@ Private Sub AnalyseAll(ByRef mw() As Double, ByRef names() As String, _
         aTable(i, 7) = SlowdownPoint(Tlong, x1, x2)
 
         ' Threshold pairs, ascending order, starting at column H
-        For t = LBound(thr) To UBound(thr)
-            Dim baseCol As Long: baseCol = N_FIXED_COLS + 1 + 2 * (t - LBound(thr))
-            aTable(i, baseCol) = ThresholdRangeStr(T, mw, m, CDbl(thr(t)))
-            aTable(i, baseCol + 1) = ThresholdSlope(c, mw, T, m, CDbl(thr(t)))
-        Next t
+        For tCol = LBound(thr) To UBound(thr)
+            Dim baseCol As Long: baseCol = N_FIXED_COLS + 1 + 2 * (tCol - LBound(thr))
+            aTable(i, baseCol) = ThresholdRangeStr(T, mw, m, CDbl(thr(tCol)))
+            aTable(i, baseCol + 1) = ThresholdSlope(c, mw, T, m, CDbl(thr(tCol)))
+        Next tCol
     Next i
 End Sub
 
