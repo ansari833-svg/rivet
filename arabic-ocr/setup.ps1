@@ -1,4 +1,4 @@
-﻿# setup.ps1 - Windows setup for arabic-ocr
+# setup.ps1 - Windows setup for arabic-ocr
 #
 # Run with:
 #   powershell -ExecutionPolicy Bypass -File setup.ps1

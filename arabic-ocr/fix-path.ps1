@@ -1,4 +1,4 @@
-﻿# fix-path.ps1 - diagnose and repair the arabic-ocr launcher + PATH entry
+# fix-path.ps1 - diagnose and repair the arabic-ocr launcher + PATH entry
 #
 # Run from the arabic-ocr project folder (the one containing .venv):
 #   powershell -ExecutionPolicy Bypass -File fix-path.ps1
