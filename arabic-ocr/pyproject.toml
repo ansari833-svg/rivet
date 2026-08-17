@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arabic-ocr"
+version = "0.1.0"
+description = "Two-pass Arabic page transcription (Surya writes, Claude verifies) for classical printed books."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "surya-ocr",
+    "Pillow",
+    "anthropic",
+    "natsort",
+    "colorama",
+]
+
+[project.scripts]
+arabic-ocr = "arabic_ocr.main:main"
+
+[tool.setuptools]
+packages = ["arabic_ocr"]
