@@ -1,4 +1,4 @@
-# setup.ps1 — Windows setup for arabic-ocr
+﻿# setup.ps1 - Windows setup for arabic-ocr
 #
 # Run with:
 #   powershell -ExecutionPolicy Bypass -File setup.ps1
@@ -20,7 +20,7 @@ if (-not (Test-Path $venvPython)) {
     Write-Host "Creating virtual environment at .venv ..." -ForegroundColor Cyan
     python -m venv .venv
 } else {
-    Write-Host "Virtual environment already exists — reusing .venv" -ForegroundColor Cyan
+    Write-Host "Virtual environment already exists - reusing .venv" -ForegroundColor Cyan
 }
 
 Write-Host "Upgrading pip ..." -ForegroundColor Cyan
@@ -66,7 +66,7 @@ Write-Host "Launcher written to $launcherPath" -ForegroundColor Cyan
 
 # --- User PATH -------------------------------------------------------------- #
 # Read the current user PATH first, check the folder isn't already present, then
-# append. Do NOT use `setx PATH` — it truncates at 1024 characters and can
+# append. Do NOT use `setx PATH` - it truncates at 1024 characters and can
 # destroy the existing PATH.
 $currentPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
 if ($null -eq $currentPath) { $currentPath = "" }

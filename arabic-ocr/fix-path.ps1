@@ -1,4 +1,4 @@
-# fix-path.ps1 — diagnose and repair the arabic-ocr launcher + PATH entry
+﻿# fix-path.ps1 - diagnose and repair the arabic-ocr launcher + PATH entry
 #
 # Run from the arabic-ocr project folder (the one containing .venv):
 #   powershell -ExecutionPolicy Bypass -File fix-path.ps1
@@ -37,10 +37,10 @@ if (Test-Path $launcherPath) {
         Write-Host "[ok] launcher .bat exists and points at this venv" -ForegroundColor Green
         $batOk = $true
     } else {
-        Write-Host "[fix] launcher .bat exists but points elsewhere — rewriting" -ForegroundColor Yellow
+        Write-Host "[fix] launcher .bat exists but points elsewhere - rewriting" -ForegroundColor Yellow
     }
 } else {
-    Write-Host "[fix] launcher .bat missing — creating it" -ForegroundColor Yellow
+    Write-Host "[fix] launcher .bat missing - creating it" -ForegroundColor Yellow
 }
 
 if (-not $batOk) {
@@ -54,7 +54,7 @@ if (-not $batOk) {
 
 # --- 3. User PATH ----------------------------------------------------------- #
 # Read the current USER PATH first, then append only if the folder is absent.
-# Never use setx — it truncates at 1024 chars and can destroy the existing PATH.
+# Never use setx - it truncates at 1024 chars and can destroy the existing PATH.
 $currentPath = [Environment]::GetEnvironmentVariable('PATH', 'User')
 if ($null -eq $currentPath) { $currentPath = "" }
 
