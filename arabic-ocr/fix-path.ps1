@@ -31,10 +31,8 @@ if (-not (Test-Path $venvPython)) {
         Write-Host "  $tag$($_.Name)"
     }
 
-    $found = @(
-        Get-ChildItem -Path $scriptDir -Recurse -Depth 4 -Force -Filter python.exe -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -match '[\\/]Scripts[\\/]python\.exe$' }
-    )
+    $all = Get-ChildItem -Path $scriptDir -Recurse -Depth 4 -Force -Filter python.exe -ErrorAction SilentlyContinue
+    $found = @($all | Where-Object { $_.FullName -match '[\\/]Scripts[\\/]python\.exe$' })
 
     if ($found.Count -ge 1) {
         $venvPython = $found[0].FullName
