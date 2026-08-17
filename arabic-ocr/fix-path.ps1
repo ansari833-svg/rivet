@@ -3,9 +3,9 @@
 # Run from the arabic-ocr project folder (the one containing .venv):
 #   powershell -ExecutionPolicy Bypass -File fix-path.ps1
 #
-# It checks whether the launcher .bat exists and whether its folder is on the
-# user PATH, fixes whichever step failed, and refreshes the CURRENT shell so you
-# can verify immediately without opening a new window.
+# It locates the venv python, checks whether the launcher .bat exists and
+# whether its folder is on the user PATH, fixes whichever step failed, and
+# refreshes the CURRENT shell so you can verify without opening a new window.
 
 $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
@@ -21,13 +21,41 @@ Write-Host "Launcher folder: $launcherDir"
 Write-Host "Launcher .bat  : $launcherPath"
 Write-Host ""
 
-# --- 1. venv sanity --------------------------------------------------------- #
+# --- 1. Locate the venv python --------------------------------------------- #
 if (-not (Test-Path $venvPython)) {
-    Write-Host "PROBLEM: .venv\Scripts\python.exe not found in this folder." -ForegroundColor Red
-    Write-Host "Run this script from the arabic-ocr project folder, or re-run setup.ps1 first." -ForegroundColor Red
-    exit 1
+    Write-Host "[fix] venv python not at the expected path - searching..." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Contents of $scriptDir :" -ForegroundColor Cyan
+    Get-ChildItem -Force $scriptDir | ForEach-Object {
+        $tag = if ($_.PSIsContainer) { '<dir> ' } else { '      ' }
+        Write-Host "  $tag$($_.Name)"
+    }
+
+    $found = @(
+        Get-ChildItem -Path $scriptDir -Recurse -Depth 4 -Force -Filter python.exe -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -match '[\\/]Scripts[\\/]python\.exe$' }
+    )
+
+    if ($found.Count -ge 1) {
+        $venvPython = $found[0].FullName
+        Write-Host "[ok] found a venv python at: $venvPython" -ForegroundColor Green
+        if ($found.Count -gt 1) {
+            Write-Host "     (multiple found; using the first - all listed below)" -ForegroundColor Yellow
+            $found | ForEach-Object { Write-Host "       $($_.FullName)" }
+        }
+    } else {
+        Write-Host "PROBLEM: no .venv\Scripts\python.exe found under this folder." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "The virtual environment was never created here. Make sure this folder" -ForegroundColor Red
+        Write-Host "contains pyproject.toml and the arabic_ocr\ package, then from THIS" -ForegroundColor Red
+        Write-Host "folder run setup first:" -ForegroundColor Red
+        Write-Host "  powershell -ExecutionPolicy Bypass -File setup.ps1" -ForegroundColor Red
+        Write-Host "and re-run this script afterward." -ForegroundColor Red
+        exit 1
+    }
+} else {
+    Write-Host "[ok] venv python exists" -ForegroundColor Green
 }
-Write-Host "[ok] venv python exists" -ForegroundColor Green
 
 # --- 2. Launcher .bat ------------------------------------------------------- #
 $batOk = $false
