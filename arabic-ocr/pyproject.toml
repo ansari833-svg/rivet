@@ -10,6 +10,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "surya-ocr",
+    # torch/torchvision are declared directly (though surya-ocr pulls them in
+    # transitively) so the CPU index pin in [tool.uv.sources] below binds.
+    "torch",
+    "torchvision",
     "Pillow",
     "anthropic",
     "natsort",
@@ -21,3 +25,17 @@ arabic-ocr = "arabic_ocr.main:main"
 
 [tool.setuptools]
 packages = ["arabic_ocr"]
+
+# PyTorch (pulled in by surya-ocr, together with torchvision) resolves to the
+# CPU-only build. This keeps installs off the multi-gigabyte CUDA wheels on
+# machines without an NVIDIA GPU. To build against a CUDA GPU instead, point the
+# index URL below at the matching channel, e.g.
+# https://download.pytorch.org/whl/cu124
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", marker = "sys_platform == 'win32'" }
+torchvision = { index = "pytorch-cpu", marker = "sys_platform == 'win32'" }

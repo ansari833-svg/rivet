@@ -1,13 +1,9 @@
 # arabic-ocr
 
-If you don't have uv, install it:
+Two-pass Arabic page transcription for classical printed books: Surya (local)
+transcribes and is the authoritative text; Claude verifies against the page
+image and flags discrepancies for a human to resolve.
 
-    powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-Install arabic-ocr:
+## Installation
 
     uv tool install .
-
-If the `arabic-ocr` command is not on your PATH afterward:
-
-    uv tool update-shell
