@@ -9,7 +9,12 @@ description = "Two-pass Arabic page transcription (Surya writes, Claude verifies
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "surya-ocr",
+    # Pinned to the last pre-VLM line. Surya 0.20+ ("Surya 2") is a VLM rewrite
+    # that replaces surya.foundation.FoundationPredictor with
+    # SuryaInferenceManager and spawns a vllm / llama-server process — the wrong
+    # architecture for a CPU-only Windows machine. 0.16-0.19 provides
+    # surya.foundation and runs the OCR models on CPU with no server.
+    "surya-ocr>=0.16,<0.20",
     # torch/torchvision are declared directly (though surya-ocr pulls them in
     # transitively) so the CPU index pin in [tool.uv.sources] below binds.
     "torch",

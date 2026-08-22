@@ -4,18 +4,26 @@ Surya transcribes what is physically on the page. This is the authoritative
 text and is never overwritten automatically. Its errors look like garbage and
 are therefore catchable by a human, which is exactly what this design wants.
 
+This targets the pre-VLM Surya line (surya-ocr >=0.16,<0.20), pinned in
+pyproject.toml. That line exposes ``surya.foundation.FoundationPredictor`` and
+runs the OCR models directly on CPU with no vllm / llama-server process. The
+0.20+ "Surya 2" VLM rewrite is deliberately excluded.
+
+API used (surya-ocr 0.17.x):
+    from surya.foundation import FoundationPredictor
+    from surya.recognition import RecognitionPredictor
+    from surya.detection import DetectionPredictor
+    from surya.layout import LayoutPredictor
+    foundation = FoundationPredictor()
+    rec = RecognitionPredictor(foundation)
+    det = DetectionPredictor()
+    predictions = rec([image], det_predictor=det)   # no langs argument
+    for line in predictions[0].text_lines:          # line.text, line.polygon
+
 Text handling rules enforced here:
   * Tashkīl (vocalization marks) is preserved exactly as Surya recognizes it.
-    Nothing is stripped, normalized, or added.
   * No arabic-reshaper and no bidi algorithm is applied to the stored text.
-    Reshaping substitutes presentation forms for the real characters and would
-    corrupt the file for every downstream consumer, including the translation
-    tool.
   * No RLM/LRM directional marks are inserted.
-
-The module sets TORCH_DEVICE from an autodetect (defaulting to CPU) before the
-Surya models are imported, and processes images in batches — Surya is
-substantially faster batched than one image per call.
 """
 
 from __future__ import annotations
@@ -53,30 +61,45 @@ def autodetect_device() -> str:
         return "cpu"
 
 
+def _poly_bbox(polygon) -> tuple[float, float, float, float]:
+    """Axis-aligned bbox (x0, y0, x1, y1) from a Surya polygon [[x, y], ...]."""
+    xs = [float(p[0]) for p in polygon]
+    ys = [float(p[1]) for p in polygon]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def _line_boxes(ocr_result) -> list[tuple[str, tuple[float, float, float, float]]]:
-    """Extract (text, bbox) pairs from a Surya OCR result, defensively."""
+    """Extract (text, bbox) pairs from a Surya OCRResult.
+
+    surya-ocr 0.17.x TextLine has ``.text`` and ``.polygon`` (no ``.bbox``), so
+    the bounding box is derived from the polygon for reading-order sorting.
+    """
     lines = []
     for line in getattr(ocr_result, "text_lines", []) or []:
         text = (getattr(line, "text", "") or "").rstrip("\n")
         if not text.strip():
             continue
-        bbox = getattr(line, "bbox", None)
-        if not bbox or len(bbox) < 4:
-            # No geometry — place it at the top so it still lands in the body.
+        polygon = getattr(line, "polygon", None)
+        if not polygon:
             bbox = (0.0, 0.0, 0.0, 0.0)
-        lines.append((text, tuple(float(v) for v in bbox[:4])))
+        else:
+            bbox = _poly_bbox(polygon)
+        lines.append((text, bbox))
     return lines
 
 
 def _layout_regions(layout_result) -> list[tuple[str, tuple[float, float, float, float]]]:
-    """Extract (label, bbox) pairs from a Surya layout result, defensively."""
+    """Extract (label, bbox) pairs from a Surya LayoutResult.
+
+    surya-ocr 0.17.x LayoutBox has ``.label`` and ``.polygon`` (no ``.bbox``).
+    """
     regions = []
     for region in getattr(layout_result, "bboxes", []) or []:
         label = getattr(region, "label", "") or ""
-        bbox = getattr(region, "bbox", None)
-        if not bbox or len(bbox) < 4:
+        polygon = getattr(region, "polygon", None)
+        if not polygon:
             continue
-        regions.append((label, tuple(float(v) for v in bbox[:4])))
+        regions.append((label, _poly_bbox(polygon)))
     return regions
 
 
@@ -116,7 +139,15 @@ class SuryaEngine:
         os.environ.setdefault("TORCH_DEVICE", self.device)
 
         # Import only after TORCH_DEVICE is set — Surya reads it at import time.
-        self._rec, self._det, self._layout = _build_predictors()
+        from surya.foundation import FoundationPredictor
+        from surya.recognition import RecognitionPredictor
+        from surya.detection import DetectionPredictor
+        from surya.layout import LayoutPredictor
+
+        foundation = FoundationPredictor()
+        self._rec = RecognitionPredictor(foundation)
+        self._det = DetectionPredictor()
+        self._layout = LayoutPredictor(foundation)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -200,40 +231,9 @@ class SuryaEngine:
         )
 
     def _run_ocr(self, images: list[Image.Image]):
-        # Newer Surya auto-detects language and takes det_predictor as a kwarg.
-        # Older Surya requires an explicit per-image language list.
-        try:
-            return self._rec(images, det_predictor=self._det)
-        except TypeError:
-            langs = [["ar"]] * len(images)
-            return self._rec(images, langs, self._det)
+        # surya-ocr 0.17.x: recognition runs detection internally when given a
+        # det_predictor; no language list is passed.
+        return self._rec(images, det_predictor=self._det)
 
     def _run_layout(self, images: list[Image.Image]):
         return self._layout(images)
-
-
-def _build_predictors():
-    """Construct Surya predictors, accommodating the two current API shapes."""
-    try:
-        # Surya >= 0.13 routes recognition and layout through a shared
-        # FoundationPredictor.
-        from surya.foundation import FoundationPredictor
-        from surya.recognition import RecognitionPredictor
-        from surya.detection import DetectionPredictor
-        from surya.layout import LayoutPredictor
-
-        foundation = FoundationPredictor()
-        rec = RecognitionPredictor(foundation)
-        det = DetectionPredictor()
-        try:
-            layout = LayoutPredictor(foundation)
-        except TypeError:
-            layout = LayoutPredictor()
-        return rec, det, layout
-    except ImportError:
-        # Older Surya: predictors are standalone.
-        from surya.recognition import RecognitionPredictor
-        from surya.detection import DetectionPredictor
-        from surya.layout import LayoutPredictor
-
-        return RecognitionPredictor(), DetectionPredictor(), LayoutPredictor()
