@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arabic-ocr"
+version = "0.1.0"
+description = "Two-pass Arabic page transcription (Surya writes, Claude verifies) for classical printed books."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Pinned to the last pre-VLM line. Surya 0.20+ ("Surya 2") is a VLM rewrite
+    # that replaces surya.foundation.FoundationPredictor with
+    # SuryaInferenceManager and spawns a vllm / llama-server process — the wrong
+    # architecture for a CPU-only Windows machine. 0.16-0.19 provides
+    # surya.foundation and runs the OCR models on CPU with no server.
+    "surya-ocr>=0.16,<0.20",
+    # torch/torchvision are declared directly (though surya-ocr pulls them in
+    # transitively) so the CPU index pin in [tool.uv.sources] below binds.
+    "torch",
+    "torchvision",
+    "Pillow",
+    "anthropic",
+    "natsort",
+    "colorama",
+    "requests",
+    "transformers>=4.57,<5",
+]
+
+[project.scripts]
+arabic-ocr = "arabic_ocr.main:main"
+
+[tool.setuptools]
+packages = ["arabic_ocr"]
+
+# PyTorch (pulled in by surya-ocr, together with torchvision) resolves to the
+# CPU-only build. This keeps installs off the multi-gigabyte CUDA wheels on
+# machines without an NVIDIA GPU. To build against a CUDA GPU instead, point the
+# index URL below at the matching channel, e.g.
+# https://download.pytorch.org/whl/cu124
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", marker = "sys_platform == 'win32'" }
+torchvision = { index = "pytorch-cpu", marker = "sys_platform == 'win32'" }
