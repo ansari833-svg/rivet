@@ -4,11 +4,13 @@ A simple prompt-based terminal UI (no frameworks) that converts each page of a
 PDF into a JPEG image. Windows-only.
 """
 
+import argparse
 import sys
 from pathlib import Path
 
 import colorama
 
+from pdf_screenshots import __version__
 from pdf_screenshots.render import get_page_count, render_pdf_to_jpegs
 
 DEFAULT_WIDTH = 900
@@ -104,7 +106,29 @@ def _confirm_overwrite(output_dir: Path) -> bool:
         print("  Please answer y or n.")
 
 
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="pdf-screenshots",
+        description=(
+            "Convert each page of a PDF into a consistently sized JPEG image. "
+            "Run with no arguments for the interactive prompt-based UI: a native "
+            "file picker opens, then you're asked for the output folder, width, "
+            "height, and JPEG quality before converting."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser.parse_args(argv)
+
+
 def main():
+    # Parse args first so `--help`/`--version` respond without opening the
+    # picker. With no arguments this simply proceeds to the interactive UI.
+    _parse_args()
+
     # Windows terminals default to a legacy code page that mangles box-drawing
     # characters and the check mark. Do this before printing anything.
     sys.stdout.reconfigure(encoding="utf-8")
