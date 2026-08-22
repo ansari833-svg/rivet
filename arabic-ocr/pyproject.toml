@@ -23,6 +23,7 @@ dependencies = [
     "anthropic",
     "natsort",
     "colorama",
+    "requests",
 ]
 
 [project.scripts]
