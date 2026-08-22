@@ -24,6 +24,7 @@ dependencies = [
     "natsort",
     "colorama",
     "requests",
+    "transformers>=4.57,<5",
 ]
 
 [project.scripts]
