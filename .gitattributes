@@ -1,3 +1,0 @@
-# PowerShell and batch scripts must stay CRLF for Windows PowerShell 5.1
-*.ps1 text eol=crlf
-*.bat text eol=crlf
