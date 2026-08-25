@@ -55,13 +55,10 @@ End Type
 ' ============================================================
 '  PUBLIC ENTRY POINT
 ' ============================================================
-'  wbTarget: the workbook that receives the data table and chart. When
-'  called with no argument (e.g. run from the VBA editor) it defaults to
-'  the ActiveWorkbook; the runner-workbook launcher passes the dropped
-'  workbook explicitly so output lands there, not in the runner.
-Public Sub BuildNPVBridge(Optional ByVal wbTarget As Workbook = Nothing)
+Public Sub BuildNPVBridge()
 
     Dim comps() As Component
+    Dim wbTarget As Workbook
     Dim nSteps As Long
     Dim baseVal As Double, delta As Double
     Dim cumBefore As Double, cumAfter As Double
@@ -70,8 +67,8 @@ Public Sub BuildNPVBridge(Optional ByVal wbTarget As Workbook = Nothing)
     Dim i As Long, idx As Long
     Dim s As String
 
-    ' Default the target to the active workbook when none was passed.
-    If wbTarget Is Nothing Then Set wbTarget = ActiveWorkbook
+    ' All data-table and chart output goes into the active workbook.
+    Set wbTarget = ActiveWorkbook
 
     ' ---- 1. How many bridge steps? (integer, minimum 1) ----
     Do
