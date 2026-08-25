@@ -55,7 +55,11 @@ End Type
 ' ============================================================
 '  PUBLIC ENTRY POINT
 ' ============================================================
-Public Sub BuildNPVBridge()
+'  wbTarget: the workbook that receives the data table and chart. When
+'  called with no argument (e.g. run from the VBA editor) it defaults to
+'  the ActiveWorkbook; the runner-workbook launcher passes the dropped
+'  workbook explicitly so output lands there, not in the runner.
+Public Sub BuildNPVBridge(Optional ByVal wbTarget As Workbook = Nothing)
 
     Dim comps() As Component
     Dim nSteps As Long
@@ -65,6 +69,9 @@ Public Sub BuildNPVBridge()
     Dim firstStepHex As String
     Dim i As Long, idx As Long
     Dim s As String
+
+    ' Default the target to the active workbook when none was passed.
+    If wbTarget Is Nothing Then Set wbTarget = ActiveWorkbook
 
     ' ---- 1. How many bridge steps? (integer, minimum 1) ----
     Do
@@ -153,7 +160,7 @@ Public Sub BuildNPVBridge()
     Application.ScreenUpdating = False
     On Error GoTo CleanFail
 
-    WriteTableAndChart comps
+    WriteTableAndChart wbTarget, comps
 
     Application.ScreenUpdating = True
     MsgBox "NPV Bridge built successfully.", vbInformation, "NPV Bridge"
@@ -168,13 +175,13 @@ End Sub
 ' ============================================================
 '  LAYOUT + CHART
 ' ============================================================
-Private Sub WriteTableAndChart(comps() As Component)
+Private Sub WriteTableAndChart(ByVal wb As Workbook, comps() As Component)
 
     Dim ws As Worksheet
     Dim nRows As Long, r As Long, i As Long
     Dim lastRow As Long
 
-    Set ws = GetCleanSheet(DATA_SHEET)
+    Set ws = GetCleanSheet(wb, DATA_SHEET)
 
     nRows = UBound(comps) - LBound(comps) + 1     ' base + steps + revised
 
@@ -421,16 +428,16 @@ End Function
 
 ' Return a worksheet with the given name, cleared. Creates it if it
 ' does not exist, otherwise deletes its charts and clears its cells.
-Private Function GetCleanSheet(ByVal name As String) As Worksheet
+Private Function GetCleanSheet(ByVal wb As Workbook, ByVal name As String) As Worksheet
     Dim ws As Worksheet
 
     On Error Resume Next
-    Set ws = ActiveWorkbook.Worksheets(name)
+    Set ws = wb.Worksheets(name)
     On Error GoTo 0
 
     If ws Is Nothing Then
-        Set ws = ActiveWorkbook.Worksheets.Add( _
-                    After:=ActiveWorkbook.Worksheets(ActiveWorkbook.Worksheets.Count))
+        Set ws = wb.Worksheets.Add( _
+                    After:=wb.Worksheets(wb.Worksheets.Count))
         ws.Name = name
     Else
         Dim co As ChartObject
