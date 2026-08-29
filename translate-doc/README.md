@@ -1,0 +1,262 @@
+# translate-doc
+
+A Windows command-line tool that translates Arabic `.docx` files into English
+using the Anthropic Claude API.
+
+For each document it produces:
+
+1. **`{name}_translated.docx`** — an English translation with formatting
+   preserved as closely as possible.
+2. **`{name}_bilingual.docx`** and **`{name}_bilingual.pdf`** — an
+   Arabic/English parallel-text document with footnotes for difficult passages.
+3. **`{name}_translation_log.csv`** — a review log flagging every difficult or
+   untranslated section.
+
+It also has a **merge mode** for combining several `.docx` or `.txt` files into
+one document, and a **format mode** that turns a raw `_translated.docx` into a
+clean, properly footnoted Word document (`{name}_formatted.docx`).
+
+> This tool is Windows-only.
+
+---
+
+## Requirements
+
+- Windows
+- Python 3.10+ (install from [python.org](https://www.python.org/downloads/);
+  the standard installer bundles `tkinter`, which the file picker needs)
+- An Anthropic API key
+- Optional, for PDF export: Microsoft Word **or**
+  [LibreOffice](https://www.libreoffice.org/)
+- Required for **format mode**: [Pandoc](https://pandoc.org/) (install with
+  `winget install --id JohnMacFarlane.Pandoc`)
+
+---
+
+## Installation
+
+From the `translate-doc` folder, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+
+The `-ExecutionPolicy Bypass` is required — Windows' default execution policy
+will otherwise block the script from running.
+
+`setup.ps1` will:
+
+- create a virtual environment at `.venv`
+- install the tool and its dependencies into it
+- create a launcher at `%LOCALAPPDATA%\Programs\translate-doc\translate-doc.bat`
+- add that folder to your **user** PATH
+
+**Open a new terminal window after setup** so the PATH change takes effect.
+Then you can run `translate-doc` from anywhere.
+
+---
+
+## Setting your API key
+
+The tool reads your key from the `ANTHROPIC_API_KEY` environment variable and
+never stores it. Set it in either of these ways:
+
+**Option 1 — from a terminal** (takes effect in *new* terminals only):
+
+```cmd
+setx ANTHROPIC_API_KEY "sk-ant-..."
+```
+
+**Option 2 — via the GUI:**
+
+System Properties → Advanced → Environment Variables → **New** under
+*User variables*, with name `ANTHROPIC_API_KEY` and value `sk-ant-...`.
+
+If the key is not set, the tool prints these instructions and exits cleanly
+(no traceback).
+
+---
+
+## Usage
+
+### Interactive
+
+Just run:
+
+```cmd
+translate-doc
+```
+
+You'll see a menu:
+
+```
+┌─────────────────────────────────────────┐
+│  translate-doc                          │
+│                                         │
+│  [T] Translate a document               │
+│  [M] Merge existing documents           │
+│  [F] Format a translated document       │
+│                                         │
+│  Enter T, M, or F:                      │
+└─────────────────────────────────────────┘
+```
+
+- **[T]** opens a native file picker, asks how many pages to translate, shows a
+  pre-flight summary, then translates.
+- **[M]** scans a folder and merges the files you choose.
+- **[F]** cleans up and reformats a `_translated.docx` (see
+  [Format mode](#format-mode) below).
+
+### Shortcuts
+
+Translate a specific file directly (skips the menu):
+
+```cmd
+translate-doc "C:\Users\you\Documents\contract.docx"
+```
+
+Ignore a saved checkpoint and start fresh:
+
+```cmd
+translate-doc "contract.docx" --restart
+```
+
+Go straight to merge mode:
+
+```cmd
+translate-doc --merge
+```
+
+Go straight to format mode (with or without a file argument):
+
+```cmd
+translate-doc --format
+translate-doc --format "contract_translated.docx"
+```
+
+---
+
+## Page selection
+
+Before translating, the tool estimates the document's page count and asks
+whether to translate all pages or a range (e.g. `1-10`). The selected range is
+reflected in the output filenames, e.g. `contract_p1-10_translated.docx`.
+
+## Resume / checkpoints
+
+Translation happens in chunks. After each chunk a checkpoint file
+(`{name}_checkpoint.json`) is written next to the input. If the run is
+interrupted, just run the tool again on the same file — it resumes from where it
+left off. Use `--restart` to ignore the checkpoint. The checkpoint is deleted
+automatically once all outputs are written.
+
+## Difficult passages
+
+Claude flags ambiguous, culturally specific, or hard-to-translate phrases. In
+the English-only document these are replaced with a highlighted marker; in the
+bilingual document they become numbered footnotes; and every one of them is
+recorded in the CSV log along with any passages that were missing from the API
+response.
+
+## PDF export
+
+The bilingual PDF is produced with Microsoft Word (via COM) if available, then
+LibreOffice headless as a fallback. If neither is installed, the `.docx` files
+are still created and the tool tells you how to export the PDF manually from
+Word (Save As → PDF).
+
+---
+
+## Format mode
+
+The Translate-mode output is faithful line-for-line, but it reads as walls of
+shredded text: footnotes sit inline as plain text, the body is broken into one
+short paragraph per source line, and the file can be cluttered with
+`[[page N]]` markers, `[†see log]` flags, and OCR garbage from cover pages.
+Format mode fixes all of that and produces **`{name}_formatted.docx`**: a clean,
+legible, properly footnoted Word document.
+
+Run it from the menu (**[F]**), or with `translate-doc --format`. It opens a
+picker for the `_translated.docx` (or takes a path argument) and writes the
+formatted file into the same folder.
+
+What it does:
+
+- **Parses the page structure**, splitting on `[[page N]]` markers and dropping
+  un-OCR-able cover/title pages (pages with fewer than ~40 Latin letters). The
+  skipped page numbers are reported at the end.
+- **Promotes footnotes to real Word footnotes.** Inline `(N)` definitions are
+  matched to their `(N)` markers in the body (numbering restarts each page) and
+  become genuine, auto-numbered footnotes anchored at the bottom of the page.
+- **Cleans and reflows the body:** `[†see log]` flags become superscript
+  asterisks, leaked `<sup>`/`<u>`/`<sub>` tags are stripped, per-line paragraphs
+  are joined into flowing prose, Qur'anic quotations in `{ ... }` are
+  italicized, and the source page number is preserved as a small superscript
+  `[N]` so you can still cite by page.
+- **Reassembles across page boundaries** without breaking sentences — a page
+  that ends mid-sentence continues into the next.
+- **Intelligent paragraphing (optional).** If `ANTHROPIC_API_KEY` is set, the
+  reflowed text is sent to Claude (`claude-sonnet-5`) in chunks, which inserts
+  paragraph breaks only where the argument shifts. The model is **only** allowed
+  to add breaks: every chunk is verified against its input and discarded if a
+  single word or placeholder changed. Without a key, this step is skipped and
+  the document is still produced with page-based paragraphs. Progress is
+  checkpointed to `{name}_format_checkpoint.json`; re-run to resume, or use
+  `--restart` to ignore it.
+- **Builds the `.docx` with Pandoc** against a generated reference document:
+  US Letter, one-inch margins, Times New Roman 12pt, justified with a first-line
+  indent, and centered page numbers in the footer.
+
+Format mode requires **Pandoc**. If it is not installed the tool prints the
+install command and stops without discarding any checkpoint.
+
+### Notes and honest limits
+
+- **Footnote matching is by number.** Markers are matched to their notes by the
+  number in `(N)`, which is reliable when there is one marker per number per
+  page (the normal case). A page that reuses the same number could misplace one.
+- **The paragraph breaks are Claude's judgment**, not the original author's. The
+  source's real paragraphing is not recoverable from the flattened text, so the
+  breaks reflect where the *argument* appears to shift — a best-effort
+  reconstruction, not the author's own layout.
+- **The asterisks are pointers, not the notes themselves.** They mark passages
+  the translator flagged as difficult during Translate mode; the full text of
+  those notes lives in that run's `{name}_translation_log.csv`.
+
+---
+
+## Tuning
+
+Constants you may want to adjust live near the top of the source modules:
+
+- `translate_doc/translator.py`
+  - `MAX_PARAGRAPHS_PER_CHUNK` — lower this if responses hit the output token
+    limit.
+  - `MODEL` — the Claude model string (`claude-sonnet-5`).
+- `translate_doc/parser.py`
+  - `PARAGRAPHS_PER_PAGE` — the ratio used to estimate page count.
+- `translate_doc/formatter.py`
+  - `LATIN_LETTER_THRESHOLD` — below this many Latin letters, a page is treated
+    as an un-OCR-able cover page and dropped.
+  - `WORDS_PER_CHUNK` — chunk size for the intelligent-paragraphing calls.
+
+---
+
+## Project structure
+
+```
+translate-doc\
+├── setup.ps1
+├── pyproject.toml
+├── README.md
+└── translate_doc\
+    ├── __init__.py
+    ├── main.py          # CLI entry point, startup menu, prompts
+    ├── parser.py        # .docx parsing and structure extraction
+    ├── translator.py    # Claude API calls and chunking logic
+    ├── builder.py       # Reconstructing the output .docx files
+    ├── pdf_export.py    # Word COM / LibreOffice PDF conversion
+    ├── merger.py        # Merge mode
+    ├── formatter.py     # Format mode (clean + real footnotes via Pandoc)
+    └── logger.py        # CSV log generation
+```
