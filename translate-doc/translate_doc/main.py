@@ -14,7 +14,7 @@ from typing import Callable, Optional
 
 import colorama
 
-from . import builder, logger, merger, pdf_export
+from . import builder, formatter, logger, merger, pdf_export
 from .parser import ParsedDocument, parse
 from .translator import Checkpoint, Translator, TranslationError
 
@@ -86,8 +86,9 @@ def _print_main_menu() -> None:
         "│  What would you like to do?             │\n"
         "│  [T] Translate a document               │\n"
         "│  [M] Merge existing documents           │\n"
+        "│  [F] Format a translated document       │\n"
         "│                                         │\n"
-        "│  Enter T or M:                          │\n"
+        "│  Enter T, M, or F:                      │\n"
         "└─────────────────────────────────────────┘"
     )
 
@@ -96,9 +97,9 @@ def _main_menu_choice() -> str:
     while True:
         _print_main_menu()
         choice = input("> ").strip().upper()
-        if choice in ("T", "M"):
+        if choice in ("T", "M", "F"):
             return choice
-        print("Please enter T or M")
+        print("Please enter T, M, or F")
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +107,7 @@ def _main_menu_choice() -> str:
 # ---------------------------------------------------------------------------
 
 
-def _pick_file() -> Optional[Path]:
+def _pick_file(title: str = "Select an Arabic .docx file") -> Optional[Path]:
     import tkinter as tk
     from tkinter import filedialog
 
@@ -115,7 +116,7 @@ def _pick_file() -> Optional[Path]:
     # Required on Windows or the dialog opens behind the terminal.
     root.attributes("-topmost", True)
     file_path = filedialog.askopenfilename(
-        title="Select an Arabic .docx file",
+        title=title,
         filetypes=[("Word documents", "*.docx")],
     )
     root.destroy()
@@ -462,6 +463,90 @@ def run_merge_flow() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Format flow
+# ---------------------------------------------------------------------------
+
+
+def run_format_flow(input_path: Path, restart: bool) -> None:
+    if input_path.suffix.lower() != ".docx":
+        print(f"Not a .docx file: {input_path}")
+        sys.exit(1)
+    if not input_path.exists():
+        print(f"File does not exist: {input_path}")
+        sys.exit(1)
+
+    # Pandoc is required; fail fast (before any API spend) so the checkpoint,
+    # if one exists from a prior run, is left untouched.
+    if not formatter.pandoc_available():
+        print(
+            "Format mode needs Pandoc. Install it with: "
+            "winget install --id JohnMacFarlane.Pandoc"
+        )
+        sys.exit(1)
+
+    input_path = input_path.resolve()
+    print(f"Selected file: {input_path}")
+
+    # Intelligent paragraphing needs the API key; without it we still format.
+    client = None
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        client = _build_client(os.environ["ANTHROPIC_API_KEY"])
+    else:
+        print(
+            "ANTHROPIC_API_KEY is not set — skipping intelligent paragraphing.\n"
+            "The document will still be formatted using page-based paragraphs."
+        )
+
+    def _progress(current: int, total: int) -> None:
+        print(f"Paragraphing... chunk {current} of {total}")
+
+    print("Reading and cleaning the document...")
+
+    result_holder: dict[str, formatter.FormatResult] = {}
+
+    def _do_format() -> None:
+        result_holder["result"] = formatter.format_document(
+            input_path, client=client, restart=restart, progress=_progress
+        )
+
+    try:
+        _retry_on_permission_error(_do_format, f"{input_path.stem}_formatted.docx")
+    except FileNotFoundError:
+        # build_reference_doc / run_pandoc invoke the pandoc binary.
+        print(
+            "Format mode needs Pandoc. Install it with: "
+            "winget install --id JohnMacFarlane.Pandoc"
+        )
+        sys.exit(1)
+
+    result = result_holder["result"]
+    _print_format_summary(input_path, result)
+
+
+def _print_format_summary(input_path: Path, result: "formatter.FormatResult") -> None:
+    skipped = (
+        ", ".join(str(n) for n in result.skipped_pages)
+        if result.skipped_pages
+        else "none"
+    )
+    print("\n" + "=" * 50)
+    print("Done.")
+    print(f"  Input:                 {input_path.name}")
+    print(f"  Output:                {result.output_path.name}")
+    print(f"  Pages formatted:       {result.pages_formatted}")
+    print(f"  Footnotes created:     {result.footnotes_created}")
+    print(f"  Asterisk flags:        {result.asterisks}")
+    print(f"  Cover pages skipped:   {skipped}")
+    print(
+        "  Intelligent paragraphing: "
+        + ("ran" if result.paragraphing_ran else "skipped")
+    )
+    print("=" * 50)
+    print(f"✓ {result.output_path.name} — clean, footnoted Word document")
+    print(f"\nSaved to: {result.output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -484,10 +569,20 @@ def main() -> None:
         action="store_true",
         help="Go straight to merge mode.",
     )
+    parser_.add_argument(
+        "--format",
+        dest="format_mode",
+        action="store_true",
+        help="Format a translated document into a clean, footnoted .docx.",
+    )
     args = parser_.parse_args()
 
     if args.merge:
         run_merge_flow()
+        return
+
+    if args.format_mode:
+        _dispatch_format(args)
         return
 
     # Direct file shortcut: skip the menu.
@@ -499,6 +594,9 @@ def main() -> None:
     if choice == "M":
         run_merge_flow()
         return
+    if choice == "F":
+        _dispatch_format(args)
+        return
 
     # Translate flow with the native file picker.
     selected = _pick_file()
@@ -506,6 +604,17 @@ def main() -> None:
         print("No file selected — exiting.")
         return
     run_translate_flow(selected, restart=args.restart)
+
+
+def _dispatch_format(args) -> None:
+    if args.file:
+        run_format_flow(Path(args.file), restart=args.restart)
+        return
+    selected = _pick_file(title="Select a translated .docx file")
+    if selected is None:
+        print("No file selected — exiting.")
+        return
+    run_format_flow(selected, restart=args.restart)
 
 
 if __name__ == "__main__":

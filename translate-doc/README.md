@@ -13,7 +13,8 @@ For each document it produces:
    untranslated section.
 
 It also has a **merge mode** for combining several `.docx` or `.txt` files into
-one document.
+one document, and a **format mode** that turns a raw `_translated.docx` into a
+clean, properly footnoted Word document (`{name}_formatted.docx`).
 
 > This tool is Windows-only.
 
@@ -27,6 +28,8 @@ one document.
 - An Anthropic API key
 - Optional, for PDF export: Microsoft Word **or**
   [LibreOffice](https://www.libreoffice.org/)
+- Required for **format mode**: [Pandoc](https://pandoc.org/) (install with
+  `winget install --id JohnMacFarlane.Pandoc`)
 
 ---
 
@@ -90,17 +93,19 @@ You'll see a menu:
 ┌─────────────────────────────────────────┐
 │  translate-doc                          │
 │                                         │
-│  What would you like to do?             │
 │  [T] Translate a document               │
 │  [M] Merge existing documents           │
+│  [F] Format a translated document       │
 │                                         │
-│  Enter T or M:                          │
+│  Enter T, M, or F:                      │
 └─────────────────────────────────────────┘
 ```
 
 - **[T]** opens a native file picker, asks how many pages to translate, shows a
   pre-flight summary, then translates.
 - **[M]** scans a folder and merges the files you choose.
+- **[F]** cleans up and reformats a `_translated.docx` (see
+  [Format mode](#format-mode) below).
 
 ### Shortcuts
 
@@ -120,6 +125,13 @@ Go straight to merge mode:
 
 ```cmd
 translate-doc --merge
+```
+
+Go straight to format mode (with or without a file argument):
+
+```cmd
+translate-doc --format
+translate-doc --format "contract_translated.docx"
 ```
 
 ---
@@ -155,6 +167,64 @@ Word (Save As → PDF).
 
 ---
 
+## Format mode
+
+The Translate-mode output is faithful line-for-line, but it reads as walls of
+shredded text: footnotes sit inline as plain text, the body is broken into one
+short paragraph per source line, and the file can be cluttered with
+`[[page N]]` markers, `[†see log]` flags, and OCR garbage from cover pages.
+Format mode fixes all of that and produces **`{name}_formatted.docx`**: a clean,
+legible, properly footnoted Word document.
+
+Run it from the menu (**[F]**), or with `translate-doc --format`. It opens a
+picker for the `_translated.docx` (or takes a path argument) and writes the
+formatted file into the same folder.
+
+What it does:
+
+- **Parses the page structure**, splitting on `[[page N]]` markers and dropping
+  un-OCR-able cover/title pages (pages with fewer than ~40 Latin letters). The
+  skipped page numbers are reported at the end.
+- **Promotes footnotes to real Word footnotes.** Inline `(N)` definitions are
+  matched to their `(N)` markers in the body (numbering restarts each page) and
+  become genuine, auto-numbered footnotes anchored at the bottom of the page.
+- **Cleans and reflows the body:** `[†see log]` flags become superscript
+  asterisks, leaked `<sup>`/`<u>`/`<sub>` tags are stripped, per-line paragraphs
+  are joined into flowing prose, Qur'anic quotations in `{ ... }` are
+  italicized, and the source page number is preserved as a small superscript
+  `[N]` so you can still cite by page.
+- **Reassembles across page boundaries** without breaking sentences — a page
+  that ends mid-sentence continues into the next.
+- **Intelligent paragraphing (optional).** If `ANTHROPIC_API_KEY` is set, the
+  reflowed text is sent to Claude (`claude-sonnet-5`) in chunks, which inserts
+  paragraph breaks only where the argument shifts. The model is **only** allowed
+  to add breaks: every chunk is verified against its input and discarded if a
+  single word or placeholder changed. Without a key, this step is skipped and
+  the document is still produced with page-based paragraphs. Progress is
+  checkpointed to `{name}_format_checkpoint.json`; re-run to resume, or use
+  `--restart` to ignore it.
+- **Builds the `.docx` with Pandoc** against a generated reference document:
+  US Letter, one-inch margins, Times New Roman 12pt, justified with a first-line
+  indent, and centered page numbers in the footer.
+
+Format mode requires **Pandoc**. If it is not installed the tool prints the
+install command and stops without discarding any checkpoint.
+
+### Notes and honest limits
+
+- **Footnote matching is by number.** Markers are matched to their notes by the
+  number in `(N)`, which is reliable when there is one marker per number per
+  page (the normal case). A page that reuses the same number could misplace one.
+- **The paragraph breaks are Claude's judgment**, not the original author's. The
+  source's real paragraphing is not recoverable from the flattened text, so the
+  breaks reflect where the *argument* appears to shift — a best-effort
+  reconstruction, not the author's own layout.
+- **The asterisks are pointers, not the notes themselves.** They mark passages
+  the translator flagged as difficult during Translate mode; the full text of
+  those notes lives in that run's `{name}_translation_log.csv`.
+
+---
+
 ## Tuning
 
 Constants you may want to adjust live near the top of the source modules:
@@ -165,6 +235,10 @@ Constants you may want to adjust live near the top of the source modules:
   - `MODEL` — the Claude model string (`claude-sonnet-5`).
 - `translate_doc/parser.py`
   - `PARAGRAPHS_PER_PAGE` — the ratio used to estimate page count.
+- `translate_doc/formatter.py`
+  - `LATIN_LETTER_THRESHOLD` — below this many Latin letters, a page is treated
+    as an un-OCR-able cover page and dropped.
+  - `WORDS_PER_CHUNK` — chunk size for the intelligent-paragraphing calls.
 
 ---
 
@@ -183,5 +257,6 @@ translate-doc\
     ├── builder.py       # Reconstructing the output .docx files
     ├── pdf_export.py    # Word COM / LibreOffice PDF conversion
     ├── merger.py        # Merge mode
+    ├── formatter.py     # Format mode (clean + real footnotes via Pandoc)
     └── logger.py        # CSV log generation
 ```
