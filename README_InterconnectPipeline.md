@@ -3,201 +3,120 @@
 One importable Excel VBA module with a **single public entry point,
 `RunInterconnectPipeline`**, that runs the whole workflow end to end from a
 blank workbook on one **Alt+F8** call. A second public procedure, `SelfTest`,
-is an in-memory test harness (no file pickers, no sheets touched) and is the
-only other entry point.
+is the test harness (in-memory checks plus a live-Excel parity round-trip and a
+2,000-substation scale smoke test).
 
-Import it via the VBA editor (**Alt+F11 → File → Import File…**) and run it
-with **Alt+F8 → `RunInterconnectPipeline`**. It is a plain `.bas` — never a
-`.bat`, `.vbs`, or runner workbook. `Option Explicit`, private helpers are
-`pl_`-prefixed, no external references, no `.Select` / `.Activate` /
-`Selection`. The four application state flags (`ScreenUpdating`,
-`EnableEvents`, `DisplayAlerts`, `Calculation`) are saved and restored on every
-exit path, including errors, and one source file's failure never aborts the run.
+Import via the VBA editor (**Alt+F11 → File → Import File…**) and run with
+**Alt+F8 → `RunInterconnectPipeline`**. Plain `.bas`, `Option Explicit`, private
+helpers `pl_`-prefixed, no external references (`Scripting.Dictionary` is used
+via late binding), no `.Select` / `.Activate` / `Selection`.
 
 ---
 
 ## The four-step flow (run order)
 
-### Step 1 — Consolidate the cost / results files → `Cost Data`
-- You multi-select the cost source workbooks (picker rooted at
-  `ThisWorkbook.Path`, falling back to `Application.DefaultFilePath` for an
-  unsaved blank workbook).
-- Each source workbook holds three sheets; **sheet 3 carries the data**, header
-  on row 1.
-- The **substation name comes from sheet 3's tab name**, not a cell:
-  - A tab that carries a voltage (multi-voltage substation, e.g.
-    `Chaves County 345`) is parsed into name + voltage — the **last** plausible
-    numeric token is the voltage, the cleaned remainder is the name.
-  - A bare tab (single-voltage substation, e.g. `Cunningham`) becomes the name
-    with a blank voltage.
-- Each sheet's used range is block-read (values only), blank rows skipped, and
-  appended to `Cost Data` behind four metadata columns the tool creates:
-  **`Substation Name` | `Voltage (kV)` | `Source File` | `Source Sheet`**, then
-  the source columns **verbatim**. The two that matter downstream —
-  `Size Overload Occurs (MW)` (tier trigger) and
-  `Proposed Project Allocation ($)` (allocation) — are carried through
-  unchanged so they can be resolved later by header name.
-- Header signatures are validated across files (case-insensitive); mismatches
-  are surfaced with an include / skip / abort choice, and every file's status
-  is logged.
+1. **Cost / results files → `Cost Data`.** Multi-select the cost workbooks
+   (picker rooted at `ThisWorkbook.Path`, falling back to
+   `Application.DefaultFilePath`). Sheet 3 carries the data; the substation name
+   is parsed from its **tab name** (last plausible numeric token = voltage, the
+   rest = name; bare tab = name only). Consolidated behind the metadata prefix
+   `Substation Name | Voltage (kV) | Source File | Source Sheet`, then the
+   source columns verbatim — including `Size Overload Occurs (MW)` (trigger) and
+   `Proposed Project Allocation ($)` (allocation).
+2. **Site files → `Site Data`.** From each `Summary` tab (name = A, state = C,
+   voltage = G), de-duplicated on the full **(name, voltage, state) triple**
+   (a different voltage or state is a different substation).
+3. **Join → `Matrix`.** Intersection only, matched by name (plus voltage when
+   the cost tab carried one). Cost-per-MW per (substation, MW).
+4. **Analysis + ranking + weighted scoring + headroom → `Cost Curve Analysis`.**
 
-### Step 2 — Consolidate the dedupe / site files → `Site Data`
-- You multi-select the site source workbooks (same picker behaviour).
-- The relevant sheet is the **`Summary`** tab: **name = column A, state =
-  column C, voltage = column G**, header on row 1, data below.
-- Those three fields per row are read into `Site Data` under headers
-  **`Substation Name` | `State` | `Voltage (kV)`**.
-- Rows are **de-duplicated on the full (name, voltage, state) triple**: two rows
-  collapse only when name **and** voltage **and** state are all equal. A
-  different voltage is a different substation; a different state is a different
-  substation. **Dedupe is on the triple, never on the name alone.** The first
-  occurrence of each distinct triple is kept; every dropped duplicate is logged
-  (file, row, triple) and the distinct-triple count is reported.
-
-### Step 3 — Join and build `Matrix` (live `SUMIFS`)
-- One matrix row per **`Site Data` triple**. Each triple's cost curve is
-  attached from `Cost Data` by **matching on name**; when the cost tab carried
-  a voltage (the multi-voltage case) the match is on **name + voltage** to pick
-  the correct one of several same-named cost tabs; when the cost tab was bare,
-  name alone matches.
-- **Intersection only.** The sets are expected to align exactly, so a `Site
-  Data` triple with no cost match, or a cost tab with no site match, is **logged
-  as an alignment error** rather than silently dropped; the run then proceeds
-  with the intersection.
-- Layout: **row 1** is a leading label then the MW axis header
-  **100, 110, … 300** (numeric, strictly ascending); **column A** from row 2
-  down is the substation identity label (name + voltage + state, so
-  multi-voltage and multi-state entries are distinct rows); the **body** is
-  cost-per-MW as one **live `SUMIFS`** per (substation, MW):
-
-  ```
-  =SUMIFS('Cost Data'!<AllocCol>, 'Cost Data'!<NameCol>, <thisSubstation>,
-          'Cost Data'!<TriggerCol>, "<=" & <thisMW>) / <thisMW>
-  ```
-
-  `<AllocCol>`, `<NameCol>`, `<TriggerCol>` (and `<VoltCol>` for the
-  multi-voltage criterion) are **resolved at run time by header name** on the
-  `Cost Data` sheet (full-column references) — **never by fixed letter**,
-  because the four metadata columns shift the source columns right. `<thisMW>`
-  references the MW header cell, so editing a header re-drives the row. The
-  metadata (state, voltage) stays on `Site Data`; the matrix body is purely the
-  MW × cost block the analysis consumes. A full recompute is forced before the
-  analysis reads the values.
-
-### Step 4 — Analysis, ranking, weighted scoring → `Cost Curve Analysis`
-The proven cost-curve analysis, per-threshold ranking and chart/leaderboard
-logic (from `modCostCurves`) is reused **unchanged**, driven off the `Matrix`
-ranges instead of interactive prompts, and writing the analysis table, chart,
-threshold leaderboard and a self-contained data copy to `Cost Curve Analysis`.
-Two points apply on top:
-
-- **(a) Column resolution.** Every reference into `Cost Data` (the matrix
-  `SUMIFS` and the headroom `MINIFS` below) resolves by header name, never by a
-  fixed column letter.
-- **(b) Weighted composite score.** See below.
+Also produced: a run log **`_Pipeline Log`** (per-file status, dropped
+duplicate triples, join alignment errors). Existing data/output sheets prompt
+**overwrite / new-timestamped / cancel**; the log is rewritten each run.
 
 ---
 
-## Weighted composite score
+## Scaling to ~2,000 substations (what changed; results unchanged)
 
-A single live weight cell **`$B$2`** (default **4**) multiplies **every**
-threshold band. All four bands share this one multiplier — **the threshold axis
-as a whole is worth 4× the flattening axis; the weight does not grade
-$25 > $50 > $75 > $100.** If graded weights are wanted later, each band needs
-its own weight cell.
+The optimization changes **how** the work is done, not what is produced. Global
+run settings are set once at entry and restored in `Cleanup` on every exit
+(including the error handler): `ScreenUpdating=False`, `EnableEvents=False`,
+`DisplayAlerts=False`, `Calculation=xlManual`, `AskToUpdateLinks=False`, a live
+`Application.StatusBar`, and a **single `Application.CalculateFull` at the very
+end** (no intermediate recalcs; the chart is built after it).
 
-| Axis | Contribution |
-|------|--------------|
-| Flattening percentile | max **5** |
-| Each threshold band | `$B$2 × (breadth pctile + slope pctile)` = `4 × (5 + 5)` = **40** |
-| Four bands | **160** |
-| **Composite maximum** | **5 + 160 = 165** |
+| Stage | Before (bottleneck) | After |
+|-------|---------------------|-------|
+| 1 Consolidation | per-cell reads/writes | every workbook opened `UpdateLinks:=0, ReadOnly:=True, AddToMru:=False` and closed immediately; used range read in one `Range.Value`; output written one `Range.Value = array` per file; one `DoEvents` + status line per file; a locked file is logged and skipped, never aborting the batch |
+| 2 Dedupe | O(N²) pairwise compare | `Scripting.Dictionary` keyed on `LCase(name)|voltage|LCase(state)` — one O(N) pass |
+| 3 Join | rescans Cost Data per substation | one-pass dictionaries (identity key → id; name → records) resolved by O(1) lookup |
+| 4 Matrix | 42,000 live `SUMIFS` | cost columns loaded once, grouped by name; each substation's trigger→allocation records scanned once to accumulate cumulative allocation `T` at each MW and divide by MW (the exact `SUMIFS` definition); written as one values block |
+| 5 Ranking | ~32M-op rank-by-scanning | stable **mergesort** once per column (O(N log N)), competition ranks assigned in one walk |
+| 6 Percentiles & score | ~22,000 volatile `PERCENTRANK.EXC`/`CEILING` | computed in VBA (`PERCENTRANK.EXC` implemented as `k/(N+1)`), written as value blocks |
+| 7 Headroom | live `MINIFS` | per-substation minimum trigger from the already-loaded cost data |
 
-> Earlier drafts said 105; that was a different sketch. **The correct ceiling
-> for these formulas is 165.** The **practical maximum today is 125**, because
-> nothing prices under \$25MM on the current data (cheapest total ≈ \$47.6MM),
-> so the \$25MM band scores 0 for every substation regardless of the multiplier.
+Every sheet write is a single `Range.Value`/`Range.Formula = array` per block;
+number formats are applied per column once after the values land.
 
-Percentiles (0–5) are computed in VBA; the band-score and composite cells are
-**formulas referencing `$B$2`**, so re-weighting in the cell is live.
+### Two switches (both default `False` = computed values)
 
----
+- **`USE_LIVE_SUMIFS`** — `True` makes Stage 4 write live `SUMIFS` bound to the
+  used rows (`$D$2:$D$<last>`, never whole-column `$D:$D`). `False` writes a
+  values block.
+- **`USE_LIVE_FORMULAS`** — `True` makes the Stage 6/7 percentiles, Weighted
+  Score and Headroom live formulas over **bounded** population ranges. `False`
+  writes computed value blocks.
 
-## Standalone Headroom columns (display-and-rank only — **not scored**)
-
-Two columns are appended at the end of the scoring block. **Headroom is a
-standalone lens: it is not added to the Weighted Score, and the composite
-maximum stays 165.**
-
-**Headroom (MW)** — the project size below which no upgrade is triggered, i.e.
-the **minimum** overload-trigger size for that substation (a substation has
-several triggers; the smallest is the binding constraint). It is computed from
-the `Cost Data` trigger column directly — **not** from the matrix cells — so
-triggers below the smallest sampled MW or above the largest are captured
-accurately rather than clipped to the sampled range:
-
-```
-=MINIFS('Cost Data'!<TriggerCol>, 'Cost Data'!<NameCol>, <thisSubstation>
-        [, 'Cost Data'!<VoltageCol>, <thisVoltage>  when multi-voltage])
-```
-
-Resolved by header name (`Size Overload Occurs (MW)`, `Substation Name`,
-`Voltage (kV)`), matched by the **same key the matrix rows use** (name, plus
-voltage when the cost tab carried one). Number format `#,##0`. A substation with
-no trigger records (shouldn't occur after the intersection join, but guarded)
-yields `MINIFS = 0` and is shown blank via `IFERROR`/`IF`, dropping it out of
-the percentile population.
-
-**Headroom Percentile (1–5)** — more headroom is better, so there is **no
-inversion** (same shape as the flattening percentile), over a fully absolute
-population across all data rows:
-
-```
-=CEILING(PERCENTRANK.EXC($<HeadroomCol>$<first>:$<HeadroomCol>$<last>, <thisHeadroomCell>)*5, 1)
-```
-
-Centred, format `0`. Reading the value:
-- A first trigger **at or below** the smallest sampled MW (100) means
-  effectively **no headroom** in the practical range.
-- A first trigger **above** the largest sampled MW (300) means headroom
-  **exceeds the studied range**.
+**Parity guarantee.** The values path and the live-formula path produce the
+same numbers. The VBA implements `PERCENTRANK.EXC` exactly (first-occurrence
+`k/(N+1)` positioning) and `CEILING(x,1)`; `SelfTest` round-trips a fixture
+population through **real Excel formulas** on a scratch sheet and asserts the
+VBA buckets match cell-for-cell, for both the raw-is-better and rank-based
+definitions.
 
 ---
 
-## Sheets produced (all in `ThisWorkbook`, created if absent)
+## Weighted score & percentiles (definitions unchanged; ceiling 165)
 
-`Cost Data`, `Site Data`, `Matrix`, `Cost Curve Analysis`, and a run log
-**`_Pipeline Log`** capturing per-file status, dropped duplicate triples and any
-join alignment errors. For the four data/output sheets, if one already exists
-you are offered **overwrite / new-timestamped / cancel** (the downstream steps
-follow the actual sheet returned, so a timestamped choice does not break the
-chain). The log is rewritten each run.
+- **Raw-is-better** columns — flattening, headroom, weighted-score percentiles:
+  `CEILING(PERCENTRANK.EXC(pop, x) * 5, 1)`.
+- **Rank-based** columns — the eight band percentiles (breadth + slope over four
+  thresholds): `IFERROR(CEILING((1 - PERCENTRANK.EXC(pop, rank)) * 5, 1), 0)`
+  (rank 1 = best; non-qualifiers score 0).
+- **Weighted Score** `= Flattening + $B$2 · (sum of the eight band percentiles)`.
+  A single live weight `$B$2` (default 4) multiplies **every** band — the
+  threshold axis as a whole is worth 4× the flattening axis; the weight does
+  **not** grade `$25 > $50 > $75 > $100`. If graded weights are wanted later,
+  each band needs its own weight cell.
+- **Composite maximum = `5 + 4·(8·5)` = 165.** Practical maximum today = **125**
+  (nothing prices under \$25MM, so that band scores 0 for everyone).
+
+### Standalone Headroom (not scored)
+
+**Headroom (MW)** is the minimum overload-trigger size (`MINIFS` over the Cost
+Data trigger column, keyed like the matrix rows), computed from the trigger
+column directly so triggers below the smallest or above the largest sampled MW
+are captured, not clipped. **Headroom Percentile (1–5)** is raw-is-better (more
+headroom is better, no inversion). Reading it: a first trigger at/below the
+smallest sampled MW (100) means effectively **no headroom** in the practical
+range; above the largest (300) means headroom **exceeds the studied range**.
+Headroom is a display-and-rank lens **only — never added to the Weighted
+Score**, and the composite maximum stays 165.
 
 ---
 
-## Self-test
+## Self-test / verification (`SelfTest`)
 
-`SelfTest` runs the full analysis logic in memory against the 17-substation ×
-21-MW reference fixture (or `substation_cost_per_mw.csv` in the workbook folder
-if present) and, in the same pass, the new front-half and scoring assertions
-(no file pickers):
-
-- **Tab parsing** — `Chaves County 345` → name `Chaves County`, voltage 345;
-  `Cunningham` → name `Cunningham`, voltage blank.
-- **Triple dedupe** — five rows where two are identical on (name, voltage,
-  state) collapse to three; rows differing only in voltage, or only in state,
-  stay separate; drops are logged.
-- **Join intersection** — a site triple with no cost match and a cost tab with
-  no site match are both logged as alignment errors and excluded; a bare cost
-  tab matches on name; the matched set builds correctly.
-- **Matrix shape** — MW axis is 100…300 step 10 (21 points, strictly
-  ascending), column A the identities, body cells `SUMIFS` that resolve
-  trigger/allocation by header name and divide by the MW cell (with a voltage
-  criterion for multi-voltage tabs).
-- **Scoring ceiling** — composite maximum is 165, and all 17 `$25MM` band
-  percentiles are 0 on the fixture.
-- **Headroom** — triggers 130/200/260 report headroom 130; largest headroom →
-  percentile 5, smallest → 1; and, because headroom is **not** summed into the
-  composite, the ceiling stays 165.
+- **Parity** — VBA buckets equal Excel `PERCENTRANK.EXC`/`CEILING` on a scratch
+  sheet, for raw-is-better and rank-based columns.
+- **Ranking** — sort-based competition ranks match the naive definition,
+  including the ties (Cunningham/Hobbs, Pleasant Hill/Roosevelt, the 13-way
+  \$100MM breadth tie) asserted on the 17-substation fixture.
+- **Dedupe/join** — dictionary results match the triple rule and the
+  intersection rule (name / name+voltage / bare; site-without-cost and
+  cost-without-site excluded and logged).
+- **Scale** — 2,000 synthetic substations are ranked and bucketed under a
+  bounded wall-clock (mergesort, no O(N²) blow-up).
+- **Tab parsing, matrix shape, headroom, and the 165 ceiling.**
 
 Results print to the Immediate window (**Ctrl+G**).
