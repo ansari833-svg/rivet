@@ -31,8 +31,58 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
 4. **Analysis + ranking + weighted scoring + headroom → `Cost Curve Analysis`.**
 
 Also produced: a run log **`_Pipeline Log`** (per-file status, dropped
-duplicate triples, join alignment errors). Existing data/output sheets prompt
-**overwrite / new-timestamped / cancel**; the log is rewritten each run.
+duplicate triples, join alignment errors) and a **`_Pipeline State`** checkpoint
+sheet (see below).
+
+---
+
+## Durable & resumable (checkpoint every stage)
+
+Each stage **writes its output sheet and saves the workbook before the next
+stage begins**:
+
+```
+cost → write Cost Data → Save → site → write Site Data → Save →
+matrix → write Matrix → Save → analysis → write → Save
+```
+
+So a crash, a runtime error, or even a VBA **compile break** in a later stage
+leaves every earlier sheet intact and saved on disk. The **sheet is the source
+of truth** — a stage never keeps its only copy in a module-level array across
+stages, and a resumed run reads `Cost Data` / `Site Data` / `Matrix` back from
+their sheets instead of recomputing them.
+
+**Per-stage failure isolation.** Each stage has its own handling: on failure it
+saves what exists, restores application state, logs the reason, and exits with a
+message naming the completed stages — e.g. *“Stage 2 failed: &lt;err&gt;.
+Completed and saved: Cost Data. Fix and re-run — it will resume.”* One stage’s
+failure never rolls back earlier sheets.
+
+**Resume vs Restart.** At entry the completed stages are detected (each output
+sheet exists and is non-empty; `_Pipeline State` records the last completed
+stage, its row count, and a timestamp). When valid checkpoints exist you are
+offered **Resume** (skip completed stages, start at the first incomplete one) or
+**Restart** (clear outputs, run from Stage 1). **Resume is the default**, so the
+expensive 2,000-file Stage 1 is never repeated because a later stage had a typo.
+A resumed run does **not** re-open any source files for the stages already done.
+
+**First save of a blank workbook.** If the host has never been saved (no path),
+the first checkpoint prompts once for a location, falling back to a timestamped
+`InterconnectPipeline_<ts>.xlsm` in `Application.DefaultFilePath`. The
+**macro-enabled format is required** (`xlOpenXMLWorkbookMacroEnabled`, 52) since
+the module lives in the workbook. `ScreenUpdating`/`EnableEvents` stay off across
+the save; per-stage saving is cheap relative to the work and is the price of
+durability.
+
+**Compile-safety.** A VBA compile error is a project-load failure that halts the
+whole run regardless of checkpoints, so the module is kept compile-clean (one
+`Attribute VB_Name`, balanced terminators, no duplicate procedures). The saved
+per-stage sheets protect the data even across a compile break; a clean compile
+prevents the halt — both mechanisms are needed. The module was verified
+structurally (balanced `Sub`/`Function`/`If`/`For`/`With`/`Do`, single
+`Attribute VB_Name`, no duplicate procedure names, call-site arities); run
+**Debug → Compile VBAProject** once on import to confirm zero compile errors
+(the definitive check; `SelfTest` prints the same reminder).
 
 ---
 
@@ -117,6 +167,13 @@ Score**, and the composite maximum stays 165.
   cost-without-site excluded and logged).
 - **Scale** — 2,000 synthetic substations are ranked and bucketed under a
   bounded wall-clock (mergesort, no O(N²) blow-up).
+- **Durability / resume** — simulates Stage 1 completing and a Stage-2 failure,
+  then asserts `Cost Data` is present, non-empty, and (when the host has a path)
+  saved on disk, and that a resumed run’s first incomplete stage is **2** —
+  i.e. Stage 1 is skipped and no source files are re-opened. Runs only on a
+  clean workbook so it never clobbers a real pipeline’s sheets.
 - **Tab parsing, matrix shape, headroom, and the 165 ceiling.**
 
-Results print to the Immediate window (**Ctrl+G**).
+Results print to the Immediate window (**Ctrl+G**). `SelfTest` also prints a
+reminder to run **Debug → Compile VBAProject** (the one check that can only be
+done in the VBA editor).

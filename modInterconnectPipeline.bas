@@ -15,6 +15,43 @@ Option Explicit
 '    4. Matrix (values) + analysis + ranking + scoring + headroom
 '
 '  =====================================================================
+'  DURABLE & RESUMABLE (checkpoint every stage)
+'  ---------------------------------------------------------------------
+'  Each stage writes its full output to its own sheet AND saves the workbook
+'  before the next stage begins:
+'      cost -> write Cost Data -> Save -> site -> write Site Data -> Save ->
+'      matrix -> write Matrix -> Save -> analysis -> write -> Save.
+'  A crash, a runtime error, or even a VBA compile break in a later stage
+'  leaves every earlier sheet intact and saved on disk. The sheet is the source
+'  of truth: a stage never keeps its only copy in a module-level array across
+'  stages, and a resumed run reads Cost Data / Site Data / Matrix back from
+'  their sheets instead of recomputing them.
+'
+'  Each stage has its own failure handling: on error it saves what exists,
+'  restores application state, logs the reason to _Pipeline State/_Pipeline Log,
+'  and exits with a clear message naming the stages already completed and saved
+'  ("Stage 2 failed: <err>. Completed and saved: Cost Data. Fix and re-run --
+'  it will resume."). One stage's failure never rolls back earlier sheets.
+'
+'  RESUME: at entry the completed stages are detected (each output sheet exists
+'  and is non-empty; _Pipeline State records the last completed stage + row
+'  count + timestamp). When valid checkpoints exist the user is offered Resume
+'  (skip completed stages, start at the first incomplete -- the 2,000-file
+'  Stage 1 is never repeated for a later typo) or Restart (clear outputs, run
+'  from Stage 1). Resume is the default.
+'
+'  If the host is an unsaved blank workbook (no path), the first save prompts
+'  once for a location (falling back to a timestamped .xlsm in
+'  Application.DefaultFilePath); the macro-enabled format (52) is required
+'  because the module lives in the workbook.
+'
+'  COMPILE-SAFETY: a VBA compile error is a project-load failure that halts the
+'  whole run regardless of checkpoints, so the module is kept compile-clean
+'  (one Attribute VB_Name, balanced terminators, no duplicate procedures). The
+'  saved per-stage sheets are what protect the data even across a compile break;
+'  a clean compile is what prevents the halt. Both are needed.
+'
+'  =====================================================================
 '  SCALING (what changed for ~2,000 files/substations; results identical)
 '  ---------------------------------------------------------------------
 '  Global run settings are set once at entry and restored in Cleanup on every
@@ -94,6 +131,21 @@ Private Const PL_SH_SITE     As String = "Site Data"
 Private Const PL_SH_MATRIX   As String = "Matrix"
 Private Const PL_SH_ANALYSIS As String = "Cost Curve Analysis"
 Private Const PL_SH_LOG      As String = "_Pipeline Log"
+Private Const PL_SH_STATE    As String = "_Pipeline State"
+
+' Stage identifiers, in completion order. COST and SITE open source files and
+' must never be repeated on a resume; MATRIX and ANALYSIS recompute cheaply
+' from the persisted upstream sheets.
+Private Const PL_STG_COST     As Long = 1
+Private Const PL_STG_SITE     As Long = 2
+Private Const PL_STG_MATRIX   As Long = 3
+Private Const PL_STG_ANALYSIS As Long = 4
+Private Const PL_STG_COUNT    As Long = 4
+
+' Macro-enabled save format for the first save of an unsaved blank host (the
+' module lives in the workbook, so every checkpoint must stay macro-enabled).
+Private Const PL_XLSM_FORMAT  As Long = 52   ' xlOpenXMLWorkbookMacroEnabled
+
 
 Private Const PL_HDR_ROW        As Long = 1
 Private Const PL_COST_DATA_IDX  As Long = 3     ' cost workbook: sheet 3 carries the data
@@ -249,6 +301,7 @@ Public Sub RunInterconnectPipeline()
     Dim wsCost As Worksheet, wsSite As Worksheet, wsMatrix As Worksheet
     Dim mtx As PL_TMatrix
     Dim analysisOK As Boolean, distinctTriples As Long
+    Dim startStage As Long, failedStage As Long, curStageName As String
 
     savedScreen = Application.ScreenUpdating
     savedEvents = Application.EnableEvents
@@ -270,38 +323,76 @@ Public Sub RunInterconnectPipeline()
     pl_LogAdd log, "Run started " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
     pl_Status "Interconnect pipeline: starting"
 
-    ' ---- Step 1: cost / results files -> Cost Data --------------------
-    If Not pl_ConsolidateCost(log, wsCost) Then
-        pl_LogAdd log, "Step 1 did not complete; pipeline stopped."
-        pl_WriteLog log
-        MsgBox "Step 1 (Cost Data) did not complete. See " & PL_SH_LOG & ".", _
-               vbExclamation, "Interconnect Pipeline"
-        GoTo Cleanup
+    ' ---- resume / restart decision (checkpoints = non-empty output sheets) ----
+    startStage = pl_FirstIncompleteStage()
+    If startStage > PL_STG_COST Then
+        Dim ans As VbMsgBoxResult
+        ans = MsgBox("Checkpoints found -- completed and saved: " & pl_CompletedStagesText() & "." & vbCrLf & vbCrLf & _
+                     IIf(startStage > PL_STG_COUNT, "All four stages are already complete.", _
+                         "Resume skips them and starts at Stage " & startStage & " (" & pl_StageName(startStage) & ").") & vbCrLf & vbCrLf & _
+                     "Yes = Resume" & vbCrLf & _
+                     "No = Restart from Stage 1 (clears all outputs)" & vbCrLf & _
+                     "Cancel = abort", vbYesNoCancel + vbQuestion, "Resume pipeline?")
+        Select Case ans
+            Case vbCancel
+                pl_LogAdd log, "User cancelled at the resume prompt."
+                GoTo Cleanup
+            Case vbNo
+                pl_ClearOutputs
+                startStage = PL_STG_COST
+                pl_LogAdd log, "Restart: outputs cleared; running from Stage 1."
+            Case vbYes
+                pl_LogAdd log, "Resume: starting at Stage " & startStage & "."
+                If startStage > PL_STG_COUNT Then
+                    pl_WriteLog log
+                    MsgBox "All four stages are already complete and saved. " & _
+                           "Choose Restart if you want to re-run from Stage 1.", _
+                           vbInformation, "Interconnect Pipeline"
+                    GoTo Cleanup
+                End If
+        End Select
     End If
 
-    ' ---- Step 2: dedupe / site files -> Site Data ---------------------
-    If Not pl_ConsolidateSite(log, wsSite, distinctTriples) Then
-        pl_LogAdd log, "Step 2 did not complete; pipeline stopped."
-        pl_WriteLog log
-        MsgBox "Step 2 (Site Data) did not complete. See " & PL_SH_LOG & ".", _
-               vbExclamation, "Interconnect Pipeline"
-        GoTo Cleanup
+    ' ================= Stage 1 -- Cost Data =================
+    failedStage = PL_STG_COST: curStageName = pl_StageName(PL_STG_COST)
+    If startStage <= PL_STG_COST Then
+        If Not pl_ConsolidateCost(log, wsCost) Then GoTo StageFailed
+        pl_SaveCheckpoint log, PL_STG_COST, pl_SheetDataRows(wsCost)
+    Else
+        Set wsCost = pl_SheetByName(PL_SH_COST)
+        If wsCost Is Nothing Then GoTo StageFailed
+        pl_LogAdd log, "Stage 1 (Cost Data): resumed from checkpoint (" & pl_SheetDataRows(wsCost) & " rows), source files NOT re-opened."
     End If
 
-    ' ---- Step 3 + 4a: join + Matrix (values in memory) ----------------
-    If Not pl_BuildMatrix(log, wsCost, wsSite, wsMatrix, mtx) Then
-        pl_LogAdd log, "Step 3 did not complete; pipeline stopped."
-        pl_WriteLog log
-        MsgBox "Step 3 (Matrix) did not complete. See " & PL_SH_LOG & ".", _
-               vbExclamation, "Interconnect Pipeline"
-        GoTo Cleanup
+    ' ================= Stage 2 -- Site Data =================
+    failedStage = PL_STG_SITE: curStageName = pl_StageName(PL_STG_SITE)
+    If startStage <= PL_STG_SITE Then
+        If Not pl_ConsolidateSite(log, wsSite, distinctTriples) Then GoTo StageFailed
+        pl_SaveCheckpoint log, PL_STG_SITE, pl_SheetDataRows(wsSite)
+    Else
+        Set wsSite = pl_SheetByName(PL_SH_SITE)
+        If wsSite Is Nothing Then GoTo StageFailed
+        distinctTriples = pl_SheetDataRows(wsSite)
+        pl_LogAdd log, "Stage 2 (Site Data): resumed from checkpoint (" & distinctTriples & " triples)."
     End If
 
-    ' ---- Step 4b: analysis + ranking + scoring + headroom -------------
-    ' pl_RunAnalysisAndScoring issues the single CalculateFull and builds the
-    ' chart last. If it is skipped, resolve any live formulas once here.
+    ' ================= Stage 3 -- Matrix =================
+    failedStage = PL_STG_MATRIX: curStageName = pl_StageName(PL_STG_MATRIX)
+    Dim reuseMatrix As Boolean
+    reuseMatrix = (startStage > PL_STG_MATRIX)     ' Matrix already checkpointed -> read values back
+    If reuseMatrix Then Set wsMatrix = pl_SheetByName(PL_SH_MATRIX)
+    If Not pl_BuildMatrix(log, wsCost, wsSite, wsMatrix, mtx, reuseMatrix) Then GoTo StageFailed
+    If Not reuseMatrix Then
+        pl_SaveCheckpoint log, PL_STG_MATRIX, mtx.matchedCount
+    Else
+        pl_LogAdd log, "Stage 3 (Matrix): resumed from checkpoint (" & mtx.matchedCount & " substations)."
+    End If
+
+    ' ================= Stage 4 -- Analysis + scoring =================
+    failedStage = PL_STG_ANALYSIS: curStageName = pl_StageName(PL_STG_ANALYSIS)
     analysisOK = pl_RunAnalysisAndScoring(wsMatrix, log, mtx)
-    If Not analysisOK Then Application.CalculateFull
+    If Not analysisOK Then GoTo StageFailed     ' Stages 1-3 stay saved; a re-run resumes here
+    pl_SaveCheckpoint log, PL_STG_ANALYSIS, mtx.matchedCount
 
     pl_WriteLog log
     pl_Status "Interconnect pipeline: done"
@@ -311,9 +402,23 @@ Public Sub RunInterconnectPipeline()
            "Site Data:  " & wsSite.Name & "  (" & distinctTriples & " distinct triples)" & vbCrLf & _
            "Matrix:     " & wsMatrix.Name & "  (" & mtx.matchedCount & " x " & mtx.mwCount & _
            ", " & IIf(USE_LIVE_SUMIFS, "live SUMIFS", "values") & ")" & vbCrLf & _
-           "Analysis:   " & IIf(analysisOK, "written (" & IIf(USE_LIVE_FORMULAS, "live formulas", "values") & ")", "skipped -- see log") & vbCrLf & _
+           "Analysis:   written (" & IIf(USE_LIVE_FORMULAS, "live formulas", "values") & ")" & vbCrLf & _
+           "Saved to:   " & IIf(Len(ThisWorkbook.Path) > 0, ThisWorkbook.Name, "(unsaved)") & vbCrLf & _
            "Run log:    " & PL_SH_LOG, _
            vbInformation, "Interconnect Pipeline"
+    GoTo Cleanup
+
+StageFailed:
+    ' A stage returned False (it already logged the reason). Save whatever exists
+    ' so earlier stages survive, report, and exit; a re-run will resume.
+    pl_TrySave
+    pl_LogAdd log, "Stage " & failedStage & " (" & curStageName & ") did not complete."
+    pl_WriteLog log
+    MsgBox "Stage " & failedStage & " (" & curStageName & ") did not complete." & vbCrLf & _
+           "Completed and saved: " & pl_CompletedStagesText() & "." & vbCrLf & _
+           "See " & PL_SH_LOG & " for the reason. Fix and re-run -- it will resume.", _
+           vbExclamation, "Interconnect Pipeline"
+    GoTo Cleanup
 
 Cleanup:
     If stateSaved Then
@@ -329,13 +434,175 @@ Cleanup:
 
 ErrHandler:
     On Error Resume Next
-    pl_LogAdd log, "FATAL error #" & Err.Number & ": " & Err.Description
+    pl_LogAdd log, "Stage " & failedStage & " (" & curStageName & ") FATAL #" & Err.Number & ": " & Err.Description
+    pl_TrySave
     pl_WriteLog log
     On Error GoTo 0
-    MsgBox "Unexpected error #" & Err.Number & ": " & Err.Description, _
-           vbCritical, "Interconnect Pipeline"
+    MsgBox "Stage " & failedStage & " (" & curStageName & ") failed: #" & Err.Number & " " & Err.Description & "." & vbCrLf & _
+           "Completed and saved: " & pl_CompletedStagesText() & "." & vbCrLf & _
+           "Fix and re-run -- it will resume.", vbCritical, "Interconnect Pipeline"
     Resume Cleanup
 End Sub
+
+' ==========================================================================
+'  CHECKPOINT / RESUME / SAVE INFRASTRUCTURE
+' ==========================================================================
+
+' Human name of a stage's output sheet.
+Private Function pl_StageName(ByVal stage As Long) As String
+    Select Case stage
+        Case PL_STG_COST: pl_StageName = PL_SH_COST
+        Case PL_STG_SITE: pl_StageName = PL_SH_SITE
+        Case PL_STG_MATRIX: pl_StageName = PL_SH_MATRIX
+        Case PL_STG_ANALYSIS: pl_StageName = PL_SH_ANALYSIS
+        Case Else: pl_StageName = "(all complete)"
+    End Select
+End Function
+
+' A stage is "done" when its output sheet exists and is non-empty (header plus
+' at least one data row). The sheet is the source of truth; _Pipeline State is
+' corroborating metadata only, so a checkpoint survives even a lost state sheet.
+Private Function pl_StageDone(ByVal stage As Long) As Boolean
+    pl_StageDone = pl_SheetNonEmpty(pl_StageName(stage))
+End Function
+
+' First stage (1..PL_STG_COUNT) whose sheet is not done, scanning in order;
+' returns PL_STG_COUNT+1 when every stage is complete.
+Private Function pl_FirstIncompleteStage() As Long
+    Dim s As Long
+    s = PL_STG_COST
+    Do While s <= PL_STG_COUNT
+        If Not pl_StageDone(s) Then Exit Do
+        s = s + 1
+    Loop
+    pl_FirstIncompleteStage = s
+End Function
+
+Private Function pl_CompletedStagesText() As String
+    Dim s As Long, parts As String
+    For s = PL_STG_COST To PL_STG_COUNT
+        If pl_StageDone(s) Then
+            If Len(parts) > 0 Then parts = parts & ", "
+            parts = parts & pl_StageName(s)
+        End If
+    Next s
+    If Len(parts) = 0 Then parts = "(none)"
+    pl_CompletedStagesText = parts
+End Function
+
+Private Function pl_SheetByName(ByVal nm As String) As Worksheet
+    On Error Resume Next
+    Set pl_SheetByName = ThisWorkbook.Worksheets(nm)
+    On Error GoTo 0
+End Function
+
+Private Function pl_SheetNonEmpty(ByVal nm As String) As Boolean
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(nm)
+    If ws Is Nothing Then Exit Function
+    pl_SheetNonEmpty = (pl_SheetDataRows(ws) >= 1)
+End Function
+
+' Data rows on a sheet (rows below the header in column A).
+Private Function pl_SheetDataRows(ByVal ws As Worksheet) As Long
+    Dim lastRow As Long
+    If ws Is Nothing Then Exit Function
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lastRow > PL_HDR_ROW Then pl_SheetDataRows = lastRow - PL_HDR_ROW
+End Function
+
+' Clears every pipeline output + state sheet (for Restart). DisplayAlerts is
+' already suppressed by the caller so Delete does not prompt.
+Private Sub pl_ClearOutputs()
+    Dim nms As Variant, i As Long, ws As Worksheet
+    nms = Array(PL_SH_COST, PL_SH_SITE, PL_SH_MATRIX, PL_SH_ANALYSIS, PL_SH_STATE)
+    For i = LBound(nms) To UBound(nms)
+        Set ws = pl_SheetByName(CStr(nms(i)))
+        If Not ws Is Nothing Then ws.Delete
+    Next i
+End Sub
+
+' Marks a stage complete in _Pipeline State (created if absent) then saves the
+' workbook -- the per-stage checkpoint.
+Private Sub pl_SaveCheckpoint(ByRef log As PL_TLog, ByVal stage As Long, ByVal rows As Long)
+    pl_MarkStage stage, rows
+    pl_EnsureSaved
+    pl_LogAdd log, "Stage " & stage & " (" & pl_StageName(stage) & ") checkpoint written and saved (" & rows & " rows)."
+End Sub
+
+' Records one stage's completion (status, rows, timestamp) on _Pipeline State.
+Private Sub pl_MarkStage(ByVal stage As Long, ByVal rows As Long)
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(PL_SH_STATE)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_STATE
+        ws.Range("A1:D1").Value = Array("Stage", "Output Sheet", "Rows", "Completed")
+        ws.Rows(1).Font.Bold = True
+        Dim s As Long
+        For s = PL_STG_COST To PL_STG_COUNT
+            ws.Cells(1 + s, 1).Value = s
+            ws.Cells(1 + s, 2).Value = pl_StageName(s)
+            ws.Cells(1 + s, 3).Value = ""
+            ws.Cells(1 + s, 4).Value = "pending"
+        Next s
+        ws.Columns.AutoFit
+    End If
+    ws.Cells(1 + stage, 3).Value = rows
+    ws.Cells(1 + stage, 4).Value = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+End Sub
+
+' Saves the workbook, prompting once for a location if the host has never been
+' saved (blank workbook). A macro-enabled format is required.
+Private Sub pl_EnsureSaved()
+    If Len(ThisWorkbook.Path) > 0 Then
+        ThisWorkbook.Save
+    Else
+        pl_FirstSaveAs
+    End If
+End Sub
+
+Private Sub pl_FirstSaveAs()
+    Dim base As String, dflt As String, chosen As Variant
+    base = Application.DefaultFilePath
+    If Len(base) = 0 Then base = ThisWorkbook.Path
+    dflt = base & Application.PathSeparator & "InterconnectPipeline_" & Format$(Now, "yyyymmdd_hhnnss") & ".xlsm"
+
+    chosen = Application.GetSaveAsFilename(InitialFileName:=dflt, _
+                FileFilter:="Excel Macro-Enabled Workbook (*.xlsm), *.xlsm", _
+                Title:="Save the pipeline workbook (checkpoint target)")
+    If VarType(chosen) = vbBoolean Then
+        ' user cancelled the picker -> fall back to the timestamped default so a
+        ' checkpoint always has somewhere to go.
+        chosen = dflt
+    End If
+    ThisWorkbook.SaveAs Filename:=CStr(chosen), FileFormat:=PL_XLSM_FORMAT
+End Sub
+
+' Best-effort save used on failure paths: never prompts, never raises.
+Private Sub pl_TrySave()
+    On Error Resume Next
+    If Len(ThisWorkbook.Path) > 0 Then ThisWorkbook.Save
+    On Error GoTo 0
+End Sub
+
+' Clears (or creates) a canonical output sheet without prompting -- the
+' Resume/Restart choice is the single overwrite decision, so stages that run
+' always overwrite their own canonical sheet.
+Private Function pl_FreshSheet(ByVal baseName As String) As Worksheet
+    Dim ws As Worksheet, co As ChartObject
+    Set ws = pl_SheetByName(baseName)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = baseName
+    Else
+        On Error Resume Next
+        For Each co In ws.ChartObjects: co.Delete: Next co
+        On Error GoTo 0
+        ws.Cells.Clear
+    End If
+    Set pl_FreshSheet = ws
+End Function
 
 ' ==========================================================================
 '  STAGE 1 -- CONSOLIDATE COST / RESULTS FILES  -> Cost Data  (bulk, silent)
@@ -414,8 +681,8 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
     Next i
     If firstValid = 0 Then pl_LogAdd log, "Step 1: no files remain.": Exit Function
 
-    Set wsCost = pl_GetOutputSheet(PL_SH_COST)
-    If wsCost Is Nothing Then pl_LogAdd log, "Step 1: cancelled at sheet creation.": Exit Function
+    Set wsCost = pl_FreshSheet(PL_SH_COST)
+    If wsCost Is Nothing Then pl_LogAdd log, "Step 1: could not create the Cost Data sheet.": Exit Function
 
     Dim headerCols As Long: headerCols = recs(firstValid).UsedCols
     wsCost.Cells(1, 1).Value = PL_HDR_NAME
@@ -642,8 +909,8 @@ Private Function pl_ConsolidateSite(ByRef log As PL_TLog, ByRef wsSite As Worksh
     distinctCount = pl_DedupTriples(rawName, rawVolt, rawVoltP, rawState, rawN, _
                                     rawFile, rawRow, dt, log, dropped)
 
-    Set wsSite = pl_GetOutputSheet(PL_SH_SITE)
-    If wsSite Is Nothing Then pl_LogAdd log, "Step 2: cancelled at sheet creation.": Exit Function
+    Set wsSite = pl_FreshSheet(PL_SH_SITE)
+    If wsSite Is Nothing Then pl_LogAdd log, "Step 2: could not create the Site Data sheet.": Exit Function
 
     Dim block() As Variant: ReDim block(1 To distinctCount + 1, 1 To 3)
     block(1, 1) = PL_HDR_NAME: block(1, 2) = "State": block(1, 3) = PL_HDR_VOLT
@@ -779,10 +1046,17 @@ End Function
 '--------------------------------------------------------------------------
 Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet, _
                                 ByVal wsSite As Worksheet, ByRef wsMatrix As Worksheet, _
-                                ByRef mtx As PL_TMatrix) As Boolean
+                                ByRef mtx As PL_TMatrix, ByVal reuseExisting As Boolean) As Boolean
     On Error GoTo ErrHandler
     pl_BuildMatrix = False
     mtx.ok = False
+    ' On a resume the Matrix is already a saved checkpoint: read its cost-per-MW
+    ' values back from the sheet instead of recomputing them. The join is still
+    ' run (cheap, from the persisted sheets) to rebuild the keys/headroom/columns
+    ' Stage 4 needs. If the sheet is missing or its shape no longer matches, fall
+    ' back to a full recompute + rewrite.
+    Dim reuseVals As Boolean
+    reuseVals = reuseExisting And (Not wsMatrix Is Nothing)
     pl_Status "Stage 3: joining cost and site sets"
 
     Dim colName As Long, colVolt As Long, colTrig As Long, colAlloc As Long
@@ -900,11 +1174,30 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     ReDim mtx.headroom(1 To n)
     ReDim mtx.keyName(1 To n): ReDim mtx.keyVolt(1 To n): ReDim mtx.keyUseVolt(1 To n)
 
-    ' -- compute each matched substation's curve (one pass over its records) --
-    pl_Status "Stage 4: computing matrix values (" & n & " x " & m & ")"
-    Dim outBlk() As Variant: ReDim outBlk(1 To n + 1, 1 To m + 1)
-    outBlk(1, 1) = "Substation \ MW"
-    For j = 1 To m: outBlk(1, j + 1) = mw(j): Next j
+    ' -- read the Matrix values back on resume, else compute + write --
+    Dim reuseOK As Boolean: reuseOK = False
+    Dim matVals As Variant
+    If reuseVals Then
+        Dim lastMatRow As Long, lastMatCol As Long
+        lastMatRow = wsMatrix.Cells(wsMatrix.Rows.Count, 1).End(xlUp).Row
+        lastMatCol = wsMatrix.Cells(1, wsMatrix.Columns.Count).End(xlToLeft).Column
+        If lastMatRow = n + 1 And lastMatCol = m + 1 Then
+            matVals = wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Value
+            reuseOK = True
+            pl_Status "Stage 3: reading Matrix checkpoint (" & n & " x " & m & ")"
+        Else
+            pl_LogAdd log, "Stage 3: Matrix checkpoint shape changed (" & (lastMatRow - 1) & _
+                           "x" & (lastMatCol - 1) & " vs " & n & "x" & m & "); recomputing."
+        End If
+    End If
+
+    Dim outBlk() As Variant
+    If Not reuseOK Then
+        pl_Status "Stage 4: computing matrix values (" & n & " x " & m & ")"
+        ReDim outBlk(1 To n + 1, 1 To m + 1)
+        outBlk(1, 1) = "Substation \ MW"
+        For j = 1 To m: outBlk(1, j + 1) = mw(j): Next j
+    End If
 
     Dim idIdx As Long, i As Long, rec As Variant, x As Double, tSum As Double, minTrig As Double
     Dim haveMin As Boolean, useV As Boolean, vSel As Double, inCrit As Boolean
@@ -916,20 +1209,11 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
             useV = idVP(idIdx): vSel = idVolt(idIdx)
             mtx.names(i) = pl_IdentityLabel(st(s).Name, st(s).Voltage, st(s).VoltParsed, st(s).State)
             mtx.keyName(i) = idName(idIdx): mtx.keyVolt(i) = vSel: mtx.keyUseVolt(i) = useV
-            outBlk(i + 1, 1) = mtx.names(i)
 
-            ' records for this NAME; apply the row's exact criteria (voltage
-            ' only when the cost tab carried one) -- identical to the SUMIFS.
+            ' headroom is always taken from the records (cheap), by the row's
+            ' exact criteria -- identical to MINIFS.
             Dim recCol As Collection: Set recCol = dName(LCase$(Trim$(idName(idIdx))))
             haveMin = False: minTrig = 0
-            For j = 1 To m
-                x = mw(j): tSum = 0
-                For Each rec In recCol
-                    inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
-                    If inCrit Then If rec(0) <= x Then tSum = tSum + rec(1)
-                Next rec
-                mtx.costM(i, j) = tSum / x
-            Next j
             For Each rec In recCol
                 inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
                 If inCrit And rec(0) > 0 Then
@@ -938,32 +1222,44 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
             Next rec
             mtx.headroom(i) = IIf(haveMin, minTrig, 0)
 
-            ' body cell content (value or bounded live SUMIFS)
-            If USE_LIVE_SUMIFS Then
+            If reuseOK Then
                 For j = 1 To m
-                    outBlk(i + 1, j + 1) = pl_SumifsFormula(wsCost.Name, colAlloc, colName, colTrig, colVolt, _
-                                            idName(idIdx), useV, vSel, _
-                                            pl_ColLetter(1 + j) & "$1", 2, lastCostRow)
+                    If IsNumeric(matVals(i + 1, j + 1)) Then mtx.costM(i, j) = CDbl(matVals(i + 1, j + 1)) Else mtx.costM(i, j) = 0
                 Next j
             Else
+                outBlk(i + 1, 1) = mtx.names(i)
                 For j = 1 To m
-                    outBlk(i + 1, j + 1) = mtx.costM(i, j)
+                    x = mw(j): tSum = 0
+                    For Each rec In recCol
+                        inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
+                        If inCrit Then If rec(0) <= x Then tSum = tSum + rec(1)
+                    Next rec
+                    mtx.costM(i, j) = tSum / x
+                    ' body cell content (value or bounded live SUMIFS)
+                    If USE_LIVE_SUMIFS Then
+                        outBlk(i + 1, j + 1) = pl_SumifsFormula(wsCost.Name, colAlloc, colName, colTrig, colVolt, _
+                                                idName(idIdx), useV, vSel, pl_ColLetter(1 + j) & "$1", 2, lastCostRow)
+                    Else
+                        outBlk(i + 1, j + 1) = mtx.costM(i, j)
+                    End If
                 Next j
             End If
         End If
     Next s
 
-    ' -- write matrix in one block --
-    Set wsMatrix = pl_GetOutputSheet(PL_SH_MATRIX)
-    If wsMatrix Is Nothing Then pl_LogAdd log, "Step 3: cancelled at Matrix sheet creation.": Exit Function
-    If USE_LIVE_SUMIFS Then
-        wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Formula = outBlk
-    Else
-        wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Value = outBlk
+    ' -- write matrix in one block (skipped when reusing the saved checkpoint) --
+    If Not reuseOK Then
+        Set wsMatrix = pl_FreshSheet(PL_SH_MATRIX)
+        If wsMatrix Is Nothing Then pl_LogAdd log, "Step 3: could not create the Matrix sheet.": Exit Function
+        If USE_LIVE_SUMIFS Then
+            wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Formula = outBlk
+        Else
+            wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Value = outBlk
+        End If
+        wsMatrix.Rows(1).Font.Bold = True
+        wsMatrix.Columns(1).AutoFit
+        wsMatrix.Range(wsMatrix.Cells(2, 2), wsMatrix.Cells(n + 1, m + 1)).NumberFormat = "$#,##0"
     End If
-    wsMatrix.Rows(1).Font.Bold = True
-    wsMatrix.Columns(1).AutoFit
-    wsMatrix.Range(wsMatrix.Cells(2, 2), wsMatrix.Cells(n + 1, m + 1)).NumberFormat = "$#,##0"
 
     mtx.matchedCount = n: mtx.mwCount = m
     mtx.costName = wsCost.Name
@@ -1090,13 +1386,9 @@ Private Function pl_RunAnalysisAndScoring(ByVal wsMatrix As Worksheet, ByRef log
     For i = 1 To n
         For j = 1 To m
             If costM(i, j) <= 0 Then
-                pl_LogAdd log, "Step 4: non-positive cost at '" & names(i) & "', MW " & mw(j) & _
-                               " (no upgrade priced at/under this size); analysis skipped."
-                MsgBox "Matrix has a non-positive cost-per-MW at '" & names(i) & "', " & mw(j) & _
-                       " MW. The cost-curve analysis needs every cell > 0, so it was skipped." & _
-                       vbCrLf & "(Steps 1-3 completed; see " & PL_SH_LOG & ".)", _
-                       vbExclamation, "Interconnect Pipeline"
-                Exit Function
+                pl_LogAdd log, "Stage 4: non-positive cost at '" & names(i) & "', MW " & mw(j) & _
+                               " (no upgrade priced at/under this size); analysis needs every cell > 0."
+                Exit Function     ' returns False -> orchestrator reports + leaves Stages 1-3 saved
             End If
         Next j
     Next i
@@ -1113,8 +1405,8 @@ Private Function pl_RunAnalysisAndScoring(ByVal wsMatrix As Worksheet, ByRef log
     Dim aTable() As Variant: ReDim aTable(1 To n, 1 To totalCols)
     AnalyseAll mw, names, costM, n, m, aTable, rankA, rankB
 
-    Dim wsOut As Worksheet: Set wsOut = pl_GetOutputSheet(PL_SH_ANALYSIS)
-    If wsOut Is Nothing Then pl_LogAdd log, "Step 4: cancelled at analysis sheet creation.": Exit Function
+    Dim wsOut As Worksheet: Set wsOut = pl_FreshSheet(PL_SH_ANALYSIS)
+    If wsOut Is Nothing Then pl_LogAdd log, "Step 4: could not create the analysis sheet.": Exit Function
 
     pl_Status "Stage 4: writing analysis"
     Dim srcMWRow As Long, srcFirstDataRow As Long
@@ -1140,10 +1432,8 @@ Private Function pl_RunAnalysisAndScoring(ByVal wsMatrix As Worksheet, ByRef log
     Exit Function
 
 ErrHandler:
-    pl_LogAdd log, "Step 4 error #" & Err.Number & ": " & Err.Description
-    MsgBox "Error during analysis/scoring #" & Err.Number & ": " & Err.Description, _
-           vbCritical, "Interconnect Pipeline"
-    pl_RunAnalysisAndScoring = False
+    pl_LogAdd log, "Stage 4 error #" & Err.Number & ": " & Err.Description
+    pl_RunAnalysisAndScoring = False     ' orchestrator's StageFailed reports + leaves 1-3 saved
 End Function
 
 '--------------------------------------------------------------------------
@@ -1618,38 +1908,6 @@ Private Function pl_PickFiles(ByVal title As String, ByRef outFiles() As String,
     pl_PickFiles = True
 End Function
 
-Private Function pl_GetOutputSheet(ByVal baseName As String) As Worksheet
-    Dim existing As Worksheet, ws As Worksheet, ans As VbMsgBoxResult, newName As String
-    On Error Resume Next
-    Set existing = ThisWorkbook.Worksheets(baseName)
-    On Error GoTo 0
-    If existing Is Nothing Then
-        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
-        ws.Name = baseName
-        Set pl_GetOutputSheet = ws
-        Exit Function
-    End If
-    ans = MsgBox("A sheet named '" & baseName & "' already exists." & vbCrLf & _
-                 "Yes = overwrite it" & vbCrLf & "No  = create a new timestamped sheet" & vbCrLf & _
-                 "Cancel = abort", vbYesNoCancel + vbQuestion, "Sheet exists")
-    Select Case ans
-        Case vbCancel
-            Set pl_GetOutputSheet = Nothing
-        Case vbYes
-            existing.Cells.Clear
-            On Error Resume Next
-            Dim co As ChartObject
-            For Each co In existing.ChartObjects: co.Delete: Next co
-            On Error GoTo 0
-            Set pl_GetOutputSheet = existing
-        Case vbNo
-            newName = Left$(baseName & " " & Format$(Now, "yyyymmdd_hhnnss"), PL_EXCEL_MAX_TAB)
-            Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
-            ws.Name = newName
-            Set pl_GetOutputSheet = ws
-    End Select
-End Function
-
 Private Function pl_ResolveCol(ByVal ws As Worksheet, ByVal headerText As String) As Long
     Dim lastCol As Long, c As Long, hv As Variant
     lastCol = ws.Cells(PL_HDR_ROW, ws.Columns.Count).End(xlToLeft).Column
@@ -1890,6 +2148,12 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
 
     ' 8) Scale smoke test: 2,000 synthetic substations, no O(N^2) blow-up
     pl_ScaleSmokeTest passCount, failCount
+
+    ' 9) Durability / resume checkpoints
+    pl_CheckpointSelfTest passCount, failCount
+
+    Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
+                " errors (a compile break cannot be asserted from runtime)."
 End Sub
 
 ' Round-trips a raw population and a rank population through real Excel formulas
@@ -1990,6 +2254,72 @@ Private Sub pl_ScaleSmokeTest(ByRef passCount As Long, ByRef failCount As Long)
     Debug.Print "  scale: " & n & " substations ranked+bucketed in " & Format$(elapsed, "0.00") & "s"
     Assert (UBound(rA, 1) = n), "Scale: ranking produced n rows for 2,000 substations", passCount, failCount
     Assert (elapsed < 30), "Scale: 2,000-substation rank+percentile pass under 30s (no O(N^2))", passCount, failCount
+End Sub
+
+' Durability + resume: simulate Stage 1 completing and a Stage-2 failure, and
+' assert Cost Data survives, is a valid checkpoint, is saved (when the host has
+' a path), and that a resumed run would start at Stage 2 (Stage 1 skipped -- no
+' source files re-opened). Runs only on a clean workbook so it never clobbers a
+' real pipeline's sheets.
+Private Sub pl_CheckpointSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim busy As Boolean
+    busy = (Not pl_SheetByName(PL_SH_COST) Is Nothing) Or _
+           (Not pl_SheetByName(PL_SH_SITE) Is Nothing) Or _
+           (Not pl_SheetByName(PL_SH_MATRIX) Is Nothing) Or _
+           (Not pl_SheetByName(PL_SH_ANALYSIS) Is Nothing) Or _
+           (Not pl_SheetByName(PL_SH_STATE) Is Nothing)
+    If busy Then
+        Debug.Print "  checkpoint test skipped (pipeline sheets already present; not clobbering)."
+        Exit Sub
+    End If
+
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+
+    ' Stage 1 completes: write Cost Data and mark the checkpoint.
+    Dim ws As Worksheet: Set ws = pl_FreshSheet(PL_SH_COST)
+    ws.Range("A1:B1").Value = Array(PL_HDR_NAME, PL_HDR_VOLT)
+    ws.Range("A2:B2").Value = Array("Alpha", 345)
+    pl_MarkStage PL_STG_COST, 1
+
+    ' A Stage-2 failure now must not touch Cost Data.
+    Assert pl_SheetNonEmpty(PL_SH_COST), _
+           "Durability: Cost Data present + non-empty after a Stage-2 failure", passCount, failCount
+    Assert pl_StageDone(PL_STG_COST), "Durability: Stage 1 checkpoint valid", passCount, failCount
+    Assert Not pl_StageDone(PL_STG_SITE), "Durability: Stage 2 not marked complete", passCount, failCount
+    Assert pl_FirstIncompleteStage() = PL_STG_SITE, _
+           "Resume: first incomplete stage is 2 (Stage 1 skipped, no file re-open)", passCount, failCount
+
+    ' Saved-on-disk assertion only when the host has a path.
+    If Len(ThisWorkbook.Path) > 0 Then
+        ThisWorkbook.Save
+        Assert ThisWorkbook.Saved, "Durability: workbook saved on disk after Stage 1", passCount, failCount
+    Else
+        Debug.Print "  (on-disk save assertion skipped: workbook has no path)"
+    End If
+
+    ' clean up the sheets this test created (workbook was clean beforehand).
+    pl_DeleteIfExists PL_SH_COST
+    pl_DeleteIfExists PL_SH_STATE
+    Application.DisplayAlerts = prevAlerts
+    Exit Sub
+Fail:
+    On Error Resume Next
+    pl_DeleteIfExists PL_SH_COST
+    pl_DeleteIfExists PL_SH_STATE
+    Application.DisplayAlerts = True
+    Assert False, "Checkpoint self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+Private Sub pl_DeleteIfExists(ByVal nm As String)
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(nm)
+    If Not ws Is Nothing Then
+        On Error Resume Next
+        ws.Delete
+        On Error GoTo 0
+    End If
 End Sub
 
 ' ---- small test helpers ----
