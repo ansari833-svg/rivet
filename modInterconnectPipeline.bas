@@ -327,11 +327,12 @@ Public Sub RunInterconnectPipeline()
     startStage = pl_FirstIncompleteStage()
     If startStage > PL_STG_COST Then
         Dim ans As VbMsgBoxResult
-        ans = MsgBox("Checkpoints found -- completed and saved: " & pl_CompletedStagesText() & "." & vbCrLf & vbCrLf & _
+        ans = MsgBox("Found completed stages: " & pl_CompletedStagesText() & "." & vbCrLf & vbCrLf & _
                      IIf(startStage > PL_STG_COUNT, "All four stages are already complete.", _
-                         "Resume skips them and starts at Stage " & startStage & " (" & pl_StageName(startStage) & ").") & vbCrLf & vbCrLf & _
-                     "Yes = Resume" & vbCrLf & _
-                     "No = Restart from Stage 1 (clears all outputs)" & vbCrLf & _
+                         "Resume from Stage " & startStage & " (" & pl_StageRole(startStage) & _
+                         "), or Restart from Stage 1?") & vbCrLf & vbCrLf & _
+                     "Yes = Resume (skip completed stages; read their sheets back, do not re-open source files)" & vbCrLf & _
+                     "No = Restart from Stage 1 (clears all outputs + _Pipeline State)" & vbCrLf & _
                      "Cancel = abort", vbYesNoCancel + vbQuestion, "Resume pipeline?")
         Select Case ans
             Case vbCancel
@@ -459,6 +460,17 @@ Private Function pl_StageName(ByVal stage As Long) As String
     End Select
 End Function
 
+' Short role label for the resume prompt (e.g. Stage 3 = "Join/Matrix").
+Private Function pl_StageRole(ByVal stage As Long) As String
+    Select Case stage
+        Case PL_STG_COST: pl_StageRole = "Consolidate Cost"
+        Case PL_STG_SITE: pl_StageRole = "Consolidate Sites"
+        Case PL_STG_MATRIX: pl_StageRole = "Join/Matrix"
+        Case PL_STG_ANALYSIS: pl_StageRole = "Analysis/Scoring"
+        Case Else: pl_StageRole = "done"
+    End Select
+End Function
+
 ' A stage is "done" when its output sheet exists and is non-empty (header plus
 ' at least one data row). The sheet is the source of truth; _Pipeline State is
 ' corroborating metadata only, so a checkpoint survives even a lost state sheet.
@@ -483,7 +495,8 @@ Private Function pl_CompletedStagesText() As String
     For s = PL_STG_COST To PL_STG_COUNT
         If pl_StageDone(s) Then
             If Len(parts) > 0 Then parts = parts & ", "
-            parts = parts & pl_StageName(s)
+            parts = parts & pl_StageName(s) & " (" & _
+                    Format$(pl_SheetDataRows(pl_SheetByName(pl_StageName(s))), "#,##0") & " rows)"
         End If
     Next s
     If Len(parts) = 0 Then parts = "(none)"
@@ -677,12 +690,21 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
 
     Dim firstValid As Long: firstValid = 0
     For i = 1 To fileCount
-        If recs(i).IsValid Then firstValid = i: Exit For
+        If recs(i).IsValid Then
+            firstValid = i
+            Exit For
+        End If
     Next i
-    If firstValid = 0 Then pl_LogAdd log, "Step 1: no files remain.": Exit Function
+    If firstValid = 0 Then
+        pl_LogAdd log, "Step 1: no files remain."
+        Exit Function
+    End If
 
     Set wsCost = pl_FreshSheet(PL_SH_COST)
-    If wsCost Is Nothing Then pl_LogAdd log, "Step 1: could not create the Cost Data sheet.": Exit Function
+    If wsCost Is Nothing Then
+        pl_LogAdd log, "Step 1: could not create the Cost Data sheet."
+        Exit Function
+    End If
 
     Dim headerCols As Long: headerCols = recs(firstValid).UsedCols
     wsCost.Cells(1, 1).Value = PL_HDR_NAME
@@ -770,10 +792,16 @@ Private Function pl_MeasureSheet(ByVal ws As Worksheet, ByRef rec As PL_TCostFil
     Dim ur As Range, lastCol As Long, lastRow As Long
     pl_MeasureSheet = False
     Set ur = ws.UsedRange
-    If ur Is Nothing Then rec.Message = "Sheet is empty": Exit Function
+    If ur Is Nothing Then
+        rec.Message = "Sheet is empty"
+        Exit Function
+    End If
     lastCol = ur.Column + ur.Columns.Count - 1
     lastRow = ur.Row + ur.Rows.Count - 1
-    If lastRow <= PL_HDR_ROW Then rec.Message = "No data rows below the header": Exit Function
+    If lastRow <= PL_HDR_ROW Then
+        rec.Message = "No data rows below the header"
+        Exit Function
+    End If
     If Application.WorksheetFunction.CountA(ws.Range(ws.Cells(PL_HDR_ROW, 1), _
             ws.Cells(PL_HDR_ROW, lastCol))) = 0 Then
         rec.Message = "Header row is empty": Exit Function
@@ -790,7 +818,11 @@ Private Function pl_HeaderSig(ByVal ws As Worksheet, ByVal usedCols As Long) As 
     Dim hv As Variant
     hv = ws.Range(ws.Cells(PL_HDR_ROW, 1), ws.Cells(PL_HDR_ROW, usedCols)).Value
     For c = 1 To usedCols
-        If usedCols = 1 Then parts(c) = Trim$(CStr(pl_NZ(hv))) Else parts(c) = Trim$(CStr(pl_NZ(hv(1, c))))
+        If usedCols = 1 Then
+            parts(c) = Trim$(CStr(pl_NZ(hv)))
+        Else
+            parts(c) = Trim$(CStr(pl_NZ(hv(1, c))))
+        End If
     Next c
     pl_HeaderSig = Join(parts, "|")
 End Function
@@ -804,7 +836,11 @@ Private Sub pl_CopyCostHeaders(ByVal wsCost As Worksheet, ByRef rec As PL_TCostF
     hv = ws.Range(ws.Cells(PL_HDR_ROW, 1), ws.Cells(PL_HDR_ROW, rec.UsedCols)).Value
     Dim outHdr() As Variant: ReDim outHdr(1 To 1, 1 To rec.UsedCols)
     For c = 1 To rec.UsedCols
-        If rec.UsedCols = 1 Then outHdr(1, c) = hv Else outHdr(1, c) = hv(1, c)
+        If rec.UsedCols = 1 Then
+            outHdr(1, c) = hv
+        Else
+            outHdr(1, c) = hv(1, c)
+        End If
     Next c
     wsCost.Range(wsCost.Cells(1, 5), wsCost.Cells(1, 4 + rec.UsedCols)).Value = outHdr
     wb.Close SaveChanges:=False
@@ -828,7 +864,10 @@ Private Function pl_AppendCostFile(ByVal wsCost As Worksheet, ByRef rec As PL_TC
     Set ws = wb.Sheets(PL_COST_DATA_IDX)
 
     srcVals = pl_BlockRead(ws, rec.FirstDataRow, rec.LastDataRow, rec.UsedCols)
-    If IsEmpty(srcVals) Then wb.Close SaveChanges:=False: Exit Function
+    If IsEmpty(srcVals) Then
+        wb.Close SaveChanges:=False
+        Exit Function
+    End If
 
     srcRows = UBound(srcVals, 1) - LBound(srcVals, 1) + 1
     srcCols = UBound(srcVals, 2) - LBound(srcVals, 2) + 1
@@ -841,11 +880,23 @@ Private Function pl_AppendCostFile(ByVal wsCost As Worksheet, ByRef rec As PL_TC
 
     ReDim outBlock(1 To srcRows, 1 To 4 + writeCols)
     outR = 0
+    Dim hdrSkipped As Long: hdrSkipped = 0
     For r = 1 To srcRows
-        If Not pl_RowBlank(srcVals, r, srcCols) Then
+        ' Data rows only: skip blanks and any row that re-states the source
+        ' header (guards against a header re-detected mid-data, which would
+        ' otherwise pollute every downstream MINIFS/SUMIFS/grouping scan).
+        If pl_RowBlank(srcVals, r, srcCols) Then
+            ' blank -> skip
+        ElseIf StrComp(pl_RowSig(srcVals, r, srcCols), rec.HeaderSig, vbTextCompare) = 0 Then
+            hdrSkipped = hdrSkipped + 1
+        Else
             outR = outR + 1
             outBlock(outR, 1) = rec.Substation
-            If rec.VoltParsed Then outBlock(outR, 2) = rec.Voltage Else outBlock(outR, 2) = ""
+            If rec.VoltParsed Then
+                outBlock(outR, 2) = rec.Voltage
+            Else
+                outBlock(outR, 2) = ""
+            End If
             outBlock(outR, 3) = rec.FilePath
             outBlock(outR, 4) = rec.SheetName
             For c = 1 To writeCols
@@ -853,6 +904,7 @@ Private Function pl_AppendCostFile(ByVal wsCost As Worksheet, ByRef rec As PL_TC
             Next c
         End If
     Next r
+    If hdrSkipped > 0 Then rec.Message = "Skipped " & hdrSkipped & " stray header row(s)"
 
     If outR > 0 Then
         wsCost.Range(wsCost.Cells(nextRow, 1), _
@@ -910,14 +962,21 @@ Private Function pl_ConsolidateSite(ByRef log As PL_TLog, ByRef wsSite As Worksh
                                     rawFile, rawRow, dt, log, dropped)
 
     Set wsSite = pl_FreshSheet(PL_SH_SITE)
-    If wsSite Is Nothing Then pl_LogAdd log, "Step 2: could not create the Site Data sheet.": Exit Function
+    If wsSite Is Nothing Then
+        pl_LogAdd log, "Step 2: could not create the Site Data sheet."
+        Exit Function
+    End If
 
     Dim block() As Variant: ReDim block(1 To distinctCount + 1, 1 To 3)
     block(1, 1) = PL_HDR_NAME: block(1, 2) = "State": block(1, 3) = PL_HDR_VOLT
     For i = 1 To distinctCount
         block(i + 1, 1) = dt(i).Name
         block(i + 1, 2) = dt(i).State
-        If dt(i).VoltParsed Then block(i + 1, 3) = dt(i).Voltage Else block(i + 1, 3) = ""
+        If dt(i).VoltParsed Then
+            block(i + 1, 3) = dt(i).Voltage
+        Else
+            block(i + 1, 3) = ""
+        End If
     Next i
     wsSite.Range(wsSite.Cells(1, 1), wsSite.Cells(distinctCount + 1, 3)).Value = block
     wsSite.Rows(1).Font.Bold = True
@@ -958,12 +1017,22 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
 
     ' One bulk read of columns A..G (name, state, voltage live inside).
     vals = ws.Range(ws.Cells(PL_HDR_ROW + 1, 1), ws.Cells(lastRow, PL_SITE_VOLT_COL)).Value
+    ' Summary header (row 1) values, to guard against a header re-detected in
+    ' the data -- data rows only.
+    Dim hName As String, hState As String, hVolt As String
+    hName = Trim$(CStr(pl_NZ(ws.Cells(PL_HDR_ROW, PL_SITE_NAME_COL).Value)))
+    hState = Trim$(CStr(pl_NZ(ws.Cells(PL_HDR_ROW, PL_SITE_STATE_COL).Value)))
+    hVolt = Trim$(CStr(pl_NZ(ws.Cells(PL_HDR_ROW, PL_SITE_VOLT_COL).Value)))
     Dim added As Long: added = 0
     Dim rows As Long
-    If IsArray(vals) Then rows = UBound(vals, 1) Else rows = 1
+    If IsArray(vals) Then
+        rows = UBound(vals, 1)
+    Else
+        rows = 1
+    End If
 
     For r = 1 To rows
-        Dim nm As String, stt As String, vv As Variant
+        Dim nm As String, stt As String, vv As Variant, vStr As String
         If IsArray(vals) Then
             nm = Trim$(CStr(pl_NZ(vals(r, PL_SITE_NAME_COL))))
             stt = Trim$(CStr(pl_NZ(vals(r, PL_SITE_STATE_COL))))
@@ -972,7 +1041,12 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
             nm = Trim$(CStr(pl_NZ(vals)))     ' single-cell degenerate
             stt = "": vv = ""
         End If
-        If Len(nm) > 0 Then
+        vStr = Trim$(CStr(pl_NZ(vv)))
+        Dim isHdr As Boolean
+        isHdr = (StrComp(nm, hName, vbTextCompare) = 0) And _
+                (StrComp(stt, hState, vbTextCompare) = 0) And _
+                (StrComp(vStr, hVolt, vbTextCompare) = 0)
+        If Len(nm) > 0 And Not isHdr Then
             rawN = rawN + 1
             If rawN > UBound(rawName) Then pl_GrowRaw rawName, rawState, rawVolt, rawVoltP, rawFile, rawRow
             rawName(rawN) = nm
@@ -1076,7 +1150,10 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     Dim lastCostRow As Long, lastCol As Long
     lastCostRow = wsCost.Cells(wsCost.Rows.Count, colName).End(xlUp).Row
     lastCol = wsCost.Cells(PL_HDR_ROW, wsCost.Columns.Count).End(xlToLeft).Column
-    If lastCostRow < PL_HDR_ROW + 1 Then pl_LogAdd log, "Step 3: Cost Data has no rows.": Exit Function
+    If lastCostRow < PL_HDR_ROW + 1 Then
+        pl_LogAdd log, "Step 3: Cost Data has no rows."
+        Exit Function
+    End If
     Dim cv As Variant
     cv = wsCost.Range(wsCost.Cells(1, 1), wsCost.Cells(lastCostRow, lastCol)).Value
 
@@ -1122,12 +1199,18 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
             End If
         End If
     Next r
-    If nId = 0 Then pl_LogAdd log, "Step 3: no cost identities.": Exit Function
+    If nId = 0 Then
+        pl_LogAdd log, "Step 3: no cost identities."
+        Exit Function
+    End If
 
     ' -- site triples (bulk read) --
     Dim st() As PL_TSiteTriple, stN As Long
     stN = pl_ReadSiteTriples(wsSite, st)
-    If stN = 0 Then pl_LogAdd log, "Step 3: no site triples.": Exit Function
+    If stN = 0 Then
+        pl_LogAdd log, "Step 3: no site triples."
+        Exit Function
+    End If
 
     ' -- join: intersection only --
     Dim matchKey() As String: ReDim matchKey(1 To stN)
@@ -1217,14 +1300,23 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
             For Each rec In recCol
                 inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
                 If inCrit And rec(0) > 0 Then
-                    If Not haveMin Then minTrig = rec(0): haveMin = True ElseIf rec(0) < minTrig Then minTrig = rec(0)
+                    If Not haveMin Then
+                        minTrig = rec(0)
+                        haveMin = True
+                    ElseIf rec(0) < minTrig Then
+                        minTrig = rec(0)
+                    End If
                 End If
             Next rec
             mtx.headroom(i) = IIf(haveMin, minTrig, 0)
 
             If reuseOK Then
                 For j = 1 To m
-                    If IsNumeric(matVals(i + 1, j + 1)) Then mtx.costM(i, j) = CDbl(matVals(i + 1, j + 1)) Else mtx.costM(i, j) = 0
+                    If IsNumeric(matVals(i + 1, j + 1)) Then
+                        mtx.costM(i, j) = CDbl(matVals(i + 1, j + 1))
+                    Else
+                        mtx.costM(i, j) = 0
+                    End If
                 Next j
             Else
                 outBlk(i + 1, 1) = mtx.names(i)
@@ -1250,7 +1342,10 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     ' -- write matrix in one block (skipped when reusing the saved checkpoint) --
     If Not reuseOK Then
         Set wsMatrix = pl_FreshSheet(PL_SH_MATRIX)
-        If wsMatrix Is Nothing Then pl_LogAdd log, "Step 3: could not create the Matrix sheet.": Exit Function
+        If wsMatrix Is Nothing Then
+            pl_LogAdd log, "Step 3: could not create the Matrix sheet."
+            Exit Function
+        End If
         If USE_LIVE_SUMIFS Then
             wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Formula = outBlk
         Else
@@ -1282,11 +1377,18 @@ End Function
 Private Function pl_ReadSiteTriples(ByVal wsSite As Worksheet, ByRef st() As PL_TSiteTriple) As Long
     Dim lastRow As Long, r As Long, k As Long
     lastRow = wsSite.Cells(wsSite.Rows.Count, 1).End(xlUp).Row
-    If lastRow < PL_HDR_ROW + 1 Then pl_ReadSiteTriples = 0: Exit Function
+    If lastRow < PL_HDR_ROW + 1 Then
+        pl_ReadSiteTriples = 0
+        Exit Function
+    End If
     Dim v As Variant
     v = wsSite.Range(wsSite.Cells(PL_HDR_ROW + 1, 1), wsSite.Cells(lastRow, 3)).Value
     Dim rows As Long
-    If IsArray(v) Then rows = UBound(v, 1) Else rows = 1
+    If IsArray(v) Then
+        rows = UBound(v, 1)
+    Else
+        rows = 1
+    End If
     ReDim st(1 To rows)
     k = 0
     For r = 1 To rows
@@ -1320,10 +1422,16 @@ Private Function pl_ResolveMatchKey(ByRef tr As PL_TSiteTriple, ByVal dId As Obj
     Dim vk As String, bk As String
     If tr.VoltParsed Then
         vk = pl_CostKey(tr.Name, tr.Voltage, True)
-        If dId.Exists(vk) Then pl_ResolveMatchKey = vk: Exit Function
+        If dId.Exists(vk) Then
+            pl_ResolveMatchKey = vk
+            Exit Function
+        End If
     End If
     bk = pl_CostKey(tr.Name, 0, False)
-    If dId.Exists(bk) Then pl_ResolveMatchKey = bk: Exit Function
+    If dId.Exists(bk) Then
+        pl_ResolveMatchKey = bk
+        Exit Function
+    End If
     pl_ResolveMatchKey = ""
 End Function
 
@@ -1406,7 +1514,10 @@ Private Function pl_RunAnalysisAndScoring(ByVal wsMatrix As Worksheet, ByRef log
     AnalyseAll mw, names, costM, n, m, aTable, rankA, rankB
 
     Dim wsOut As Worksheet: Set wsOut = pl_FreshSheet(PL_SH_ANALYSIS)
-    If wsOut Is Nothing Then pl_LogAdd log, "Step 4: could not create the analysis sheet.": Exit Function
+    If wsOut Is Nothing Then
+        pl_LogAdd log, "Step 4: could not create the analysis sheet."
+        Exit Function
+    End If
 
     pl_Status "Stage 4: writing analysis"
     Dim srcMWRow As Long, srcFirstDataRow As Long
@@ -1639,7 +1750,10 @@ End Function
 
 ' Single-value raw-is-better bucket: CEILING(PERCENTRANK.EXC(pop, x)*5, 1).
 Private Function pl_PctExcCeil5(ByRef pop() As Double, ByVal nPop As Long, ByVal x As Double) As Long
-    If nPop < 1 Then pl_PctExcCeil5 = 0: Exit Function
+    If nPop < 1 Then
+        pl_PctExcCeil5 = 0
+        Exit Function
+    End If
     pl_PctExcCeil5 = pl_Ceil1(pl_PercentRankExc(pop, nPop, x) * PL_MAX_PCTILE)
 End Function
 
@@ -1647,7 +1761,10 @@ End Function
 ' walk (no per-element rescan).
 Private Function pl_RawBucketArray(ByRef vals() As Double, ByVal n As Long) As Long()
     Dim bucket() As Long: ReDim bucket(1 To pl_Max1(n))
-    If n < 1 Then pl_RawBucketArray = bucket: Exit Function
+    If n < 1 Then
+        pl_RawBucketArray = bucket
+        Exit Function
+    End If
     Dim idx() As Long: idx = pl_SortIdxAscD(vals, n)
     Dim pos As Long, groupStart As Long, s0 As Long
     Dim val As Double
@@ -1672,9 +1789,16 @@ Private Function pl_RawBucketArrayMasked(ByRef vals() As Double, ByRef part() As
     ReDim pop(1 To pl_Max1(n)): ReDim mapIdx(1 To pl_Max1(n))
     np = 0
     For i = 1 To n
-        If part(i) Then np = np + 1: pop(np) = vals(i): mapIdx(np) = i
+        If part(i) Then
+            np = np + 1
+            pop(np) = vals(i)
+            mapIdx(np) = i
+        End If
     Next i
-    If np < 1 Then pl_RawBucketArrayMasked = bucket: Exit Function
+    If np < 1 Then
+        pl_RawBucketArrayMasked = bucket
+        Exit Function
+    End If
     Dim sub_() As Double: ReDim sub_(1 To np)
     For i = 1 To np: sub_(i) = pop(i): Next i
     Dim b() As Long: b = pl_RawBucketArray(sub_, np)
@@ -1690,9 +1814,16 @@ Private Function pl_RankBucketArray(ByRef rankArr() As Long, ByVal tt As Long, B
     ReDim pop(1 To pl_Max1(n)): ReDim mapIdx(1 To pl_Max1(n))
     nq = 0
     For i = 1 To n
-        If rankArr(i, tt) > 0 Then nq = nq + 1: pop(nq) = CDbl(rankArr(i, tt)): mapIdx(nq) = i
+        If rankArr(i, tt) > 0 Then
+            nq = nq + 1
+            pop(nq) = CDbl(rankArr(i, tt))
+            mapIdx(nq) = i
+        End If
     Next i
-    If nq < 1 Then pl_RankBucketArray = bucket: Exit Function       ' all 0 (IFERROR -> 0)
+    If nq < 1 Then
+        pl_RankBucketArray = bucket
+        Exit Function
+    End If  ' all 0 (IFERROR -> 0)
     Dim sub_() As Double: ReDim sub_(1 To nq)
     For i = 1 To nq: sub_(i) = pop(i): Next i
     Dim idx() As Long: idx = pl_SortIdxAscD(sub_, nq)
@@ -1714,7 +1845,10 @@ Private Function pl_SortIdxAscD(ByRef vals() As Double, ByVal n As Long) As Long
     Dim ord() As Long: ReDim ord(1 To pl_Max1(n))
     Dim i As Long
     For i = 1 To n: ord(i) = i: Next i
-    If n < 2 Then pl_SortIdxAscD = ord: Exit Function
+    If n < 2 Then
+        pl_SortIdxAscD = ord
+        Exit Function
+    End If
     Dim buf() As Long: ReDim buf(1 To n)
     Dim width As Long, s As Long
     width = 1
@@ -1752,7 +1886,11 @@ Private Function pl_SortIdxAscD(ByRef vals() As Double, ByVal n As Long) As Long
 End Function
 
 Private Function pl_Max1(ByVal n As Long) As Long
-    If n < 1 Then pl_Max1 = 1 Else pl_Max1 = n
+    If n < 1 Then
+        pl_Max1 = 1
+    Else
+        pl_Max1 = n
+    End If
 End Function
 
 ' Live-formula fragments (bounded population ranges).
@@ -1850,7 +1988,10 @@ Private Function pl_CollapseName(ByVal s As String) As String
     For i = 1 To Len(s)
         ch = Mid$(s, i, 1)
         If pl_IsSeparator(ch) Then
-            If Not lastSpace Then sb = sb & " ": lastSpace = True
+            If Not lastSpace Then
+                sb = sb & " "
+                lastSpace = True
+            End If
         Else
             sb = sb & ch: lastSpace = False
         End If
@@ -1900,9 +2041,16 @@ Private Function pl_PickFiles(ByVal title As String, ByRef outFiles() As String,
         .Filters.Add "Excel Files", "*.xlsx; *.xlsm; *.xls; *.xlsb"
         .InitialFileName = base & Application.PathSeparator
     End With
-    If fd.Show <> -1 Then outCount = 0: pl_PickFiles = False: Exit Function
+    If fd.Show <> -1 Then
+        outCount = 0
+        pl_PickFiles = False
+        Exit Function
+    End If
     outCount = fd.SelectedItems.Count
-    If outCount = 0 Then pl_PickFiles = False: Exit Function
+    If outCount = 0 Then
+        pl_PickFiles = False
+        Exit Function
+    End If
     ReDim outFiles(1 To outCount)
     For i = 1 To outCount: outFiles(i) = fd.SelectedItems(i): Next i
     pl_PickFiles = True
@@ -1914,8 +2062,15 @@ Private Function pl_ResolveCol(ByVal ws As Worksheet, ByVal headerText As String
     hv = ws.Range(ws.Cells(PL_HDR_ROW, 1), ws.Cells(PL_HDR_ROW, lastCol)).Value
     For c = 1 To lastCol
         Dim cellTxt As String
-        If lastCol = 1 Then cellTxt = Trim$(CStr(pl_NZ(hv))) Else cellTxt = Trim$(CStr(pl_NZ(hv(1, c))))
-        If StrComp(cellTxt, headerText, vbTextCompare) = 0 Then pl_ResolveCol = c: Exit Function
+        If lastCol = 1 Then
+            cellTxt = Trim$(CStr(pl_NZ(hv)))
+        Else
+            cellTxt = Trim$(CStr(pl_NZ(hv(1, c))))
+        End If
+        If StrComp(cellTxt, headerText, vbTextCompare) = 0 Then
+            pl_ResolveCol = c
+            Exit Function
+        End If
     Next c
     pl_ResolveCol = 0
 End Function
@@ -1931,7 +2086,10 @@ End Function
 Private Function pl_BlockRead(ByVal ws As Worksheet, ByVal firstRow As Long, _
                               ByVal lastRow As Long, ByVal cols As Long) As Variant
     Dim rng As Range, tmp(1 To 1, 1 To 1) As Variant
-    If lastRow < firstRow Then pl_BlockRead = Empty: Exit Function
+    If lastRow < firstRow Then
+        pl_BlockRead = Empty
+        Exit Function
+    End If
     Set rng = ws.Range(ws.Cells(firstRow, 1), ws.Cells(lastRow, cols))
     If rng.Cells.Count = 1 Then
         tmp(1, 1) = rng.Value: pl_BlockRead = tmp
@@ -1945,10 +2103,24 @@ Private Function pl_RowBlank(ByRef arr As Variant, ByVal r As Long, ByVal cols A
     For c = 1 To cols
         v = arr(r, c)
         If Not IsEmpty(v) Then
-            If Len(Trim$(CStr(v))) > 0 Then pl_RowBlank = False: Exit Function
+            If Len(Trim$(CStr(v))) > 0 Then
+                pl_RowBlank = False
+                Exit Function
+            End If
         End If
     Next c
     pl_RowBlank = True
+End Function
+
+' Signature of one row of a block array (trimmed values joined by "|"), in the
+' same shape pl_HeaderSig builds -- used to detect a row that re-states a header.
+Private Function pl_RowSig(ByRef arr As Variant, ByVal r As Long, ByVal cols As Long) As String
+    Dim c As Long, parts() As String
+    ReDim parts(1 To cols)
+    For c = 1 To cols
+        parts(c) = Trim$(CStr(pl_NZ(arr(r, c))))
+    Next c
+    pl_RowSig = Join(parts, "|")
 End Function
 
 Private Function pl_TrimRows(ByRef arr() As Variant, ByVal rows As Long, ByVal cols As Long) As Variant
@@ -2016,7 +2188,11 @@ Private Function pl_FileName(ByVal fullPath As String) As String
     Dim p As Long
     p = InStrRev(fullPath, Application.PathSeparator)
     If p = 0 Then p = InStrRev(fullPath, "\")
-    If p = 0 Then pl_FileName = fullPath Else pl_FileName = Mid$(fullPath, p + 1)
+    If p = 0 Then
+        pl_FileName = fullPath
+    Else
+        pl_FileName = Mid$(fullPath, p + 1)
+    End If
 End Function
 
 Private Sub pl_Status(ByVal msg As String)
@@ -2152,8 +2328,45 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 9) Durability / resume checkpoints
     pl_CheckpointSelfTest passCount, failCount
 
+    ' 10) Header-row guard: consolidation keeps data rows only
+    pl_HeaderGuardSelfTest passCount, failCount
+
     Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
                 " errors (a compile break cannot be asserted from runtime)."
+End Sub
+
+' Fix 1 verification: given a file's rows-2-down block containing real data, a
+' stray header-dup row, and a blank row, the append filter keeps only the data
+' rows -- so N files yield exactly one header row on Cost Data and a data-row
+' count equal to the sum of source data rows.
+Private Sub pl_HeaderGuardSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    Dim hdrSig As String
+    hdrSig = PL_HDR_NAME & "|" & PL_HDR_VOLT & "|" & PL_HDR_TRIGGER & "|" & PL_HDR_ALLOC
+    Dim blk(1 To 4, 1 To 4) As Variant
+    ' row 1: data
+    blk(1, 1) = "Alpha": blk(1, 2) = 345: blk(1, 3) = 100: blk(1, 4) = 5000000#
+    ' row 2: a duplicated header (must be skipped)
+    blk(2, 1) = PL_HDR_NAME: blk(2, 2) = PL_HDR_VOLT: blk(2, 3) = PL_HDR_TRIGGER: blk(2, 4) = PL_HDR_ALLOC
+    ' row 3: fully blank (must be skipped)
+    blk(3, 1) = "": blk(3, 2) = "": blk(3, 3) = "": blk(3, 4) = ""
+    ' row 4: data
+    blk(4, 1) = "Beta": blk(4, 2) = 230: blk(4, 3) = 150: blk(4, 4) = 6000000#
+
+    Assert StrComp(pl_RowSig(blk, 2, 4), hdrSig, vbTextCompare) = 0, _
+           "Header guard: a header-dup row matches the header signature", passCount, failCount
+
+    Dim kept As Long, r As Long
+    kept = 0
+    For r = 1 To 4
+        If pl_RowBlank(blk, r, 4) Then
+            ' skip
+        ElseIf StrComp(pl_RowSig(blk, r, 4), hdrSig, vbTextCompare) = 0 Then
+            ' skip stray header
+        Else
+            kept = kept + 1
+        End If
+    Next r
+    Assert kept = 2, "Header guard: keeps 2 data rows, drops the header-dup and the blank", passCount, failCount
 End Sub
 
 ' Round-trips a raw population and a rank population through real Excel formulas
@@ -2181,7 +2394,11 @@ Private Sub pl_ParitySelfTest(ByRef passCount As Long, ByRef failCount As Long)
     rseed = Array(1, 2, 2, 4, 5, 6, 1, 2, 0, 4, 6, 2)   ' 0 => non-qualifier
     For i = 1 To n
         ranks(i, 1) = CLng(rseed(i - 1))
-        If ranks(i, 1) > 0 Then ws.Cells(i, 3).Value = ranks(i, 1) Else ws.Cells(i, 3).Value = "n/a"
+        If ranks(i, 1) > 0 Then
+            ws.Cells(i, 3).Value = ranks(i, 1)
+        Else
+            ws.Cells(i, 3).Value = "n/a"
+        End If
     Next i
 
     ' Excel formulas: raw-is-better in col B, rank-based in col D
@@ -2256,11 +2473,12 @@ Private Sub pl_ScaleSmokeTest(ByRef passCount As Long, ByRef failCount As Long)
     Assert (elapsed < 30), "Scale: 2,000-substation rank+percentile pass under 30s (no O(N^2))", passCount, failCount
 End Sub
 
-' Durability + resume: simulate Stage 1 completing and a Stage-2 failure, and
-' assert Cost Data survives, is a valid checkpoint, is saved (when the host has
-' a path), and that a resumed run would start at Stage 2 (Stage 1 skipped -- no
-' source files re-opened). Runs only on a clean workbook so it never clobbers a
-' real pipeline's sheets.
+' Durability + resume: simulate Stage 1 completing (and a Stage-2 failure) then
+' Stage 2 completing, asserting Cost Data survives + is saved, and that a
+' resumed run starts at Stage 2 with only Cost done, Stage 3 with Cost + Site
+' done, and Stage 1 with nothing done -- never re-opening source files for a
+' checkpointed stage. Runs only on a clean workbook so it never clobbers a real
+' pipeline's sheets.
 Private Sub pl_CheckpointSelfTest(ByRef passCount As Long, ByRef failCount As Long)
     On Error GoTo Fail
     Dim busy As Boolean
@@ -2299,14 +2517,26 @@ Private Sub pl_CheckpointSelfTest(ByRef passCount As Long, ByRef failCount As Lo
         Debug.Print "  (on-disk save assertion skipped: workbook has no path)"
     End If
 
+    ' Stage 2 also completes: with Cost + Site valid, a resume begins at Stage 3.
+    Dim ws2 As Worksheet: Set ws2 = pl_FreshSheet(PL_SH_SITE)
+    ws2.Range("A1:C1").Value = Array(PL_HDR_NAME, "State", PL_HDR_VOLT)
+    ws2.Range("A2:C2").Value = Array("Alpha", "NM", 345)
+    pl_MarkStage PL_STG_SITE, 1
+    Assert pl_FirstIncompleteStage() = PL_STG_MATRIX, _
+           "Resume: with Cost + Site valid, first incomplete stage is 3 (Join/Matrix)", passCount, failCount
+
     ' clean up the sheets this test created (workbook was clean beforehand).
     pl_DeleteIfExists PL_SH_COST
+    pl_DeleteIfExists PL_SH_SITE
     pl_DeleteIfExists PL_SH_STATE
+    Assert pl_FirstIncompleteStage() = PL_STG_COST, _
+           "Resume: with no checkpoints, first incomplete stage is 1 (start fresh)", passCount, failCount
     Application.DisplayAlerts = prevAlerts
     Exit Sub
 Fail:
     On Error Resume Next
     pl_DeleteIfExists PL_SH_COST
+    pl_DeleteIfExists PL_SH_SITE
     pl_DeleteIfExists PL_SH_STATE
     Application.DisplayAlerts = True
     Assert False, "Checkpoint self-test could not run (" & Err.Description & ")", passCount, failCount
@@ -2355,7 +2585,11 @@ Private Function pl_MinHeadroom(ByRef v() As Double, ByVal n As Long) As Double
             End If
         End If
     Next i
-    If seen Then pl_MinHeadroom = mn Else pl_MinHeadroom = 0
+    If seen Then
+        pl_MinHeadroom = mn
+    Else
+        pl_MinHeadroom = 0
+    End If
 End Function
 
 ' Cost at one MW from two cumulative allocations (trig 100 alloc `a1`, trig 200
@@ -2540,7 +2774,10 @@ Private Sub ComputeRankings(ByRef mw() As Double, ByRef names() As String, _
         ' Rank A population: substations with >=1 qualifying point.
         popN = 0
         For i = 1 To n
-            If rkCount(i, tt) >= 1 Then popN = popN + 1: ord(popN) = i
+            If rkCount(i, tt) >= 1 Then
+                popN = popN + 1
+                ord(popN) = i
+            End If
         Next i
         If popN > 0 Then
             SortIdx ord, popN, tt, True, rkCount, rkMaxMW, rkCostMax, rkSlope, names
@@ -2558,7 +2795,10 @@ Private Sub ComputeRankings(ByRef mw() As Double, ByRef names() As String, _
         ' Rank B population: substations with a defined slope (>=2 points).
         popN = 0
         For i = 1 To n
-            If rkHasSlope(i, tt) Then popN = popN + 1: ord(popN) = i
+            If rkHasSlope(i, tt) Then
+                popN = popN + 1
+                ord(popN) = i
+            End If
         Next i
         If popN > 0 Then
             SortIdx ord, popN, tt, False, rkCount, rkMaxMW, rkCostMax, rkSlope, names
@@ -2791,7 +3031,11 @@ Private Function PowerFitString(ByRef mw() As Double, ByRef c() As Double, _
         ssRes = ssRes + resid * resid
     Next j
     Dim r2 As Double
-    If ssTot > 0 Then r2 = 1 - ssRes / ssTot Else r2 = 1
+    If ssTot > 0 Then
+        r2 = 1 - ssRes / ssTot
+    Else
+        r2 = 1
+    End If
 
     PowerFitString = "y = " & Format(a, "0.00E+00") & " * x^" & Format(b, "0.000") & _
                      "  (power fit, R" & ChrW(178) & " = " & Format(r2, "0.000") & ")"
@@ -2805,7 +3049,10 @@ End Function
 
 Private Function StepChangeStr(ByRef mw() As Double, ByRef segs() As TSegment, _
                                ByVal nseg As Long) As String
-    If nseg <= 1 Then StepChangeStr = "None": Exit Function
+    If nseg <= 1 Then
+        StepChangeStr = "None"
+        Exit Function
+    End If
     Dim parts() As String
     ReDim parts(1 To nseg - 1)
     Dim k As Long
@@ -2825,7 +3072,10 @@ Private Function LongestSegIdx(ByRef mw() As Double, ByRef segs() As TSegment, _
     best = 1: bestSpan = -1
     For k = 1 To nseg
         span = mw(segs(k).LastJ) - mw(segs(k).FirstJ)
-        If span > bestSpan Then bestSpan = span: best = k
+        If span > bestSpan Then
+            bestSpan = span
+            best = k
+        End If
     Next k
     LongestSegIdx = best
 End Function
@@ -2880,7 +3130,10 @@ Private Function KneeXStar(ByRef mw() As Double, ByRef T() As Double, _
             xn = (mw(j) - x1) / (x2 - x1)
             yn = ((T(j) / mw(j)) - yLo) / (yHi - yLo)
             dist = (1 - xn) - yn
-            If dist > bestDist Then bestDist = dist: bestMW = mw(j)
+            If dist > bestDist Then
+                bestDist = dist
+                bestMW = mw(j)
+            End If
             If mw(j) - prevX > maxGap Then maxGap = mw(j) - prevX
             prevX = mw(j)
         Next j
@@ -2932,7 +3185,10 @@ Private Function ThresholdRangeStr(ByRef T() As Double, ByRef mw() As Double, _
         If qual(j) Then cntQ = cntQ + 1
     Next j
 
-    If cntQ = 0 Then ThresholdRangeStr = "None": Exit Function
+    If cntQ = 0 Then
+        ThresholdRangeStr = "None"
+        Exit Function
+    End If
     If cntQ = m Then
         ThresholdRangeStr = "All (" & Format(mw(1), FMT_MW) & "-" & _
                             Format(mw(m), FMT_MW) & " MW)"
@@ -2993,8 +3249,14 @@ Private Function ThresholdSlope(ByRef c() As Double, ByRef mw() As Double, _
         End If
     Next j
 
-    If cnt = 0 Then ThresholdSlope = "n/a": Exit Function
-    If cnt = 1 Then ThresholdSlope = "n/a (single point)": Exit Function
+    If cnt = 0 Then
+        ThresholdSlope = "n/a"
+        Exit Function
+    End If
+    If cnt = 1 Then
+        ThresholdSlope = "n/a (single point)"
+        Exit Function
+    End If
     ThresholdSlope = OLSSlope(xs, ys, cnt)
 End Function
 
@@ -3017,7 +3279,10 @@ End Function
 ' ============================================================
 
 Private Function UniqueSheetName(ByVal wb As Workbook, ByVal baseName As String) As String
-    If Not SheetExists(wb, baseName) Then UniqueSheetName = baseName: Exit Function
+    If Not SheetExists(wb, baseName) Then
+        UniqueSheetName = baseName
+        Exit Function
+    End If
     Dim k As Long: k = 2
     Do While SheetExists(wb, baseName & " (" & k & ")")
         k = k + 1
@@ -3028,7 +3293,10 @@ End Function
 Private Function SheetExists(ByVal wb As Workbook, ByVal nm As String) As Boolean
     Dim ws As Worksheet
     For Each ws In wb.Worksheets
-        If StrComp(ws.Name, nm, vbTextCompare) = 0 Then SheetExists = True: Exit Function
+        If StrComp(ws.Name, nm, vbTextCompare) = 0 Then
+            SheetExists = True
+            Exit Function
+        End If
     Next ws
 End Function
 
@@ -3301,7 +3569,10 @@ Private Sub LeaderOrder(ByRef rank() As Long, ByRef names() As String, ByVal n A
     k = 0
     Dim i As Long
     For i = 1 To n
-        If rank(i, tt) > 0 Then k = k + 1: ord(k) = i
+        If rank(i, tt) > 0 Then
+            k = k + 1
+            ord(k) = i
+        End If
     Next i
     If k < 2 Then Exit Sub
 
@@ -3545,9 +3816,17 @@ Private Function ModalStep(ByRef mw() As Double, ByVal m As Long) As Double
         d = mw(j) - mw(j - 1)
         found = False
         For k = 1 To nv
-            If Abs(vals(k) - d) < 0.000001 Then cnts(k) = cnts(k) + 1: found = True: Exit For
+            If Abs(vals(k) - d) < 0.000001 Then
+                cnts(k) = cnts(k) + 1
+                found = True
+                Exit For
+            End If
         Next k
-        If Not found Then nv = nv + 1: vals(nv) = d: cnts(nv) = 1
+        If Not found Then
+            nv = nv + 1
+            vals(nv) = d
+            cnts(nv) = 1
+        End If
     Next j
     Dim best As Long: best = 1
     For k = 2 To nv
@@ -3559,7 +3838,10 @@ End Function
 ' Round outward (ceil) or inward (floor) to a clean increment.
 Private Function NiceRound(ByVal x As Double, ByVal incr As Double, _
                            ByVal up As Boolean) As Double
-    If incr <= 0 Then NiceRound = x: Exit Function
+    If incr <= 0 Then
+        NiceRound = x
+        Exit Function
+    End If
     If up Then
         NiceRound = -Int(-x / incr) * incr
     Else
@@ -3569,7 +3851,10 @@ End Function
 
 ' A clean axis increment ~ one order of magnitude below the max value.
 Private Function NiceIncrement(ByVal gMax As Double) As Double
-    If gMax <= 0 Then NiceIncrement = 1: Exit Function
+    If gMax <= 0 Then
+        NiceIncrement = 1
+        Exit Function
+    End If
     Dim ord As Double: ord = Int(Log(gMax) / Log(10#))
     Dim incr As Double: incr = 10# ^ (ord - 1)
     If incr < 1 Then incr = 1
@@ -3804,13 +4089,20 @@ End Sub
 Private Function NameIndex(ByRef names() As String, ByVal n As Long, ByVal nm As String) As Long
     Dim i As Long
     For i = 1 To n
-        If StrComp(names(i), nm, vbTextCompare) = 0 Then NameIndex = i: Exit Function
+        If StrComp(names(i), nm, vbTextCompare) = 0 Then
+            NameIndex = i
+            Exit Function
+        End If
     Next i
     NameIndex = 0
 End Function
 
 Private Function GetName(ByRef names() As String, ByVal i As Long) As String
-    If i >= LBound(names) And i <= UBound(names) Then GetName = names(i) Else GetName = "?"
+    If i >= LBound(names) And i <= UBound(names) Then
+        GetName = names(i)
+    Else
+        GetName = "?"
+    End If
 End Function
 
 Private Function CountRanked(ByRef rank() As Long, ByVal n As Long, ByVal tt As Long) As Long
@@ -3888,7 +4180,10 @@ Private Sub SetProfile(ByRef costM() As Double, ByRef mw() As Double, ByVal i As
     Dim j As Long, k As Long
     For j = 1 To m
         For k = LBound(ups) To UBound(ups)
-            If mw(j) <= CDbl(ups(k)) Then T(j) = CDbl(ts(k)): Exit For
+            If mw(j) <= CDbl(ups(k)) Then
+                T(j) = CDbl(ts(k))
+                Exit For
+            End If
         Next k
     Next j
     SetRow costM, mw, T, i, m

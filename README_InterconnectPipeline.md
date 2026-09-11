@@ -19,13 +19,20 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    (picker rooted at `ThisWorkbook.Path`, falling back to
    `Application.DefaultFilePath`). Sheet 3 carries the data; the substation name
    is parsed from its **tab name** (last plausible numeric token = voltage, the
-   rest = name; bare tab = name only). Consolidated behind the metadata prefix
-   `Substation Name | Voltage (kV) | Source File | Source Sheet`, then the
-   source columns verbatim — including `Size Overload Occurs (MW)` (trigger) and
-   `Proposed Project Allocation ($)` (allocation).
+   rest = name; bare tab = name only). The output header is written **once**
+   (the metadata prefix `Substation Name | Voltage (kV) | Source File |
+   Source Sheet`, then the source columns verbatim — including
+   `Size Overload Occurs (MW)` (trigger) and `Proposed Project Allocation ($)`
+   (allocation)); from each source only the **data rows** (row 2 down of its
+   used range) are appended. Blank rows and any row that re-states the source
+   header (matches the header signature) are skipped, so `Cost Data` never
+   accumulates stray header rows that would corrupt the downstream
+   `MINIFS`/`SUMIFS`/grouping scans.
 2. **Site files → `Site Data`.** From each `Summary` tab (name = A, state = C,
-   voltage = G), de-duplicated on the full **(name, voltage, state) triple**
-   (a different voltage or state is a different substation).
+   voltage = G, **row 2 down** — header taken once, data rows only, a
+   header-matching row skipped), de-duplicated on the full
+   **(name, voltage, state) triple** (a different voltage or state is a
+   different substation).
 3. **Join → `Matrix`.** Intersection only, matched by name (plus voltage when
    the cost tab carried one). Cost-per-MW per (substation, MW).
 4. **Analysis + ranking + weighted scoring + headroom → `Cost Curve Analysis`.**
@@ -58,13 +65,23 @@ message naming the completed stages — e.g. *“Stage 2 failed: &lt;err&gt;.
 Completed and saved: Cost Data. Fix and re-run — it will resume.”* One stage’s
 failure never rolls back earlier sheets.
 
-**Resume vs Restart.** At entry the completed stages are detected (each output
-sheet exists and is non-empty; `_Pipeline State` records the last completed
-stage, its row count, and a timestamp). When valid checkpoints exist you are
-offered **Resume** (skip completed stages, start at the first incomplete one) or
-**Restart** (clear outputs, run from Stage 1). **Resume is the default**, so the
-expensive 2,000-file Stage 1 is never repeated because a later stage had a typo.
-A resumed run does **not** re-open any source files for the stages already done.
+**Resume vs Restart (explicit).** At entry the completed stages are detected
+(each output sheet exists and is non-empty; `_Pipeline State` records the last
+completed stage, its row count, and a timestamp). When valid checkpoints exist
+you get an explicit prompt naming exactly what was found and where a resume
+would begin, e.g.:
+
+> Found completed stages: Cost Data (42,013 rows), Site Data (1,987 rows).
+> Resume from Stage 3 (Join/Matrix), or Restart from Stage 1?
+> [Yes = Resume] [No = Restart] [Cancel]
+
+**Resume** skips the completed stages and reads their data back from the
+persisted sheets — it does **not** re-open any source files for a stage already
+checkpointed, so the expensive 2,000-file Stage 1 is never repeated because a
+later stage had a typo. **Restart** clears the output sheets and `_Pipeline
+State`, then runs from Stage 1. Resume is the default. If no valid checkpoints
+exist, the run simply starts at Stage 1 with no prompt (and still creates
+`_Pipeline State` at the first checkpoint).
 
 **First save of a blank workbook.** If the host has never been saved (no path),
 the first checkpoint prompts once for a location, falling back to a timestamped
@@ -74,15 +91,20 @@ the module lives in the workbook. `ScreenUpdating`/`EnableEvents` stay off acros
 the save; per-stage saving is cheap relative to the work and is the price of
 durability.
 
-**Compile-safety.** A VBA compile error is a project-load failure that halts the
-whole run regardless of checkpoints, so the module is kept compile-clean (one
-`Attribute VB_Name`, balanced terminators, no duplicate procedures). The saved
-per-stage sheets protect the data even across a compile break; a clean compile
-prevents the halt — both mechanisms are needed. The module was verified
-structurally (balanced `Sub`/`Function`/`If`/`For`/`With`/`Do`, single
-`Attribute VB_Name`, no duplicate procedure names, call-site arities); run
-**Debug → Compile VBAProject** once on import to confirm zero compile errors
-(the definitive check; `SelfTest` prints the same reminder).
+**Compile-safety (block `If` rule).** A VBA compile error is a project-load
+failure that halts the whole run regardless of checkpoints, so the module is
+kept compile-clean. In particular, **no single-line `If` uses `ElseIf` or chains
+more than one statement after `Then` with colons** — any `If` needing more than
+one action, or any `Else`/`ElseIf`, is a multi-line block
+`If … Then` / `ElseIf` / `Else` / `End If`. (Simple single-statement guards like
+`If x > 0 Then y = 1` are left as one line.) One `Attribute VB_Name`, balanced
+terminators, no duplicate procedures. The saved per-stage sheets protect the
+data even across a compile break; a clean compile prevents the halt — both are
+needed. The module was verified structurally (balanced
+`Sub`/`Function`/`If`/`For`/`With`/`Do`, single `Attribute VB_Name`, no
+duplicate procedure names, call-site arities); run **Debug → Compile
+VBAProject** once on import to confirm zero compile errors (the definitive
+check; `SelfTest` prints the same reminder).
 
 ---
 
@@ -167,11 +189,14 @@ Score**, and the composite maximum stays 165.
   cost-without-site excluded and logged).
 - **Scale** — 2,000 synthetic substations are ranked and bucketed under a
   bounded wall-clock (mergesort, no O(N²) blow-up).
-- **Durability / resume** — simulates Stage 1 completing and a Stage-2 failure,
-  then asserts `Cost Data` is present, non-empty, and (when the host has a path)
-  saved on disk, and that a resumed run’s first incomplete stage is **2** —
-  i.e. Stage 1 is skipped and no source files are re-opened. Runs only on a
+- **Durability / resume** — simulates Stage 1 then Stage 2 completing and
+  asserts `Cost Data` is present, non-empty, and (when the host has a path)
+  saved on disk; that a resumed run’s first incomplete stage is **2** with only
+  Cost done, **3** with Cost + Site done, and **1** with nothing done — i.e.
+  completed stages are skipped and no source files are re-opened. Runs only on a
   clean workbook so it never clobbers a real pipeline’s sheets.
+- **Header guard** — a source block containing a data row, a duplicated header
+  row, and a blank row keeps only the data rows (one header total).
 - **Tab parsing, matrix shape, headroom, and the 165 ceiling.**
 
 Results print to the Immediate window (**Ctrl+G**). `SelfTest` also prints a
