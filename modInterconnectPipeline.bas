@@ -187,6 +187,7 @@ Private Type PL_TCostFile
     Voltage       As Double
     VoltParsed    As Boolean
     HeaderSig     As String
+    HeaderRow     As Long
     UsedCols      As Long
     FirstDataRow  As Long
     LastDataRow   As Long
@@ -771,7 +772,7 @@ Private Sub pl_ValidateCostFile(ByRef rec As PL_TCostFile)
     rec.SheetName = ws.Name
     If Not pl_MeasureSheet(ws, rec) Then GoTo CloseAndExit
 
-    rec.HeaderSig = pl_HeaderSig(ws, rec.UsedCols)
+    rec.HeaderSig = pl_HeaderSig(ws, rec.UsedCols, rec.HeaderRow)
     pl_ParseTab rec.SheetName, rec.Substation, rec.Voltage, rec.VoltParsed
     rec.IsValid = True: rec.Status = "Imported": rec.Message = ""
 
@@ -789,34 +790,100 @@ CloseFail:
 End Sub
 
 Private Function pl_MeasureSheet(ByVal ws As Worksheet, ByRef rec As PL_TCostFile) As Boolean
-    Dim ur As Range, lastCol As Long, lastRow As Long
+    Dim ur As Range, lastCol As Long, lastRow As Long, firstRow As Long, hdrRow As Long
     pl_MeasureSheet = False
     Set ur = ws.UsedRange
     If ur Is Nothing Then
         rec.Message = "Sheet is empty"
         Exit Function
     End If
+    firstRow = ur.Row
     lastCol = ur.Column + ur.Columns.Count - 1
     lastRow = ur.Row + ur.Rows.Count - 1
-    If lastRow <= PL_HDR_ROW Then
-        rec.Message = "No data rows below the header"
+
+    ' Detect the HEADER row -- the row that carries the field names -- rather
+    ' than assuming row 1. Source sheets have a "band" row above the header
+    ' (e.g. Monitored Element / Worst Case Contingency / Cost Allocation), so a
+    ' fixed row-1 header would grab that band and push the real header into the
+    ' data. The header is the first row (of the leading scan window) that
+    ' contains both known field names, normalized.
+    hdrRow = pl_DetectHeaderRow(ws, firstRow, lastRow, lastCol)
+    If hdrRow = 0 Then
+        rec.Message = "Could not find a header row containing '" & PL_HDR_TRIGGER & "' and '" & _
+                      PL_HDR_ALLOC & "' in the first rows"
         Exit Function
     End If
-    If Application.WorksheetFunction.CountA(ws.Range(ws.Cells(PL_HDR_ROW, 1), _
-            ws.Cells(PL_HDR_ROW, lastCol))) = 0 Then
-        rec.Message = "Header row is empty": Exit Function
+    If lastRow <= hdrRow Then
+        rec.Message = "No data rows below the detected header (row " & hdrRow & ")"
+        Exit Function
     End If
+
+    rec.HeaderRow = hdrRow
     rec.UsedCols = lastCol
-    rec.FirstDataRow = PL_HDR_ROW + 1
+    rec.FirstDataRow = hdrRow + 1
     rec.LastDataRow = lastRow
     pl_MeasureSheet = True
 End Function
 
-Private Function pl_HeaderSig(ByVal ws As Worksheet, ByVal usedCols As Long) As String
+' Scans a leading window of rows and returns the first that CONTAINS both known
+' field names (normalized match); 0 if none. This is the header, data begins on
+' the next row -- never a hardcoded row number.
+Private Function pl_DetectHeaderRow(ByVal ws As Worksheet, ByVal firstRow As Long, _
+                                    ByVal lastRow As Long, ByVal lastCol As Long) As Long
+    Const SCAN_ROWS As Long = 20
+    Dim rEnd As Long: rEnd = firstRow + SCAN_ROWS - 1
+    If rEnd > lastRow Then rEnd = lastRow
+    Dim r As Long
+    For r = firstRow To rEnd
+        If pl_RowHasCostHeaders(ws, r, lastCol) Then
+            pl_DetectHeaderRow = r
+            Exit Function
+        End If
+    Next r
+    pl_DetectHeaderRow = 0
+End Function
+
+' True when row r contains BOTH the trigger and allocation field names
+' (whitespace/case-normalized), i.e. it is the real field-name header.
+Private Function pl_RowHasCostHeaders(ByVal ws As Worksheet, ByVal r As Long, ByVal lastCol As Long) As Boolean
+    Dim v As Variant, c As Long, t As String
+    Dim foundTrig As Boolean, foundAlloc As Boolean
+    Dim wantTrig As String, wantAlloc As String
+    wantTrig = pl_NormHdr(PL_HDR_TRIGGER)
+    wantAlloc = pl_NormHdr(PL_HDR_ALLOC)
+    v = ws.Range(ws.Cells(r, 1), ws.Cells(r, lastCol)).Value
+    For c = 1 To lastCol
+        If lastCol = 1 Then
+            t = pl_NormHdr(CStr(pl_NZ(v)))
+        Else
+            t = pl_NormHdr(CStr(pl_NZ(v(1, c))))
+        End If
+        If t = wantTrig Then foundTrig = True
+        If t = wantAlloc Then foundAlloc = True
+    Next c
+    pl_RowHasCostHeaders = foundTrig And foundAlloc
+End Function
+
+' Normalizes a header cell for matching: strip non-breaking spaces, line breaks
+' and tabs to spaces, collapse runs of whitespace, trim, lower-case.
+Private Function pl_NormHdr(ByVal s As String) As String
+    Dim t As String
+    t = s
+    t = Replace(t, Chr$(160), " ")     ' non-breaking space
+    t = Replace(t, vbCr, " ")
+    t = Replace(t, vbLf, " ")
+    t = Replace(t, vbTab, " ")
+    Do While InStr(t, "  ") > 0
+        t = Replace(t, "  ", " ")
+    Loop
+    pl_NormHdr = LCase$(Trim$(t))
+End Function
+
+Private Function pl_HeaderSig(ByVal ws As Worksheet, ByVal usedCols As Long, ByVal headerRow As Long) As String
     Dim c As Long, parts() As String
     ReDim parts(1 To usedCols)
     Dim hv As Variant
-    hv = ws.Range(ws.Cells(PL_HDR_ROW, 1), ws.Cells(PL_HDR_ROW, usedCols)).Value
+    hv = ws.Range(ws.Cells(headerRow, 1), ws.Cells(headerRow, usedCols)).Value
     For c = 1 To usedCols
         If usedCols = 1 Then
             parts(c) = Trim$(CStr(pl_NZ(hv)))
@@ -833,7 +900,7 @@ Private Sub pl_CopyCostHeaders(ByVal wsCost As Worksheet, ByRef rec As PL_TCostF
     Set wb = Application.Workbooks.Open(Filename:=rec.FilePath, UpdateLinks:=0, _
                                         ReadOnly:=True, AddToMru:=False)
     Set ws = wb.Sheets(PL_COST_DATA_IDX)
-    hv = ws.Range(ws.Cells(PL_HDR_ROW, 1), ws.Cells(PL_HDR_ROW, rec.UsedCols)).Value
+    hv = ws.Range(ws.Cells(rec.HeaderRow, 1), ws.Cells(rec.HeaderRow, rec.UsedCols)).Value
     Dim outHdr() As Variant: ReDim outHdr(1 To 1, 1 To rec.UsedCols)
     For c = 1 To rec.UsedCols
         If rec.UsedCols = 1 Then
@@ -2331,8 +2398,58 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 10) Header-row guard: consolidation keeps data rows only
     pl_HeaderGuardSelfTest passCount, failCount
 
+    ' 11) Header-row DETECTION: field-name row is chosen, not the band row
+    pl_HeaderDetectSelfTest passCount, failCount
+
     Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
                 " errors (a compile break cannot be asserted from runtime)."
+End Sub
+
+' The real header bug: source cost sheets have a "band" row above the field-name
+' header. Assert pl_DetectHeaderRow picks the field-name row (not the band), and
+' that the match is whitespace/case-normalized. Uses a scratch sheet.
+Private Sub pl_HeaderDetectSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets.Add
+
+    ' Row 1: band labels (must NOT be taken as the header).
+    ws.Range("A1").Value = "Monitored Element"
+    ws.Range("C1").Value = "Worst Case Contingency"
+    ws.Range("E1").Value = "Cost Allocation"
+    ' Row 2: the real field-name header.
+    ws.Range("A2").Value = "Substation"
+    ws.Range("B2").Value = PL_HDR_TRIGGER
+    ws.Range("C2").Value = "Monitoring"
+    ws.Range("D2").Value = PL_HDR_ALLOC
+    ' Rows 3-4: data.
+    ws.Range("A3").Value = "Alpha": ws.Range("B3").Value = 100: ws.Range("D3").Value = 5000000#
+    ws.Range("A4").Value = "Beta": ws.Range("B4").Value = 150: ws.Range("D4").Value = 6000000#
+
+    Dim lastCol As Long, lastRow As Long
+    lastCol = 5: lastRow = 4
+    Assert pl_DetectHeaderRow(ws, 1, lastRow, lastCol) = 2, _
+           "Header detect: field-name row (2) chosen, not the band row (1)", passCount, failCount
+    Assert Not pl_RowHasCostHeaders(ws, 1, lastCol), _
+           "Header detect: band row is not mistaken for the header", passCount, failCount
+    Assert pl_RowHasCostHeaders(ws, 2, lastCol), _
+           "Header detect: field-name row recognised", passCount, failCount
+
+    ' Normalized match: a non-breaking space and a double space still match.
+    ws.Range("B2").Value = "Size" & Chr$(160) & "Overload  Occurs (MW)"
+    Assert pl_RowHasCostHeaders(ws, 2, lastCol), _
+           "Header detect: normalized match (nbsp / collapsed whitespace)", passCount, failCount
+
+    Application.DisplayAlerts = False
+    ws.Delete
+    Application.DisplayAlerts = prevAlerts
+    Exit Sub
+Fail:
+    On Error Resume Next
+    If Not ws Is Nothing Then ws.Delete
+    Application.DisplayAlerts = True
+    Assert False, "Header-detect self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' Fix 1 verification: given a file's rows-2-down block containing real data, a

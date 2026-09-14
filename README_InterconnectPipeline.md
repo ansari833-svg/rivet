@@ -11,6 +11,20 @@ Import via the VBA editor (**Alt+F11 → File → Import File…**) and run with
 helpers `pl_`-prefixed, no external references (`Scripting.Dictionary` is used
 via late binding), no `.Select` / `.Activate` / `Selection`.
 
+> **Re-import correctly every time you get a new `.bas`** (a clean workbook does
+> not guarantee a clean module): in the VBA editor, right-click
+> `modInterconnectPipeline` → **Remove** → *No* (don't export), then **File →
+> Import File…** the new `.bas`. Importing without removing first creates a
+> second module (`modInterconnectPipeline1`) and Alt+F8 may keep running the old
+> one. Then **Debug → Compile VBAProject**, confirm exactly **one**
+> `modInterconnectPipeline` in the Project Explorer, and run.
+>
+> 30-second check that the new code is running: the cost consolidator must
+> **detect** the header row by matching the field names
+> (`pl_DetectHeaderRow` / `pl_RowHasCostHeaders`), **not** a hardcoded
+> `firstDataRow = 2`. If you still see a fixed row-1 header, the old build is
+> loaded.
+
 ---
 
 ## The four-step flow (run order)
@@ -19,20 +33,23 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    (picker rooted at `ThisWorkbook.Path`, falling back to
    `Application.DefaultFilePath`). Sheet 3 carries the data; the substation name
    is parsed from its **tab name** (last plausible numeric token = voltage, the
-   rest = name; bare tab = name only). The output header is written **once**
-   (the metadata prefix `Substation Name | Voltage (kV) | Source File |
-   Source Sheet`, then the source columns verbatim — including
-   `Size Overload Occurs (MW)` (trigger) and `Proposed Project Allocation ($)`
-   (allocation)); from each source only the **data rows** (row 2 down of its
-   used range) are appended. Blank rows and any row that re-states the source
-   header (matches the header signature) are skipped, so `Cost Data` never
-   accumulates stray header rows that would corrupt the downstream
+   rest = name; bare tab = name only). **The header row is detected, not
+   assumed:** source sheets carry a *band* row above the real header (e.g.
+   `Monitored Element` / `Worst Case Contingency` / `Cost Allocation`), so the
+   tool scans the first rows and picks the header as the first row that
+   *contains* the field names `Size Overload Occurs (MW)` **and**
+   `Proposed Project Allocation ($)` (whitespace/case-normalized); data starts
+   the row **after** it. The output header is written **once** (the metadata
+   prefix `Substation Name | Voltage (kV) | Source File | Source Sheet`, then
+   the detected source header verbatim); from each source only the **data
+   rows** (below the detected header) are appended. Blank rows and any row that
+   re-states the header signature are skipped, so `Cost Data` never accumulates
+   the band row or stray header rows that would corrupt the downstream
    `MINIFS`/`SUMIFS`/grouping scans.
 2. **Site files → `Site Data`.** From each `Summary` tab (name = A, state = C,
-   voltage = G, **row 2 down** — header taken once, data rows only, a
-   header-matching row skipped), de-duplicated on the full
-   **(name, voltage, state) triple** (a different voltage or state is a
-   different substation).
+   voltage = G, header on row 1, **data row 2 down**, a header-matching row
+   skipped), de-duplicated on the full **(name, voltage, state) triple** (a
+   different voltage or state is a different substation).
 3. **Join → `Matrix`.** Intersection only, matched by name (plus voltage when
    the cost tab carried one). Cost-per-MW per (substation, MW).
 4. **Analysis + ranking + weighted scoring + headroom → `Cost Curve Analysis`.**
@@ -197,6 +214,9 @@ Score**, and the composite maximum stays 165.
   clean workbook so it never clobbers a real pipeline’s sheets.
 - **Header guard** — a source block containing a data row, a duplicated header
   row, and a blank row keeps only the data rows (one header total).
+- **Header detection** — a scratch sheet with a band row above the field-name
+  header asserts `pl_DetectHeaderRow` picks the field-name row (row 2), not the
+  band row (row 1), with a whitespace/case-normalized match.
 - **Tab parsing, matrix shape, headroom, and the 165 ceiling.**
 
 Results print to the Immediate window (**Ctrl+G**). `SelfTest` also prints a
