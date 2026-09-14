@@ -72,13 +72,29 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    MW taken from the header cell so the formula re-drives if the header changes.
    Ranges are bound to used rows, never whole columns.
 4. **Analysis + ranking + weighted scoring + headroom → `Cost Curve Analysis`.**
-   Before Stage 4 runs, the Matrix is validated (≥1 substation row, ≥3 numeric
-   strictly-ascending MW columns, every body cell present and > 0); if it is not
-   valid the run **stops with a specific message** (e.g. *“Stage 4 cannot run:
-   Matrix has 0 valid substation rows”*) rather than a silent no-op. Any Stage-4
-   runtime error is written to `_Pipeline Log` (routine, `Err.Number`,
-   `Err.Description`, offending substation/MW when known) **and** shown in a
-   `MsgBox`; on success the analysis sheet's row count is logged.
+   Before Stage 4 runs, the Matrix is validated against the input contract:
+   ≥1 substation row, ≥3 numeric strictly-ascending MW columns, and every body
+   cell numeric and **≥ 0**. A cost of **`$0` is valid** — it means no upgrade
+   was priced at or under that MW, i.e. the size sits **below the substation's
+   first trigger (headroom)**. Only a **negative** cost, or a non-numeric cell,
+   is an error. The "can it run at all" guard still stops a genuinely empty or
+   malformed matrix (0 rows, non-ascending / non-positive MW header) with a
+   **specific message** (e.g. *“Stage 4 cannot run: Matrix has 0 valid
+   substation rows”*) rather than a silent no-op. Any Stage-4 runtime error is
+   written to `_Pipeline Log` (routine, `Err.Number`, `Err.Description`,
+   offending substation/MW when known) **and** shown in a `MsgBox`; on success
+   the analysis sheet's row count is logged.
+
+   **Zeros are handled, not just permitted.** A leading run of `$0` cells forms
+   its own `T = 0` segment (the segmentation walk treats `0→0` as one segment and
+   `0→nonzero` as a boundary), so the fitted function reads e.g.
+   `y = 0 / x [100-120 MW] | y = 6,500,000 / x [130-170 MW]`. Every computation
+   that would divide by a cost or take `Log(cost)` is guarded against zero — the
+   Kneedle knee falls back to the closed-form geometric mean on an all-zero
+   (flat) segment, and the power-law fallback fit skips zero-cost points — so a
+   zero cell yields a **defined** result instead of `#DIV/0!` / overflow.
+   Zero-cost substations are **kept** in the ranking and percentiles; this lines
+   up with **Headroom (MW)**, which equals the first trigger MW.
 
 Also produced: a run log **`_Pipeline Log`** (per-file status, dropped
 duplicate triples, join alignment errors) and a **`_Pipeline State`** checkpoint

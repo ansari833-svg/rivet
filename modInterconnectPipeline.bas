@@ -1646,7 +1646,9 @@ End Sub
 
 ' Pure Matrix-validity check for Stage 4 (no side effects, so it is unit
 ' testable): >=1 substation row, >=3 numeric strictly-ascending MW columns, and
-' every body cell present and > 0. Returns False with a specific reason.
+' every body cell numeric and >= 0. A cost of 0 is VALID (no upgrade priced at/
+' under that size = headroom); only a NEGATIVE cost is an error. Returns False
+' with a specific reason.
 Private Function pl_Stage4MatrixValid(ByRef mtx As PL_TMatrix, ByRef reason As String) As Boolean
     pl_Stage4MatrixValid = False
     reason = ""
@@ -1678,9 +1680,9 @@ Private Function pl_Stage4MatrixValid(ByRef mtx As PL_TMatrix, ByRef reason As S
     Dim i As Long, j As Long
     For i = 1 To mtx.matchedCount
         For j = 1 To mtx.mwCount
-            If mtx.costM(i, j) <= 0 Then
-                reason = "non-positive cost at '" & mtx.names(i) & "', MW " & mtx.mw(j) & _
-                         " (no upgrade priced at/under this size; analysis needs every cell > 0)"
+            If mtx.costM(i, j) < 0 Then
+                reason = "negative cost at '" & mtx.names(i) & "', MW " & mtx.mw(j) & _
+                         " (costs must be >= 0; a 0 cell is valid and means no upgrade priced at/under this size)"
                 Exit Function
             End If
         Next j
@@ -2535,6 +2537,76 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     Assert (Not pl_Stage4MatrixValid(em, rsn)) And (InStr(rsn, "0 valid substation rows") > 0), _
            "Stage 4 guard: an emptied matrix stops with the explicit message", passCount, failCount
 
+    ' 4c) Zero-cost cells are VALID (headroom); only NEGATIVE costs error.
+    '     A substation whose first upgrade triggers at 130 MW has $0 at
+    '     100/110/120 -- the analysis must run to completion, segment the
+    '     leading zero region on its own, and never divide by / Log() a zero.
+    Dim zj As Long
+    Dim zmw() As Double: ReDim zmw(1 To 8)
+    zmw(1) = 100: zmw(2) = 110: zmw(3) = 120: zmw(4) = 130
+    zmw(5) = 140: zmw(6) = 150: zmw(7) = 160: zmw(8) = 170
+    Dim zm As PL_TMatrix
+    zm.ok = True: zm.matchedCount = 1: zm.mwCount = 8
+    ReDim zm.mw(1 To 8)
+    For zj = 1 To 8: zm.mw(zj) = zmw(zj): Next zj
+    ReDim zm.names(1 To 1): zm.names(1) = "Napoleon 138 kV (Indiana)"
+    ReDim zm.costM(1 To 1, 1 To 8)
+    Dim zT() As Double: ReDim zT(1 To 8)
+    Dim zc() As Double: ReDim zc(1 To 8)
+    For zj = 1 To 8
+        If zmw(zj) < 130 Then
+            zc(zj) = 0#                       ' below first trigger = headroom
+        Else
+            zc(zj) = 6500000# / zmw(zj)       ' constant $6.5MM total above trigger
+        End If
+        zm.costM(1, zj) = zc(zj)
+        zT(zj) = zc(zj) * zmw(zj)
+    Next zj
+
+    ' (a) Stage 4 accepts the matrix -- leading zeros no longer abort.
+    Dim zrsn As String
+    Assert pl_Stage4MatrixValid(zm, zrsn), _
+           "Stage 4 zero-cost: leading $0 cells are valid, matrix runs", passCount, failCount
+
+    ' (b) A genuinely negative cost still errors, with a clear reason.
+    Dim nm As PL_TMatrix
+    nm.ok = True: nm.matchedCount = 1: nm.mwCount = 8
+    ReDim nm.mw(1 To 8)
+    For zj = 1 To 8: nm.mw(zj) = zmw(zj): Next zj
+    ReDim nm.names(1 To 1): nm.names(1) = "Napoleon 138 kV (Indiana)"
+    ReDim nm.costM(1 To 1, 1 To 8)
+    For zj = 1 To 8: nm.costM(1, zj) = zm.costM(1, zj): Next zj
+    nm.costM(1, 2) = -5#
+    Assert (Not pl_Stage4MatrixValid(nm, zrsn)) And (InStr(zrsn, "negative cost") > 0), _
+           "Stage 4 zero-cost: a negative cost still errors explicitly", passCount, failCount
+
+    ' (c) Segmentize splits the leading zero region as its own T=0 segment
+    '     (0->0 same segment, 0->nonzero boundary) with no divide-by-zero.
+    Dim zsg() As TSegment: zsg = Segmentize(zmw, zT, 8)
+    Assert (UBound(zsg) = 2) And (zsg(1).FirstJ = 1) And (zsg(1).LastJ = 3) _
+           And (zsg(1).Ttotal = 0) And (zsg(2).FirstJ = 4), _
+           "Stage 4 zero-cost: leading $0 forms its own T=0 segment", passCount, failCount
+
+    ' (d) FittedString renders the leading zero region then the step, no #DIV/0!.
+    Dim zfit As String: zfit = FittedString(zmw, zT, zsg, UBound(zsg), 8, zc)
+    Assert (InStr(zfit, "y = 0 / x") > 0) And (InStr(zfit, "100-120 MW") > 0), _
+           "Stage 4 zero-cost: fitted function shows the leading zero region", passCount, failCount
+
+    ' (e) KneeXStar on the all-zero segment is defined (geometric mean), no 0/0.
+    Dim zknee As Double: zknee = KneeXStar(zmw, zT, zsg(1))
+    Assert Abs(zknee - Sqr(100# * 120#)) < 0.5, _
+           "Stage 4 zero-cost: knee on the all-zero segment = Sqr(x1*x2)", passCount, failCount
+
+    ' (f) Headroom = first trigger MW = first MW whose cost is > 0.
+    Dim zHR As Double: zHR = 0
+    For zj = 1 To 8
+        If zc(zj) > 0# Then
+            zHR = zmw(zj)
+            Exit For
+        End If
+    Next zj
+    Assert zHR = 130, "Stage 4 zero-cost: headroom = first trigger (130 MW)", passCount, failCount
+
     ' 5) Scoring ceiling + $25MM band all-zero on the fixture
     Assert CLng(pl_ScoreCeiling(4)) = 165, "Scoring: weighted-score maximum is 165", passCount, failCount
     Assert CLng(pl_ScoreCeiling(3)) = 125, "Scoring: practical maximum (3 bands) is 125", passCount, failCount
@@ -3225,6 +3297,10 @@ End Function
 '  where a genuine tier step is orders of magnitude larger. Each
 '  segment's representative total is the mean of its T values,
 '  rounded to the nearest $1,000.
+'  A leading run of zero-cost cells (T = 0 = headroom, no upgrade
+'  priced under that size) forms its own segment: when T(j-1) = 0
+'  the relative-change test would divide by zero, so 0->0 is treated
+'  as the same segment and 0->nonzero (or nonzero->0) as a boundary.
 ' ============================================================
 
 Private Function Segmentize(ByRef mw() As Double, ByRef T() As Double, _
@@ -3235,8 +3311,14 @@ Private Function Segmentize(ByRef mw() As Double, ByRef T() As Double, _
     Dim nseg As Long: nseg = 0
     Dim segStart As Long: segStart = 1
     Dim j As Long
+    Dim isBoundary As Boolean
     For j = 2 To m
-        If Abs(T(j) - T(j - 1)) / T(j - 1) > SEG_TOL Then
+        If T(j - 1) = 0# Then
+            isBoundary = (T(j) <> 0#)     ' 0->0 same segment; 0->nonzero splits
+        Else
+            isBoundary = (Abs(T(j) - T(j - 1)) / T(j - 1) > SEG_TOL)
+        End If
+        If isBoundary Then
             nseg = nseg + 1
             segs(nseg).FirstJ = segStart
             segs(nseg).LastJ = j - 1
@@ -3298,29 +3380,43 @@ End Function
 
 ' Global power-law y = a * x^b, least squares on ln(y) vs ln(x).
 ' R^2 computed on the log-transformed values. Fallback path only.
+' Log(cost) is undefined at cost = 0, so zero-cost (headroom) points are
+' skipped from the fit; if fewer than 2 positive-cost points remain the
+' power law is undefined and a safe descriptive string is returned instead.
 Private Function PowerFitString(ByRef mw() As Double, ByRef c() As Double, _
                                 ByVal m As Long) As String
     Dim j As Long
     Dim sx As Double, sy As Double, sxx As Double, sxy As Double
     Dim lx As Double, ly As Double
+    Dim nfit As Long: nfit = 0
     For j = 1 To m
-        lx = Log(mw(j)): ly = Log(c(j))
-        sx = sx + lx: sy = sy + ly
-        sxx = sxx + lx * lx: sxy = sxy + lx * ly
+        If c(j) > 0# Then
+            lx = Log(mw(j)): ly = Log(c(j))
+            sx = sx + lx: sy = sy + ly
+            sxx = sxx + lx * lx: sxy = sxy + lx * ly
+            nfit = nfit + 1
+        End If
     Next j
+    Dim denom As Double: denom = nfit * sxx - sx * sx
+    If nfit < 2 Or denom = 0# Then
+        PowerFitString = "y = piecewise (insufficient positive-cost points for power fit)"
+        Exit Function
+    End If
     Dim b As Double, lnA As Double
-    b = (m * sxy - sx * sy) / (m * sxx - sx * sx)
-    lnA = (sy - b * sx) / m
+    b = (nfit * sxy - sx * sy) / denom
+    lnA = (sy - b * sx) / nfit
     Dim a As Double: a = Exp(lnA)
 
-    ' R^2 on ln(y)
-    Dim meanLy As Double: meanLy = sy / m
+    ' R^2 on ln(y), over the same positive-cost points
+    Dim meanLy As Double: meanLy = sy / nfit
     Dim ssTot As Double, ssRes As Double, resid As Double
     For j = 1 To m
-        ly = Log(c(j))
-        ssTot = ssTot + (ly - meanLy) ^ 2
-        resid = ly - (lnA + b * Log(mw(j)))
-        ssRes = ssRes + resid * resid
+        If c(j) > 0# Then
+            ly = Log(c(j))
+            ssTot = ssTot + (ly - meanLy) ^ 2
+            resid = ly - (lnA + b * Log(mw(j)))
+            ssRes = ssRes + resid * resid
+        End If
     Next j
     Dim r2 As Double
     If ssTot > 0 Then
@@ -3405,15 +3501,18 @@ Private Function KneeXStar(ByRef mw() As Double, ByRef T() As Double, _
     End If
 
     Dim nPts As Long: nPts = seg.LastJ - seg.FirstJ + 1
-    If nPts >= 3 Then
+    Dim yLo As Double, yHi As Double
+    yHi = T(seg.FirstJ) / mw(seg.FirstJ)   ' cost is highest at x1
+    yLo = T(seg.LastJ) / mw(seg.LastJ)      ' cost is lowest  at x2
+    ' A flat segment (yHi = yLo) has no knee to normalise against: a
+    ' leading zero-cost (headroom) segment is all-zero cost-per-MW, so
+    ' the [0,1] normalisation would be 0/0. Skip the discrete search and
+    ' report the closed-form geometric mean, which is still well defined.
+    If nPts >= 3 And yHi <> yLo Then
         ' Discrete Kneedle: normalise x and y across the segment to
         ' [0,1]; y falls as x rises, so the chord runs from (0,1) to
         ' (1,0), chord(xn) = 1 - xn. Vertical distance below the chord
         ' is (1 - xn) - yn. Take the argmax over data points.
-        Dim yLo As Double, yHi As Double
-        yHi = T(seg.FirstJ) / mw(seg.FirstJ)   ' cost is highest at x1
-        yLo = T(seg.LastJ) / mw(seg.LastJ)      ' cost is lowest  at x2
-
         Dim j As Long, xn As Double, yn As Double, dist As Double
         Dim bestDist As Double, bestMW As Double, maxGap As Double, prevX As Double
         bestDist = -1E+308
