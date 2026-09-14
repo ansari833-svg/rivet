@@ -84,12 +84,12 @@ Option Explicit
 '  Stage 7  Headroom (MW) is the per-substation minimum trigger, taken from the
 '           already-loaded cost data; its percentile is a raw-is-better bucket.
 '
-'  TWO SWITCHES (both default False = computed values; documented in README):
-'    USE_LIVE_SUMIFS    True -> Stage 4 writes live SUMIFS bound to used rows
-'                       ($D$2:$D$<last>, never $D:$D). False -> values block.
-'    USE_LIVE_FORMULAS  True -> Stage 6/7 percentiles, Weighted Score and
-'                       headroom are written as live formulas over BOUNDED
-'                       population ranges. False -> computed value blocks.
+'  TWO SWITCHES (documented in README):
+'    USE_LIVE_SUMIFS    DEFAULT TRUE -> the Matrix body is live SUMIFS bound to
+'                       used rows ($D$2:$D$<last>, never $D:$D). False -> values.
+'    USE_LIVE_FORMULAS  Default False -> Stage 6/7 percentiles, Weighted Score
+'                       and headroom are computed value blocks. True -> live
+'                       formulas over BOUNDED population ranges.
 '  PARITY GUARANTEE: the values path and the live-formula path produce the same
 '  numbers. The VBA implements PERCENTRANK.EXC exactly (k/(N+1) positioning),
 '  and SelfTest round-trips the fixture through real Excel formulas to prove
@@ -172,7 +172,7 @@ Private Const PL_MAX_PCTILE As Long = 5
 
 ' Evaluation-path switches (see the header block). Both default False so the
 ' finished workbook holds values, not thousands of volatile array formulas.
-Private Const USE_LIVE_SUMIFS   As Boolean = False   ' Stage 4 matrix
+Private Const USE_LIVE_SUMIFS   As Boolean = True    ' Stage 4 matrix (default: live formulas)
 Private Const USE_LIVE_FORMULAS As Boolean = False   ' Stage 6/7 pctiles/score/headroom
 
 Private Const PL_EXCEL_MAX_ROWS   As Long = 1048576
@@ -393,7 +393,13 @@ Public Sub RunInterconnectPipeline()
     ' ================= Stage 4 -- Analysis + scoring =================
     failedStage = PL_STG_ANALYSIS: curStageName = pl_StageName(PL_STG_ANALYSIS)
     analysisOK = pl_RunAnalysisAndScoring(wsMatrix, log, mtx)
-    If Not analysisOK Then GoTo StageFailed     ' Stages 1-3 stay saved; a re-run resumes here
+    If Not analysisOK Then
+        ' pl_RunAnalysisAndScoring already logged the reason and showed a
+        ' specific MsgBox; just persist what exists (Stages 1-3) and stop.
+        pl_TrySave
+        pl_WriteLog log
+        GoTo Cleanup
+    End If
     pl_SaveCheckpoint log, PL_STG_ANALYSIS, mtx.matchedCount
 
     pl_WriteLog log
@@ -1327,26 +1333,31 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     ' -- read the Matrix values back on resume, else compute + write --
     Dim reuseOK As Boolean: reuseOK = False
     Dim matVals As Variant
+    ' Matrix layout: 3 identity columns (Substation | Voltage (kV) | State),
+    ' then the MW x cost body. The MW header sits at columns 4..(3+m).
+    Const IDC As Long = 3
     If reuseVals Then
         Dim lastMatRow As Long, lastMatCol As Long
         lastMatRow = wsMatrix.Cells(wsMatrix.Rows.Count, 1).End(xlUp).Row
         lastMatCol = wsMatrix.Cells(1, wsMatrix.Columns.Count).End(xlToLeft).Column
-        If lastMatRow = n + 1 And lastMatCol = m + 1 Then
-            matVals = wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Value
+        If lastMatRow = n + 1 And lastMatCol = m + IDC Then
+            matVals = wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + IDC)).Value
             reuseOK = True
             pl_Status "Stage 3: reading Matrix checkpoint (" & n & " x " & m & ")"
         Else
             pl_LogAdd log, "Stage 3: Matrix checkpoint shape changed (" & (lastMatRow - 1) & _
-                           "x" & (lastMatCol - 1) & " vs " & n & "x" & m & "); recomputing."
+                           "x" & (lastMatCol - IDC) & " vs " & n & "x" & m & "); recomputing."
         End If
     End If
 
     Dim outBlk() As Variant
     If Not reuseOK Then
-        pl_Status "Stage 4: computing matrix values (" & n & " x " & m & ")"
-        ReDim outBlk(1 To n + 1, 1 To m + 1)
-        outBlk(1, 1) = "Substation \ MW"
-        For j = 1 To m: outBlk(1, j + 1) = mw(j): Next j
+        pl_Status "Stage 4: computing matrix (" & n & " x " & m & ")"
+        ReDim outBlk(1 To n + 1, 1 To m + IDC)
+        outBlk(1, 1) = "Substation"
+        outBlk(1, 2) = PL_HDR_VOLT           ' "Voltage (kV)"
+        outBlk(1, 3) = "State"
+        For j = 1 To m: outBlk(1, IDC + j) = mw(j): Next j
     End If
 
     Dim idIdx As Long, i As Long, rec As Variant, x As Double, tSum As Double, minTrig As Double
@@ -1379,14 +1390,21 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
 
             If reuseOK Then
                 For j = 1 To m
-                    If IsNumeric(matVals(i + 1, j + 1)) Then
-                        mtx.costM(i, j) = CDbl(matVals(i + 1, j + 1))
+                    If IsNumeric(matVals(i + 1, IDC + j)) Then
+                        mtx.costM(i, j) = CDbl(matVals(i + 1, IDC + j))
                     Else
                         mtx.costM(i, j) = 0
                     End If
                 Next j
             Else
-                outBlk(i + 1, 1) = mtx.names(i)
+                ' three separate identity columns -- never a concatenated label
+                outBlk(i + 1, 1) = st(s).Name
+                If st(s).VoltParsed Then
+                    outBlk(i + 1, 2) = st(s).Voltage
+                Else
+                    outBlk(i + 1, 2) = ""
+                End If
+                outBlk(i + 1, 3) = st(s).State
                 For j = 1 To m
                     x = mw(j): tSum = 0
                     For Each rec In recCol
@@ -1394,12 +1412,12 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
                         If inCrit Then If rec(0) <= x Then tSum = tSum + rec(1)
                     Next rec
                     mtx.costM(i, j) = tSum / x
-                    ' body cell content (value or bounded live SUMIFS)
+                    ' body cell content (bounded live SUMIFS by default, else value)
                     If USE_LIVE_SUMIFS Then
-                        outBlk(i + 1, j + 1) = pl_SumifsFormula(wsCost.Name, colAlloc, colName, colTrig, colVolt, _
-                                                idName(idIdx), useV, vSel, pl_ColLetter(1 + j) & "$1", 2, lastCostRow)
+                        outBlk(i + 1, IDC + j) = pl_SumifsFormula(wsCost.Name, colAlloc, colName, colTrig, colVolt, _
+                                                idName(idIdx), useV, vSel, pl_ColLetter(IDC + j) & "$1", 2, lastCostRow)
                     Else
-                        outBlk(i + 1, j + 1) = mtx.costM(i, j)
+                        outBlk(i + 1, IDC + j) = mtx.costM(i, j)
                     End If
                 Next j
             End If
@@ -1414,13 +1432,13 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
             Exit Function
         End If
         If USE_LIVE_SUMIFS Then
-            wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Formula = outBlk
+            wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + IDC)).Formula = outBlk
         Else
-            wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + 1)).Value = outBlk
+            wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + IDC)).Value = outBlk
         End If
         wsMatrix.Rows(1).Font.Bold = True
-        wsMatrix.Columns(1).AutoFit
-        wsMatrix.Range(wsMatrix.Cells(2, 2), wsMatrix.Cells(n + 1, m + 1)).NumberFormat = "$#,##0"
+        wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(1, IDC)).Columns.AutoFit
+        wsMatrix.Range(wsMatrix.Cells(2, IDC + 1), wsMatrix.Cells(n + 1, m + IDC)).NumberFormat = "$#,##0"
     End If
 
     mtx.matchedCount = n: mtx.mwCount = m
@@ -1556,17 +1574,12 @@ Private Function pl_RunAnalysisAndScoring(ByVal wsMatrix As Worksheet, ByRef log
     mw = mtx.mw: names = mtx.names: costM = mtx.costM
     n = mtx.matchedCount: m = mtx.mwCount
 
-    ' validate the cost-per-MW block in memory (the analysis contract: > 0)
-    Dim i As Long, j As Long
-    For i = 1 To n
-        For j = 1 To m
-            If costM(i, j) <= 0 Then
-                pl_LogAdd log, "Stage 4: non-positive cost at '" & names(i) & "', MW " & mw(j) & _
-                               " (no upgrade priced at/under this size); analysis needs every cell > 0."
-                Exit Function     ' returns False -> orchestrator reports + leaves Stages 1-3 saved
-            End If
-        Next j
-    Next i
+    ' ---- explicit Matrix-validity guard: Stage 4 must never silently no-op ----
+    Dim reason As String
+    If Not pl_Stage4MatrixValid(mtx, reason) Then
+        pl_Stage4Fail log, reason
+        Exit Function
+    End If
 
     pl_Status "Stage 4: ranking " & n & " substations"
     Dim thr As Variant: thr = GetThresholds()
@@ -1603,15 +1616,76 @@ Private Function pl_RunAnalysisAndScoring(ByVal wsMatrix As Worksheet, ByRef log
     BuildChart wsOut, mw, costM, n, m, srcMWRow, srcFirstDataRow, _
                hlpMWCol, hlpFirstThreshCol, hlpFirstRow, hlpRows
 
+    ' confirm the analysis sheet was created and populated
+    Dim outRows As Long: outRows = pl_SheetDataRows(wsOut)
     pl_LogAdd log, "STAGE 4 -- Cost Curve Analysis (" & wsOut.Name & "): " & n & _
-                   " substation(s), " & m & " MW; weighted-score ceiling 165, $B$2=" & PL_WEIGHT_B2 & _
+                   " substation(s) analysed, sheet data rows=" & outRows & ", " & m & _
+                   " MW; weighted-score ceiling 165, $B$2=" & PL_WEIGHT_B2 & _
                    "; " & IIf(USE_LIVE_FORMULAS, "live formulas", "values") & "."
+    If outRows < 1 Then
+        pl_Stage4Fail log, "Cost Curve Analysis sheet is empty after the write"
+        Exit Function
+    End If
     pl_RunAnalysisAndScoring = True
     Exit Function
 
 ErrHandler:
-    pl_LogAdd log, "Stage 4 error #" & Err.Number & ": " & Err.Description
-    pl_RunAnalysisAndScoring = False     ' orchestrator's StageFailed reports + leaves 1-3 saved
+    ' Any Stage-4 runtime error is made visible (log + MsgBox), never swallowed.
+    pl_Stage4Fail log, "runtime error in " & Err.Source & " #" & Err.Number & " (" & Err.Description & ")"
+    pl_RunAnalysisAndScoring = False
+End Function
+
+' Logs a Stage-4 failure reason to _Pipeline Log and shows a specific MsgBox --
+' a Stage-4 problem must be visible, not a silent no-op.
+Private Sub pl_Stage4Fail(ByRef log As PL_TLog, ByVal reason As String)
+    pl_LogAdd log, "STAGE 4 FAILED (pl_RunAnalysisAndScoring): " & reason
+    MsgBox "Stage 4 cannot run: " & reason & "." & vbCrLf & vbCrLf & _
+           "Stages 1-3 remain saved. See " & PL_SH_LOG & "; fix and re-run.", _
+           vbExclamation, "Interconnect Pipeline"
+End Sub
+
+' Pure Matrix-validity check for Stage 4 (no side effects, so it is unit
+' testable): >=1 substation row, >=3 numeric strictly-ascending MW columns, and
+' every body cell present and > 0. Returns False with a specific reason.
+Private Function pl_Stage4MatrixValid(ByRef mtx As PL_TMatrix, ByRef reason As String) As Boolean
+    pl_Stage4MatrixValid = False
+    reason = ""
+    If Not mtx.ok Then
+        reason = "Matrix was not built (mtx.ok = False)"
+        Exit Function
+    End If
+    If mtx.matchedCount < 1 Then
+        reason = "Matrix has 0 valid substation rows"
+        Exit Function
+    End If
+    If mtx.mwCount < 3 Then
+        reason = "Matrix has fewer than 3 MW columns (" & mtx.mwCount & ")"
+        Exit Function
+    End If
+    Dim jj As Long
+    For jj = 1 To mtx.mwCount
+        If mtx.mw(jj) <= 0 Then
+            reason = "Matrix MW header value at position " & jj & " is not positive"
+            Exit Function
+        End If
+        If jj > 1 Then
+            If mtx.mw(jj) <= mtx.mw(jj - 1) Then
+                reason = "Matrix MW header is not strictly ascending at position " & jj
+                Exit Function
+            End If
+        End If
+    Next jj
+    Dim i As Long, j As Long
+    For i = 1 To mtx.matchedCount
+        For j = 1 To mtx.mwCount
+            If mtx.costM(i, j) <= 0 Then
+                reason = "non-positive cost at '" & mtx.names(i) & "', MW " & mtx.mw(j) & _
+                         " (no upgrade priced at/under this size; analysis needs every cell > 0)"
+                Exit Function
+            End If
+        Next j
+    Next i
+    pl_Stage4MatrixValid = True
 End Function
 
 '--------------------------------------------------------------------------
@@ -1979,91 +2053,155 @@ End Function
 
 Private Sub pl_ParseTab(ByVal rawName As String, ByRef outName As String, _
                         ByRef outVoltage As Double, ByRef outParsed As Boolean)
-    Dim work As String, i As Long, nlen As Long, ch As String
-    Dim tokStart As Long, tokEnd As Long, token As String
-    Dim bestStart As Long, bestEnd As Long, bestVal As Double, found As Boolean
-    outParsed = False: outVoltage = 0
-    work = Trim$(rawName): nlen = Len(work): found = False: i = 1
-    Do While i <= nlen
-        ch = Mid$(work, i, 1)
-        If pl_IsDigitOrDot(ch) Then
-            tokStart = i
-            Do While i <= nlen And pl_IsDigitOrDot(Mid$(work, i, 1))
-                i = i + 1
-            Loop
-            tokEnd = i - 1
-            token = Mid$(work, tokStart, tokEnd - tokStart + 1)
-            If pl_IsPlausibleVoltage(token) Then
-                bestStart = tokStart: bestEnd = tokEnd: bestVal = CDbl(token): found = True
-            End If
-        Else
-            i = i + 1
-        End If
-    Loop
-    If Not found Then
-        outName = pl_CollapseName(work)
-        If Len(outName) = 0 Then outName = work
-        Exit Sub
+    ' Parse a messy cost-sheet tab name into (clean name, voltage), precedence:
+    '   1. strip a trailing standalone integer (a duplicate-file counter):
+    '      "Cecelia 138kV 1" / "... 2" both lose the 1/2.
+    '   2. extract voltage tolerantly: a number, then optional punctuation/
+    '      spaces, then "kV" (case-insensitive): 138kV / 230 kV / 230. kV ->
+    '      the numeric value.
+    '   3. clean name = the remainder with the voltage+counter removed, nbsp
+    '      and multiple spaces collapsed to one, trimmed.
+    ' Examples: "Cecelia 138kV 1"->("Cecelia",138); "Chalkley 230. kV"->
+    ' ("Chalkley",230); "Cunningham"->("Cunningham", blank).
+    outParsed = False: outVoltage = 0: outName = ""
+
+    Dim work As String
+    work = pl_NormSpaces(rawName)
+    work = pl_StripTrailingCounter(work)
+
+    Dim vFound As Boolean, vVal As Double, vStart As Long, vEnd As Long
+    pl_ExtractVoltage work, vFound, vVal, vStart, vEnd
+    If vFound Then
+        outVoltage = vVal
+        outParsed = True
+        outName = pl_NormSpaces(Left$(work, vStart - 1) & " " & Mid$(work, vEnd + 1))
+    Else
+        outName = pl_NormSpaces(work)
     End If
-    outVoltage = bestVal: outParsed = True
-    Dim remainder As String
-    remainder = Left$(work, bestStart - 1) & " " & pl_StripKv(Mid$(work, bestEnd + 1))
-    outName = pl_CollapseName(remainder)
+
+    If Len(outName) = 0 Then outName = pl_NormSpaces(work)
+    If Len(outName) = 0 Then outName = Trim$(rawName)
     If Len(outName) = 0 Then outName = "(unnamed)"
 End Sub
 
+' Collapse nbsp/tabs/whitespace runs to single spaces and trim (no case change,
+' punctuation preserved so names still match the site side).
+Private Function pl_NormSpaces(ByVal s As String) As String
+    Dim t As String
+    t = Replace(s, Chr$(160), " ")
+    t = Replace(t, vbTab, " ")
+    t = Replace(t, vbCr, " ")
+    t = Replace(t, vbLf, " ")
+    Do While InStr(t, "  ") > 0
+        t = Replace(t, "  ", " ")
+    Loop
+    pl_NormSpaces = Trim$(t)
+End Function
+
+' Remove a single trailing space-delimited all-digits token (the duplicate-file
+' counter). Never strips a number that is attached to text (e.g. 138kV).
+Private Function pl_StripTrailingCounter(ByVal work As String) As String
+    Dim p As Long
+    p = InStrRev(work, " ")
+    If p > 0 Then
+        Dim tail As String
+        tail = Mid$(work, p + 1)
+        If pl_IsAllDigits(tail) Then
+            pl_StripTrailingCounter = Trim$(Left$(work, p - 1))
+            Exit Function
+        End If
+    End If
+    pl_StripTrailingCounter = work
+End Function
+
+' Find a voltage: a numeric run, then separators, then "kV". Sets found/value
+' and the [startPos..endPos] span (numeric start .. the "V" of kV) to remove.
+Private Sub pl_ExtractVoltage(ByVal work As String, ByRef found As Boolean, _
+                              ByRef val As Double, ByRef startPos As Long, ByRef endPos As Long)
+    found = False
+    Dim lw As String: lw = LCase$(work)
+    Dim kpos As Long: kpos = InStr(1, lw, "kv")
+    Do While kpos > 0
+        ' the char after "kV" must not be a letter (avoid kVA, names like Skvortsov are handled by the digit test)
+        Dim okBoundary As Boolean
+        okBoundary = (kpos + 2 > Len(work))
+        If Not okBoundary Then okBoundary = Not pl_IsAlpha(Mid$(work, kpos + 2, 1))
+        If okBoundary Then
+            Dim j As Long: j = kpos - 1
+            Do While j >= 1
+                Dim c As String: c = Mid$(work, j, 1)
+                If c = " " Or c = "." Or c = "," Or c = "-" Or c = Chr$(160) Or c = vbTab Then
+                    j = j - 1
+                Else
+                    Exit Do
+                End If
+            Loop
+            If j >= 1 Then
+                If pl_IsDigitOrDot(Mid$(work, j, 1)) Then
+                    Dim numEnd As Long: numEnd = j
+                    Do While j >= 1
+                        If pl_IsDigitOrDot(Mid$(work, j, 1)) Then
+                            j = j - 1
+                        Else
+                            Exit Do
+                        End If
+                    Loop
+                    Dim numStart As Long: numStart = j + 1
+                    Dim cleaned As String
+                    cleaned = pl_CleanNumber(Mid$(work, numStart, numEnd - numStart + 1))
+                    If Len(cleaned) > 0 Then
+                        If IsNumeric(cleaned) Then
+                            Dim v As Double: v = CDbl(cleaned)
+                            If v > 0 And v <= 2000 Then
+                                found = True: val = v: startPos = numStart: endPos = kpos + 1
+                                Exit Sub
+                            End If
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        kpos = InStr(kpos + 1, lw, "kv")
+    Loop
+End Sub
+
+' Clean a numeric token: drop leading/trailing dots and spaces (e.g. "230." ->
+' "230"); keeps an internal decimal point.
+Private Function pl_CleanNumber(ByVal s As String) As String
+    Dim t As String: t = Replace(s, " ", "")
+    Do While Len(t) > 0
+        If Right$(t, 1) = "." Then
+            t = Left$(t, Len(t) - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+    Do While Len(t) > 0
+        If Left$(t, 1) = "." Then
+            t = Mid$(t, 2)
+        Else
+            Exit Do
+        End If
+    Loop
+    pl_CleanNumber = t
+End Function
+
+Private Function pl_IsAllDigits(ByVal s As String) As Boolean
+    Dim i As Long
+    If Len(s) = 0 Then Exit Function
+    For i = 1 To Len(s)
+        If Mid$(s, i, 1) < "0" Or Mid$(s, i, 1) > "9" Then Exit Function
+    Next i
+    pl_IsAllDigits = True
+End Function
+
+Private Function pl_IsAlpha(ByVal ch As String) As Boolean
+    Dim u As String: u = UCase$(ch)
+    pl_IsAlpha = (u >= "A" And u <= "Z")
+End Function
+
 Private Function pl_IsDigitOrDot(ByVal ch As String) As Boolean
     pl_IsDigitOrDot = (ch >= "0" And ch <= "9") Or (ch = ".")
-End Function
-
-Private Function pl_IsPlausibleVoltage(ByVal token As String) As Boolean
-    Dim v As Double
-    pl_IsPlausibleVoltage = False
-    If Len(token) = 0 Then Exit Function
-    If Left$(token, 1) = "." Or Right$(token, 1) = "." Then Exit Function
-    If InStr(token, ".") <> InStrRev(token, ".") Then Exit Function
-    If Not IsNumeric(token) Then Exit Function
-    v = CDbl(token)
-    If v > 0 And v <= 2000 Then pl_IsPlausibleVoltage = True
-End Function
-
-Private Function pl_StripKv(ByVal s As String) As String
-    Dim t As String, j As Long
-    t = s: j = 1
-    Do While j <= Len(t) And pl_IsSeparator(Mid$(t, j, 1))
-        j = j + 1
-    Loop
-    t = Mid$(t, j)
-    If Len(t) >= 2 Then
-        If StrComp(Left$(t, 2), "kV", vbTextCompare) = 0 Then t = Mid$(t, 3)
-    End If
-    pl_StripKv = t
-End Function
-
-Private Function pl_IsSeparator(ByVal ch As String) As Boolean
-    Select Case ch
-        Case " ", "_", "-", "(", ")", ",", ".", vbTab
-            pl_IsSeparator = True
-        Case Else
-            pl_IsSeparator = False
-    End Select
-End Function
-
-Private Function pl_CollapseName(ByVal s As String) As String
-    Dim i As Long, ch As String, sb As String, lastSpace As Boolean
-    lastSpace = True
-    For i = 1 To Len(s)
-        ch = Mid$(s, i, 1)
-        If pl_IsSeparator(ch) Then
-            If Not lastSpace Then
-                sb = sb & " "
-                lastSpace = True
-            End If
-        Else
-            sb = sb & ch: lastSpace = False
-        End If
-    Next i
-    pl_CollapseName = Trim$(sb)
 End Function
 
 ' ==========================================================================
@@ -2310,14 +2448,27 @@ End Sub
 Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Long)
     Debug.Print "--- front-half / scaling tests ---"
 
-    ' 1) Tab-name parsing
+    ' 1) Tab-name parsing (strip trailing counter; tolerant kV; clean name)
     Dim nm As String, v As Double, p As Boolean
-    pl_ParseTab "Chaves County 345", nm, v, p
-    Assert (nm = "Chaves County") And p And (v = 345), _
-           "Tab parse: 'Chaves County 345' -> ('Chaves County', 345)", passCount, failCount
+    pl_ParseTab "Cecelia 138kV 1", nm, v, p
+    Assert (nm = "Cecelia") And p And (v = 138), _
+           "Tab parse: 'Cecelia 138kV 1' -> ('Cecelia', 138)", passCount, failCount
+    pl_ParseTab "Cecelia 138kV 2", nm, v, p
+    Assert (nm = "Cecelia") And p And (v = 138), _
+           "Tab parse: 'Cecelia 138kV 2' -> ('Cecelia', 138)", passCount, failCount
+    pl_ParseTab "Chalkley 230. kV", nm, v, p
+    Assert (nm = "Chalkley") And p And (v = 230), _
+           "Tab parse: 'Chalkley 230. kV' -> ('Chalkley', 230)", passCount, failCount
     pl_ParseTab "Cunningham", nm, v, p
     Assert (nm = "Cunningham") And (Not p), _
            "Tab parse: 'Cunningham' -> ('Cunningham', blank)", passCount, failCount
+
+    ' Two Cecelia tabs differing only by counter share one cost identity key.
+    Dim n1 As String, v1 As Double, p1 As Boolean, n2 As String, v2 As Double, p2 As Boolean
+    pl_ParseTab "Cecelia 138kV 1", n1, v1, p1
+    pl_ParseTab "Cecelia 138kV 2", n2, v2, p2
+    Assert pl_CostKey(n1, v1, p1) = pl_CostKey(n2, v2, p2), _
+           "Dedupe: the two Cecelia tabs collapse to one cost identity key", passCount, failCount
 
     ' 2) Triple dedupe (dictionary)
     Dim rn() As String, rst() As String, rv() As Double, rp() As Boolean, rf() As String, rr() As Long
@@ -2359,6 +2510,30 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' one substation, tiers T=100 at 100+, T=200 at 200+  => cost(100)=1.0MM etc.
     ' cumulative alloc: trig 100 alloc 100; trig 200 alloc 100.
     Assert pl_PiecewiseCost(100, 100) = 1, "Matrix value: cost at 100 = T/MW", passCount, failCount
+    ' body defaults to live SUMIFS formulas, resolved by header name + MW cell
+    Assert USE_LIVE_SUMIFS = True, "Matrix: USE_LIVE_SUMIFS defaults to True (formulas)", passCount, failCount
+    Dim fSum As String
+    fSum = pl_SumifsFormula("Cost Data", 8, 5, 6, 7, "Cecelia", True, 138, "D$1", 2, 100)
+    Assert (Left$(fSum, 8) = "=SUMIFS(") And (InStr(fSum, "D$1") > 0) And (InStr(fSum, "138") > 0), _
+           "Matrix: body cell is a bounded SUMIFS formula keyed to the MW cell", passCount, failCount
+
+    ' 4b) Stage-4 Matrix-validity guard is explicit, never a silent no-op
+    Dim gm As PL_TMatrix, rsn As String, gi As Long, gj As Long
+    gm.ok = True: gm.matchedCount = 2: gm.mwCount = 3
+    ReDim gm.mw(1 To 3): gm.mw(1) = 100: gm.mw(2) = 110: gm.mw(3) = 120
+    ReDim gm.names(1 To 2): gm.names(1) = "A": gm.names(2) = "B"
+    ReDim gm.costM(1 To 2, 1 To 3)
+    For gi = 1 To 2
+        For gj = 1 To 3
+            gm.costM(gi, gj) = 1000
+        Next gj
+    Next gi
+    Assert pl_Stage4MatrixValid(gm, rsn), "Stage 4 guard: a valid matrix passes", passCount, failCount
+    Dim em As PL_TMatrix
+    em.ok = True: em.matchedCount = 0: em.mwCount = 3
+    ReDim em.mw(1 To 3): em.mw(1) = 100: em.mw(2) = 110: em.mw(3) = 120
+    Assert (Not pl_Stage4MatrixValid(em, rsn)) And (InStr(rsn, "0 valid substation rows") > 0), _
+           "Stage 4 guard: an emptied matrix stops with the explicit message", passCount, failCount
 
     ' 5) Scoring ceiling + $25MM band all-zero on the fixture
     Assert CLng(pl_ScoreCeiling(4)) = 165, "Scoring: weighted-score maximum is 165", passCount, failCount

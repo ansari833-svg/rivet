@@ -31,28 +31,54 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
 
 1. **Cost / results files → `Cost Data`.** Multi-select the cost workbooks
    (picker rooted at `ThisWorkbook.Path`, falling back to
-   `Application.DefaultFilePath`). Sheet 3 carries the data; the substation name
-   is parsed from its **tab name** (last plausible numeric token = voltage, the
-   rest = name; bare tab = name only). **The header row is detected, not
-   assumed:** source sheets carry a *band* row above the real header (e.g.
-   `Monitored Element` / `Worst Case Contingency` / `Cost Allocation`), so the
-   tool scans the first rows and picks the header as the first row that
-   *contains* the field names `Size Overload Occurs (MW)` **and**
-   `Proposed Project Allocation ($)` (whitespace/case-normalized); data starts
-   the row **after** it. The output header is written **once** (the metadata
-   prefix `Substation Name | Voltage (kV) | Source File | Source Sheet`, then
-   the detected source header verbatim); from each source only the **data
-   rows** (below the detected header) are appended. Blank rows and any row that
-   re-states the header signature are skipped, so `Cost Data` never accumulates
-   the band row or stray header rows that would corrupt the downstream
-   `MINIFS`/`SUMIFS`/grouping scans.
+   `Application.DefaultFilePath`). Sheet 3 carries the data. The substation name
+   is **parsed from the (messy) tab name into clean `(name, voltage)`**, in this
+   precedence: (a) strip a trailing standalone integer — a duplicate-file
+   counter — so `Cecelia 138kV 1` and `Cecelia 138kV 2` both lose the `1`/`2`;
+   (b) extract voltage tolerantly — a number, then optional punctuation/spaces,
+   then `kV` (case-insensitive): `138kV`, `230 kV`, `230. kV` → `138`/`230`;
+   (c) clean name = the remainder with nbsp/multiple spaces collapsed to one,
+   trimmed. So `Cecelia 138kV 1` → (`Cecelia`, 138), `Chalkley 230. kV` →
+   (`Chalkley`, 230), bare `Cunningham` → (`Cunningham`, blank). Voltage is
+   recognised **only** with a `kV` marker; a bare trailing integer is always a
+   counter. Name / voltage / state are stored as **separate fields** everywhere
+   — the concatenated string is never used as identity.
+   **The header row is detected, not assumed:** source sheets carry a *band* row
+   above the real header (e.g. `Monitored Element` / `Worst Case Contingency` /
+   `Cost Allocation`), so the tool scans the first rows and picks the header as
+   the first row that *contains* the field names `Size Overload Occurs (MW)`
+   **and** `Proposed Project Allocation ($)` (whitespace/case-normalized); data
+   starts the row **after** it. The output header is written **once** (the
+   metadata prefix `Substation Name | Voltage (kV) | Source File | Source Sheet`,
+   then the detected source header verbatim); from each source only the **data
+   rows** are appended, with blank rows and any header-signature row skipped.
 2. **Site files → `Site Data`.** From each `Summary` tab (name = A, state = C,
    voltage = G, header on row 1, **data row 2 down**, a header-matching row
-   skipped), de-duplicated on the full **(name, voltage, state) triple** (a
-   different voltage or state is a different substation).
+   skipped), de-duplicated on the full **(name, voltage, state) triple** built
+   from the parsed fields — key `LCase(name)|voltageNumeric|LCase(state)`. With
+   the counter stripped and voltage parsed, `Cecelia 138kV 1` and
+   `Cecelia 138kV 2` (same state, 138 kV) produce the same key and collapse to
+   one entry; a different *real* voltage or state stays separate. First
+   occurrence kept, drops logged.
 3. **Join → `Matrix`.** Intersection only, matched by name (plus voltage when
-   the cost tab carried one). Cost-per-MW per (substation, MW).
+   the cost tab carried one). The `Matrix` identity is **three separate
+   columns** — `Substation` (clean name), `Voltage (kV)`, `State` — followed by
+   the MW × cost body (never a concatenated `Chalkley 230. kV (Louisiana)`
+   label). The body is **live `SUMIFS` by default** (`USE_LIVE_SUMIFS = True`):
+   each cell is a bounded `SUMIFS` over `Cost Data` — resolving
+   `Proposed Project Allocation ($)`, `Substation Name`,
+   `Size Overload Occurs (MW)` (and `Voltage (kV)` for multi-voltage) by
+   normalized header name, matched to that row's parsed name (+ voltage), with
+   MW taken from the header cell so the formula re-drives if the header changes.
+   Ranges are bound to used rows, never whole columns.
 4. **Analysis + ranking + weighted scoring + headroom → `Cost Curve Analysis`.**
+   Before Stage 4 runs, the Matrix is validated (≥1 substation row, ≥3 numeric
+   strictly-ascending MW columns, every body cell present and > 0); if it is not
+   valid the run **stops with a specific message** (e.g. *“Stage 4 cannot run:
+   Matrix has 0 valid substation rows”*) rather than a silent no-op. Any Stage-4
+   runtime error is written to `_Pipeline Log` (routine, `Err.Number`,
+   `Err.Description`, offending substation/MW when known) **and** shown in a
+   `MsgBox`; on success the analysis sheet's row count is logged.
 
 Also produced: a run log **`_Pipeline Log`** (per-file status, dropped
 duplicate triples, join alignment errors) and a **`_Pipeline State`** checkpoint
@@ -147,14 +173,14 @@ end** (no intermediate recalcs; the chart is built after it).
 Every sheet write is a single `Range.Value`/`Range.Formula = array` per block;
 number formats are applied per column once after the values land.
 
-### Two switches (both default `False` = computed values)
+### Two switches
 
-- **`USE_LIVE_SUMIFS`** — `True` makes Stage 4 write live `SUMIFS` bound to the
-  used rows (`$D$2:$D$<last>`, never whole-column `$D:$D`). `False` writes a
-  values block.
-- **`USE_LIVE_FORMULAS`** — `True` makes the Stage 6/7 percentiles, Weighted
-  Score and Headroom live formulas over **bounded** population ranges. `False`
-  writes computed value blocks.
+- **`USE_LIVE_SUMIFS`** — **default `True`**: the Matrix body is live `SUMIFS`
+  bound to the used rows (`$D$2:$D$<last>`, never whole-column `$D:$D`). `False`
+  writes a values block.
+- **`USE_LIVE_FORMULAS`** — default `False` (computed value blocks): `True`
+  makes the Stage 6/7 percentiles, Weighted Score and Headroom live formulas
+  over **bounded** population ranges.
 
 **Parity guarantee.** The values path and the live-formula path produce the
 same numbers. The VBA implements `PERCENTRANK.EXC` exactly (first-occurrence
@@ -217,7 +243,13 @@ Score**, and the composite maximum stays 165.
 - **Header detection** — a scratch sheet with a band row above the field-name
   header asserts `pl_DetectHeaderRow` picks the field-name row (row 2), not the
   band row (row 1), with a whitespace/case-normalized match.
-- **Tab parsing, matrix shape, headroom, and the 165 ceiling.**
+- **Tab parsing** — `Cecelia 138kV 1` → (`Cecelia`, 138), `Cecelia 138kV 2` →
+  (`Cecelia`, 138), `Chalkley 230. kV` → (`Chalkley`, 230), `Cunningham` →
+  (`Cunningham`, blank); the two Cecelia tabs share one cost-identity key.
+- **Matrix** — MW axis 100…300; body is a bounded `SUMIFS` formula
+  (`USE_LIVE_SUMIFS` defaults True); `pl_Stage4MatrixValid` passes a good matrix
+  and stops an emptied one with the explicit *“0 valid substation rows”* reason.
+- **Matrix shape, headroom, and the 165 ceiling.**
 
 Results print to the Immediate window (**Ctrl+G**). `SelfTest` also prints a
 reminder to run **Debug → Compile VBAProject** (the one check that can only be
