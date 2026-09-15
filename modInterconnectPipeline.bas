@@ -132,6 +132,7 @@ Private Const PL_SH_MATRIX   As String = "Matrix"
 Private Const PL_SH_ANALYSIS As String = "Cost Curve Analysis"
 Private Const PL_SH_LOG      As String = "_Pipeline Log"
 Private Const PL_SH_STATE    As String = "_Pipeline State"
+Private Const PL_SH_SKIPPED  As String = "_Skipped Files"   ' durable skip/fail record
 
 ' Stage identifiers, in completion order. COST and SITE open source files and
 ' must never be repeated on a resume; MATRIX and ANALYSIS recompute cheaply
@@ -174,6 +175,12 @@ Private Const PL_MAX_PCTILE As Long = 5
 ' finished workbook holds values, not thousands of volatile array formulas.
 Private Const USE_LIVE_SUMIFS   As Boolean = True    ' Stage 4 matrix (default: live formulas)
 Private Const USE_LIVE_FORMULAS As Boolean = False   ' Stage 6/7 pctiles/score/headroom
+
+' Optional external copy of the run log: when True, pl_WriteLog also writes the
+' log lines to "<workbook base>_PipelineLog.txt" beside the saved workbook, so a
+' run's transcript survives independent of any tab deletion. Best-effort: an
+' unwritable path is ignored, never fatal. Requires the workbook to be saved.
+Private Const WRITE_LOG_TO_FILE As Boolean = False
 
 Private Const PL_EXCEL_MAX_ROWS   As Long = 1048576
 Private Const PL_EXCEL_MAX_TAB    As Long = 31
@@ -412,7 +419,7 @@ Public Sub RunInterconnectPipeline()
            ", " & IIf(USE_LIVE_SUMIFS, "live SUMIFS", "values") & ")" & vbCrLf & _
            "Analysis:   written (" & IIf(USE_LIVE_FORMULAS, "live formulas", "values") & ")" & vbCrLf & _
            "Saved to:   " & IIf(Len(ThisWorkbook.Path) > 0, ThisWorkbook.Name, "(unsaved)") & vbCrLf & _
-           "Run log:    " & PL_SH_LOG, _
+           "Run log:    " & PL_SH_LOG & "  (deletable -- regenerate with RebuildAudit)", _
            vbInformation, "Interconnect Pipeline"
     GoTo Cleanup
 
@@ -451,6 +458,144 @@ ErrHandler:
            "Fix and re-run -- it will resume.", vbCritical, "Interconnect Pipeline"
     Resume Cleanup
 End Sub
+
+' ==========================================================================
+'  REBUILD AUDIT  (regenerate the diagnostic summary from the output sheets)
+' ==========================================================================
+'   The _Pipeline Log is a run transcript; deleting it must not force an
+'   (expensive) re-run. Every fact the audit needs is persisted: Cost Data
+'   retains per-row Source File / Source Sheet provenance, and skipped/failed
+'   files (which leave no Cost Data rows) are recorded in _Skipped Files. This
+'   routine recomputes the summary + reconciliation from those sheets alone, so
+'   it is safe to call any time -- including after _Pipeline Log is deleted --
+'   without re-opening a single source workbook.
+Public Sub RebuildAudit()
+    Dim log As PL_TLog: pl_LogInit log
+    Dim wsCost As Worksheet: Set wsCost = pl_SheetByName(PL_SH_COST)
+    Dim wsSk As Worksheet: Set wsSk = pl_SheetByName(PL_SH_SKIPPED)
+    Dim dSubs As Long, fContrib As Long, coll As Long, sf As Long
+    Dim ok As Boolean
+    ok = pl_ComputeAudit(wsCost, wsSk, log, dSubs, fContrib, coll, sf)
+    pl_WriteLog log
+    If ok Then
+        MsgBox "Audit rebuilt from sheets (no consolidation re-run):" & vbCrLf & vbCrLf & _
+               "Distinct substations:        " & dSubs & vbCrLf & _
+               "Contributing source files:   " & fContrib & vbCrLf & _
+               "Substations from >1 file:     " & coll & vbCrLf & _
+               "Skipped/failed files:        " & sf & vbCrLf & vbCrLf & _
+               "Files seen (" & (fContrib + sf) & ") = distinct (" & dSubs & ") + collapsed (" & _
+               (fContrib - dSubs) & ") + skipped/failed (" & sf & ")." & vbCrLf & vbCrLf & _
+               "Full reconciliation written to " & PL_SH_LOG & ".", _
+               vbInformation, "Rebuild Audit"
+    Else
+        MsgBox "Could not rebuild the audit: '" & PL_SH_COST & "' is missing or lacks the " & _
+               "'Source File' provenance column. Run the pipeline (Stage 1) first.", _
+               vbExclamation, "Rebuild Audit"
+    End If
+End Sub
+
+' Computes the audit summary from the persisted sheets and appends the summary +
+' reconciliation lines to `log`. wsCost is required; wsSkipped may be Nothing.
+' Returns the key counts by ref so callers (and the self-test) can assert them.
+Private Function pl_ComputeAudit(ByVal wsCost As Worksheet, ByVal wsSkipped As Worksheet, _
+                                 ByRef log As PL_TLog, ByRef distinctSubs As Long, _
+                                 ByRef filesContributing As Long, ByRef collapseCount As Long, _
+                                 ByRef skippedFailed As Long) As Boolean
+    pl_ComputeAudit = False
+    distinctSubs = 0: filesContributing = 0: collapseCount = 0: skippedFailed = 0
+    If wsCost Is Nothing Then
+        pl_LogAdd log, "RebuildAudit: '" & PL_SH_COST & "' is not present -- cannot rebuild."
+        Exit Function
+    End If
+
+    Dim colName As Long, colVolt As Long, colSrc As Long
+    colName = pl_ResolveCol(wsCost, PL_HDR_NAME)
+    colVolt = pl_ResolveCol(wsCost, PL_HDR_VOLT)
+    colSrc = pl_ResolveCol(wsCost, "Source File")
+    If colName = 0 Or colSrc = 0 Then
+        pl_LogAdd log, "RebuildAudit: Cost Data is missing '" & PL_HDR_NAME & "' or 'Source File'."
+        Exit Function
+    End If
+
+    Dim lastRow As Long, lastCol As Long
+    lastRow = wsCost.Cells(wsCost.Rows.Count, colName).End(xlUp).Row
+    lastCol = wsCost.Cells(1, wsCost.Columns.Count).End(xlToLeft).Column
+    If lastRow < 2 Then
+        pl_LogAdd log, "RebuildAudit: Cost Data has no data rows."
+        Exit Function
+    End If
+    Dim cv As Variant
+    cv = wsCost.Range(wsCost.Cells(1, 1), wsCost.Cells(lastRow, lastCol)).Value
+
+    Dim dSub As Object: Set dSub = CreateObject("Scripting.Dictionary")
+    Dim dFile As Object: Set dFile = CreateObject("Scripting.Dictionary")
+    Dim dPair As Object: Set dPair = CreateObject("Scripting.Dictionary")
+    Dim dSubFiles As Object: Set dSubFiles = CreateObject("Scripting.Dictionary")
+
+    Dim r As Long
+    For r = 2 To lastRow
+        Dim nm As String: nm = Trim$(CStr(pl_NZ(cv(r, colName))))
+        If Len(nm) > 0 Then
+            Dim vp As Boolean, vv As Double
+            vp = False: vv = 0
+            If colVolt > 0 Then
+                If IsNumeric(cv(r, colVolt)) And Len(Trim$(CStr(pl_NZ(cv(r, colVolt))))) > 0 Then
+                    vv = CDbl(cv(r, colVolt)): vp = True
+                End If
+            End If
+            Dim idk As String: idk = pl_CostKey(nm, vv, vp)
+            If Not dSub.Exists(idk) Then dSub.Add idk, True
+
+            Dim fpath As String: fpath = LCase$(Trim$(CStr(pl_NZ(cv(r, colSrc)))))
+            If Len(fpath) > 0 Then
+                If Not dFile.Exists(fpath) Then dFile.Add fpath, True
+                Dim pk As String: pk = idk & "||" & fpath
+                If Not dPair.Exists(pk) Then
+                    dPair.Add pk, True
+                    If dSubFiles.Exists(idk) Then
+                        dSubFiles(idk) = dSubFiles(idk) + 1
+                    Else
+                        dSubFiles.Add idk, 1
+                    End If
+                End If
+            End If
+        End If
+    Next r
+
+    distinctSubs = dSub.Count
+    filesContributing = dPair.Count            ' each source file maps to one substation
+    Dim k As Variant
+    For Each k In dSubFiles.Keys
+        If dSubFiles(k) > 1 Then collapseCount = collapseCount + 1
+    Next k
+
+    If Not wsSkipped Is Nothing Then
+        Dim slr As Long: slr = wsSkipped.Cells(wsSkipped.Rows.Count, 1).End(xlUp).Row
+        If slr >= 2 Then skippedFailed = slr - 1
+    End If
+
+    Dim dupCollapsed As Long: dupCollapsed = filesContributing - distinctSubs
+    Dim filesSeen As Long: filesSeen = filesContributing + skippedFailed
+
+    pl_LogAdd log, "AUDIT REBUILT " & Format$(Now, "yyyy-mm-dd hh:nn:ss") & _
+                   " (regenerated from sheets; no consolidation re-run)."
+    pl_LogAdd log, "Cost Data: " & distinctSubs & " distinct substation(s) from " & _
+                   filesContributing & " contributing source file(s) (" & dFile.Count & " distinct file name(s))."
+    pl_LogAdd log, "Collapsed (>1 file -> 1 substation): " & collapseCount & _
+                   " substation(s), " & dupCollapsed & " extra file(s) merged."
+    Dim shown As Long: shown = 0
+    For Each k In dSubFiles.Keys
+        If dSubFiles(k) > 1 And shown < 8 Then
+            pl_LogAdd log, "  collapse: '" & CStr(k) & "' <- " & dSubFiles(k) & " files"
+            shown = shown + 1
+        End If
+    Next k
+    pl_LogAdd log, "Skipped/failed files (from " & PL_SH_SKIPPED & "): " & skippedFailed & "."
+    pl_LogAdd log, "Reconciliation: files seen (" & filesSeen & ") = distinct substations (" & _
+                   distinctSubs & ") + duplicate files collapsed (" & dupCollapsed & _
+                   ") + skipped/failed (" & skippedFailed & ")."
+    pl_ComputeAudit = True
+End Function
 
 ' ==========================================================================
 '  CHECKPOINT / RESUME / SAVE INFRASTRUCTURE
@@ -535,7 +680,7 @@ End Function
 ' already suppressed by the caller so Delete does not prompt.
 Private Sub pl_ClearOutputs()
     Dim nms As Variant, i As Long, ws As Worksheet
-    nms = Array(PL_SH_COST, PL_SH_SITE, PL_SH_MATRIX, PL_SH_ANALYSIS, PL_SH_STATE)
+    nms = Array(PL_SH_COST, PL_SH_SITE, PL_SH_MATRIX, PL_SH_ANALYSIS, PL_SH_STATE, PL_SH_SKIPPED)
     For i = LBound(nms) To UBound(nms)
         Set ws = pl_SheetByName(CStr(nms(i)))
         If Not ws Is Nothing Then ws.Delete
@@ -570,6 +715,47 @@ Private Sub pl_MarkStage(ByVal stage As Long, ByVal rows As Long)
     End If
     ws.Cells(1 + stage, 3).Value = rows
     ws.Cells(1 + stage, 4).Value = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+End Sub
+
+' ---- Durable skip/fail record (survives a _Pipeline Log deletion) -----------
+' A file that failed or was skipped left NO rows in Cost Data, so its outcome
+' cannot be reconstructed from the output sheets. Persist it here so RebuildAudit
+' can complete the reconciliation. Recreated fresh at the start of Stage 1.
+
+Private Function pl_ResetSkips() As Worksheet
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(PL_SH_SKIPPED)
+    If Not ws Is Nothing Then
+        ws.Cells.Clear
+    Else
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_SKIPPED
+    End If
+    ws.Range("A1:E1").Value = Array("Stage", "File", "Sheet", "Status", "Reason")
+    ws.Rows(1).Font.Bold = True
+    pl_ResetSkips = ws
+End Function
+
+' Appends one skip/fail row to _Skipped Files (created if absent). Never raises.
+Private Sub pl_AppendSkip(ByVal stage As String, ByVal file As String, _
+                          ByVal sheet As String, ByVal status As String, ByVal reason As String)
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(PL_SH_SKIPPED)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_SKIPPED
+        ws.Range("A1:E1").Value = Array("Stage", "File", "Sheet", "Status", "Reason")
+        ws.Rows(1).Font.Bold = True
+    End If
+    Dim nr As Long: nr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    If nr < 2 Then nr = 2
+    ws.Cells(nr, 1).Value = stage
+    ws.Cells(nr, 2).Value = file
+    ws.Cells(nr, 3).Value = sheet
+    ws.Cells(nr, 4).Value = status
+    ws.Cells(nr, 5).Value = reason
+    On Error GoTo 0
 End Sub
 
 ' Saves the workbook, prompting once for a location if the host has never been
@@ -713,6 +899,10 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
         Exit Function
     End If
 
+    ' Start a fresh durable skip/fail record for this run (Stage 1 always opens
+    ' the run; Stage 2 will append to it).
+    pl_ResetSkips
+
     Dim headerCols As Long: headerCols = recs(firstValid).UsedCols
     wsCost.Cells(1, 1).Value = PL_HDR_NAME
     wsCost.Cells(1, 2).Value = PL_HDR_VOLT
@@ -749,6 +939,21 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
                        IIf(Len(recs(i).Message) > 0, " -- " & recs(i).Message, "")
     Next i
     If hitLimit Then pl_LogAdd log, "  Worksheet row limit reached; import truncated."
+
+    ' Persist every skipped/failed cost file to _Skipped Files. These produced no
+    ' Cost Data rows, so their outcome is NOT reconstructable from the sheets --
+    ' this is what keeps RebuildAudit's reconciliation whole after a log deletion.
+    Dim skStatus As String
+    For i = 1 To fileCount
+        If (Not recs(i).IsValid) Or recs(i).RowsImported = 0 Then
+            If StrComp(recs(i).Status, "Imported", vbTextCompare) <> 0 Then
+                skStatus = recs(i).Status
+                If Len(skStatus) = 0 Then skStatus = "Empty (0 rows)"
+                pl_AppendSkip "1 Cost", pl_FileName(recs(i).FilePath), recs(i).SheetName, _
+                              skStatus, recs(i).Message
+            End If
+        End If
+    Next i
 
     pl_ConsolidateCost = (totalRows > 0)
     Exit Function
@@ -1078,6 +1283,7 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
     On Error GoTo Fail
     If ws Is Nothing Then
         pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- no '" & PL_SITE_TAB & "' tab"
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped", "no '" & PL_SITE_TAB & "' tab"
         wb.Close SaveChanges:=False: Exit Sub
     End If
 
@@ -1085,6 +1291,7 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
     lastRow = ur.Row + ur.Rows.Count - 1
     If lastRow <= PL_HDR_ROW Then
         pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- Summary has no data rows"
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped", "Summary has no data rows"
         wb.Close SaveChanges:=False: Exit Sub
     End If
 
@@ -1140,6 +1347,7 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
     Exit Sub
 Fail:
     pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- read error: " & Err.Description
+    pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Failed", "read error: " & Err.Description
     On Error Resume Next
     If Not wb Is Nothing Then wb.Close SaveChanges:=False
     On Error GoTo 0
@@ -2444,6 +2652,29 @@ Private Sub pl_WriteLog(ByRef log As PL_TLog)
         ws.Range(ws.Cells(2, 1), ws.Cells(1 + log.n, 1)).Value = blk
     End If
     ws.Columns(1).ColumnWidth = 120
+
+    If WRITE_LOG_TO_FILE Then pl_WriteLogFile log
+End Sub
+
+' Fix 4: optional external copy of the run log, beside the saved workbook, so the
+' transcript survives independent of the _Pipeline Log tab. Best-effort only.
+Private Sub pl_WriteLogFile(ByRef log As PL_TLog)
+    On Error Resume Next
+    If Len(ThisWorkbook.Path) = 0 Then Exit Sub      ' nowhere to write until saved
+    Dim base As String: base = ThisWorkbook.Name
+    Dim dot As Long: dot = InStrRev(base, ".")
+    If dot > 1 Then base = Left$(base, dot - 1)
+    Dim path As String
+    path = ThisWorkbook.Path & Application.PathSeparator & base & "_PipelineLog.txt"
+    Dim ff As Integer: ff = FreeFile
+    Open path For Output As #ff
+    Print #ff, "Interconnect Pipeline -- Run Log (" & Format$(Now, "yyyy-mm-dd hh:nn:ss") & ")"
+    Dim i As Long
+    For i = 1 To log.n
+        Print #ff, log.lines(i)
+    Next i
+    Close #ff
+    On Error GoTo 0
 End Sub
 
 ' ==========================================================================
@@ -2654,6 +2885,9 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 12) Matrix membership = all Cost Data subs; State is a left-join attachment
     pl_MatrixMembershipSelfTest passCount, failCount
 
+    ' 13) RebuildAudit regenerates the log/audit from sheets (no re-run)
+    pl_RebuildAuditSelfTest passCount, failCount
+
     Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
                 " errors (a compile break cannot be asserted from runtime)."
 End Sub
@@ -2800,6 +3034,65 @@ Fail:
     If Not wsC Is Nothing Then wsC.Delete
     Application.DisplayAlerts = True
     Assert False, "Matrix-membership self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+' RebuildAudit: the audit summary regenerates from the persisted sheets alone
+' (retained Source File provenance + the durable _Skipped Files record) with no
+' consolidation re-run -- so deleting _Pipeline Log costs nothing. Uses scratch
+' sheets standing in for Cost Data and _Skipped Files.
+Private Sub pl_RebuildAuditSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+
+    ' Cost Data with per-row Source File provenance: Cecelia consolidated from TWO
+    ' files (...1 and ...2), Marlin from one.
+    Dim wsC As Worksheet: Set wsC = ThisWorkbook.Worksheets.Add
+    wsC.Cells(1, 1).Value = PL_HDR_NAME
+    wsC.Cells(1, 2).Value = PL_HDR_VOLT
+    wsC.Cells(1, 3).Value = "Source File"
+    wsC.Cells(1, 4).Value = "Source Sheet"
+    wsC.Cells(1, 5).Value = PL_HDR_TRIGGER
+    wsC.Cells(1, 6).Value = PL_HDR_ALLOC
+    wsC.Cells(2, 1).Value = "Cecelia": wsC.Cells(2, 2).Value = 138: wsC.Cells(2, 3).Value = "Cecelia 138kV 1.xlsx": wsC.Cells(2, 4).Value = "Cecelia 138kV 1": wsC.Cells(2, 5).Value = 100: wsC.Cells(2, 6).Value = 5000000#
+    wsC.Cells(3, 1).Value = "Cecelia": wsC.Cells(3, 2).Value = 138: wsC.Cells(3, 3).Value = "Cecelia 138kV 2.xlsx": wsC.Cells(3, 4).Value = "Cecelia 138kV 2": wsC.Cells(3, 5).Value = 150: wsC.Cells(3, 6).Value = 3000000#
+    wsC.Cells(4, 1).Value = "Marlin": wsC.Cells(4, 2).Value = 230: wsC.Cells(4, 3).Value = "Marlin 230kV.xlsx": wsC.Cells(4, 4).Value = "Marlin 230kV": wsC.Cells(4, 5).Value = 120: wsC.Cells(4, 6).Value = 4000000#
+
+    ' Durable skip record: one file that FAILED and left no Cost Data rows.
+    Dim wsK As Worksheet: Set wsK = ThisWorkbook.Worksheets.Add
+    wsK.Range("A1:E1").Value = Array("Stage", "File", "Sheet", "Status", "Reason")
+    wsK.Cells(2, 1).Value = "1 Cost": wsK.Cells(2, 2).Value = "Broken.xlsx": wsK.Cells(2, 4).Value = "Failed": wsK.Cells(2, 5).Value = "Import error: unreadable"
+
+    ' Rebuild the audit from sheets only (as if _Pipeline Log had been deleted).
+    Dim log As PL_TLog: pl_LogInit log
+    Dim dS As Long, fC As Long, cc As Long, sf As Long
+    Dim okA As Boolean
+    okA = pl_ComputeAudit(wsC, wsK, log, dS, fC, cc, sf)
+    Assert okA, "RebuildAudit: computes from sheets, no consolidation re-run", passCount, failCount
+    Assert dS = 2, "RebuildAudit: 2 distinct substations (Cecelia + Marlin)", passCount, failCount
+    Assert fC = 3, "RebuildAudit: 3 contributing source files", passCount, failCount
+    Assert cc = 1, "RebuildAudit: Cecelia collapsed from >1 file (1/2)", passCount, failCount
+    Assert sf = 1, "RebuildAudit: 1 skipped/failed file from the persisted record", passCount, failCount
+    Assert (fC + sf) = (dS + (fC - dS) + sf), _
+           "RebuildAudit: reconciliation identity holds (4 = 2 + 1 + 1)", passCount, failCount
+
+    Dim hasRecon As Boolean: hasRecon = False
+    Dim ii As Long
+    For ii = 1 To log.n
+        If InStr(log.lines(ii), "Reconciliation: files seen (4)") > 0 Then hasRecon = True
+    Next ii
+    Assert hasRecon, "RebuildAudit: reconciliation line written to the rebuilt log", passCount, failCount
+
+    wsK.Delete
+    wsC.Delete
+    Application.DisplayAlerts = prevAlerts
+    Exit Sub
+Fail:
+    On Error Resume Next
+    If Not wsK Is Nothing Then wsK.Delete
+    If Not wsC Is Nothing Then wsC.Delete
+    Application.DisplayAlerts = True
+    Assert False, "Rebuild-audit self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' Fix 1 verification: given a file's rows-2-down block containing real data, a

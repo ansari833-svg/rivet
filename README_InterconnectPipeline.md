@@ -106,8 +106,9 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    up with **Headroom (MW)**, which equals the first trigger MW.
 
 Also produced: a run log **`_Pipeline Log`** (per-file status, dropped
-duplicate triples, join alignment errors) and a **`_Pipeline State`** checkpoint
-sheet (see below).
+duplicate triples, join alignment errors), a **`_Pipeline State`** checkpoint
+sheet, and a durable **`_Skipped Files`** record — the log is regenerable from
+the sheets via `RebuildAudit` (see below).
 
 ---
 
@@ -150,6 +151,41 @@ later stage had a typo. **Restart** clears the output sheets and `_Pipeline
 State`, then runs from Stage 1. Resume is the default. If no valid checkpoints
 exist, the run simply starts at Stage 1 with no prompt (and still creates
 `_Pipeline State` at the first checkpoint).
+
+## Regenerable audit (`RebuildAudit`)
+
+`_Pipeline Log` is a **run transcript** — deleting the tab must not force an
+(expensive) re-run to recover the diagnostics. Everything the audit needs is
+**persisted outside the log**, so the summary can be recomputed from the output
+sheets on demand:
+
+- **Per-row provenance is retained.** `Cost Data` keeps a **`Source File`** and
+  **`Source Sheet`** column on every row (columns C/D, ahead of the resolved
+  cost columns). With `Source File` present, the mapping of files → substations,
+  the collapse counts (which substations came from >1 file, e.g. the
+  `Cecelia …1` / `…2` merges), and the distinct total are all **derivable from
+  the sheet at any time** — no run history required. (The clean sheet already
+  carries this, so no separate raw sheet is needed.)
+- **Skips/fails are persisted durably.** A file that was unreadable, lacked its
+  data sheet, had no header, or an empty `Summary` leaves **no rows** in
+  `Cost Data`, so its outcome can’t be reconstructed from the output sheets.
+  These are written to a dedicated **`_Skipped Files`** sheet
+  (`Stage | File | Sheet | Status | Reason`) during Stages 1–2 — not only to the
+  deletable `_Pipeline Log` — so a log deletion never erases them.
+
+**`Public Sub RebuildAudit()`** regenerates the diagnostic summary from those
+sheets alone, callable any time (including after `_Pipeline Log` is deleted),
+**without re-running consolidation**. It recreates `_Pipeline Log` (fresh) and
+writes: total distinct substations in `Cost Data`; count of contributing source
+files; the files-per-substation collapse counts (with a few examples); and the
+reconciliation line — **files seen = distinct substations + duplicate files
+collapsed + skipped/failed**. That is the “why are there 2,090 files but ~1,600
+substations” answer, recovered with no re-run.
+
+**Optional external log copy.** With the constant `WRITE_LOG_TO_FILE = True`,
+`pl_WriteLog` also writes the run log to `<workbook base>_PipelineLog.txt` beside
+the saved workbook, so a run’s transcript survives independent of any tab
+deletion. Best-effort: an unwritable path is ignored, never fatal.
 
 **First save of a blank workbook.** If the host has never been saved (no path),
 the first checkpoint prompts once for a location, falling back to a timestamped
@@ -281,6 +317,13 @@ Score**, and the composite maximum stays 165.
 - **Matrix** — MW axis 100…300; body is a bounded `SUMIFS` formula
   (`USE_LIVE_SUMIFS` defaults True); `pl_Stage4MatrixValid` passes a good matrix
   and stops an emptied one with the explicit *“0 valid substation rows”* reason.
+- **Rebuild audit** — a scratch `Cost Data` (with `Cecelia` consolidated from
+  two files and a `Marlin` from one) and a `_Skipped Files` record with one
+  failed file: with `_Pipeline Log` gone, `RebuildAudit`’s computation
+  regenerates the summary from the sheets alone (2 distinct substations, 3
+  contributing files, 1 collapsed, 1 skipped/failed) and writes the
+  reconciliation *files seen (4) = distinct (2) + collapsed (1) + skipped (1)* —
+  with **no consolidation re-run**.
 - **Matrix shape, headroom, and the 165 ceiling.**
 
 Results print to the Immediate window (**Ctrl+G**). `SelfTest` also prints a
