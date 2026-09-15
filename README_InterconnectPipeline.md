@@ -59,14 +59,23 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    the counter stripped and voltage parsed, `Cecelia 138kV 1` and
    `Cecelia 138kV 2` (same state, 138 kV) produce the same key and collapse to
    one entry; a different *real* voltage or state stays separate. First
-   occurrence kept, drops logged.
-3. **Join → `Matrix`.** Intersection only, matched by name (plus voltage when
-   the cost tab carried one). The `Matrix` identity is **three separate
-   columns** — `Substation` (clean name), `Voltage (kV)`, `State` — followed by
-   the MW × cost body (never a concatenated `Chalkley 230. kV (Louisiana)`
-   label). The body is **live `SUMIFS` by default** (`USE_LIVE_SUMIFS = True`):
-   each cell is a bounded `SUMIFS` over `Cost Data` — resolving
-   `Proposed Project Allocation ($)`, `Substation Name`,
+   occurrence kept, drops logged. **This dedupe serves consolidation and the
+   State attachment only — it never decides which substations are analyzed.**
+3. **Matrix (all Cost Data substations) → `Matrix`.** Matrix rows are **every
+   distinct substation in `Cost Data` column A** (`Substation Name`, plus
+   `Voltage (kV)` where the cost tab carried one) — taken as-is from the cost
+   consolidation, which already cleans and de-duplicates them. **This is not an
+   intersection with the site data**: a substation present in `Cost Data` (e.g.
+   `Cecelia`) always gets a full row, even with no matching site entry.
+   `State` is a **LEFT JOIN** attached from `Site Data`: filled where the
+   substation matches (by name, plus voltage when carried), **left blank when
+   there is no match — never a reason to drop the row**. Site rows with no
+   Cost Data match are logged as informational only. The `Matrix` identity is
+   **three separate columns** — `Substation` (clean name), `Voltage (kV)`,
+   `State` — followed by the MW × cost body (never a concatenated
+   `Chalkley 230. kV (Louisiana)` label). The body is **live `SUMIFS` by
+   default** (`USE_LIVE_SUMIFS = True`): each cell is a bounded `SUMIFS` over
+   `Cost Data` — resolving `Proposed Project Allocation ($)`, `Substation Name`,
    `Size Overload Occurs (MW)` (and `Voltage (kV)` for multi-voltage) by
    normalized header name, matched to that row's parsed name (+ voltage), with
    MW taken from the header cell so the formula re-drives if the header changes.
@@ -180,7 +189,7 @@ end** (no intermediate recalcs; the chart is built after it).
 |-------|---------------------|-------|
 | 1 Consolidation | per-cell reads/writes | every workbook opened `UpdateLinks:=0, ReadOnly:=True, AddToMru:=False` and closed immediately; used range read in one `Range.Value`; output written one `Range.Value = array` per file; one `DoEvents` + status line per file; a locked file is logged and skipped, never aborting the batch |
 | 2 Dedupe | O(N²) pairwise compare | `Scripting.Dictionary` keyed on `LCase(name)|voltage|LCase(state)` — one O(N) pass |
-| 3 Join | rescans Cost Data per substation | one-pass dictionaries (identity key → id; name → records) resolved by O(1) lookup |
+| 3 Matrix membership + State join | rescans Cost Data per substation | one-pass dictionaries (identity key → id = all distinct Cost Data subs; name → records); `State` attached by O(1) left-join lookup, blank when unmatched |
 | 4 Matrix | 42,000 live `SUMIFS` | cost columns loaded once, grouped by name; each substation's trigger→allocation records scanned once to accumulate cumulative allocation `T` at each MW and divide by MW (the exact `SUMIFS` definition); written as one values block |
 | 5 Ranking | ~32M-op rank-by-scanning | stable **mergesort** once per column (O(N log N)), competition ranks assigned in one walk |
 | 6 Percentiles & score | ~22,000 volatile `PERCENTRANK.EXC`/`CEILING` | computed in VBA (`PERCENTRANK.EXC` implemented as `k/(N+1)`), written as value blocks |
@@ -243,9 +252,16 @@ Score**, and the composite maximum stays 165.
 - **Ranking** — sort-based competition ranks match the naive definition,
   including the ties (Cunningham/Hobbs, Pleasant Hill/Roosevelt, the 13-way
   \$100MM breadth tie) asserted on the 17-substation fixture.
-- **Dedupe/join** — dictionary results match the triple rule and the
-  intersection rule (name / name+voltage / bare; site-without-cost and
-  cost-without-site excluded and logged).
+- **Dedupe** — dictionary results match the triple rule (name / name+voltage /
+  bare); the (name, voltage, state) triple collapses correctly.
+- **Matrix membership + State left join** — a scratch `Cost Data` (with `Cecelia`
+  spread over two rows and a `Marlin` row) and a `Site Data` that has `Cecelia`
+  (Kentucky) but **no `Marlin`** assert: every distinct Cost Data substation
+  appears exactly once (Cecelia + Marlin), `Cecelia` gets its `State` from the
+  left join, `Marlin` still appears with a **blank `State`** (never dropped), the
+  identity is three separate columns (not concatenated), the body cells are live
+  `SUMIFS`, and Cecelia's curve sums **both** source rows above its second
+  trigger.
 - **Scale** — 2,000 synthetic substations are ranked and bucketed under a
   bounded wall-clock (mergesort, no O(N²) blow-up).
 - **Durability / resume** — simulates Stage 1 then Stage 2 completing and

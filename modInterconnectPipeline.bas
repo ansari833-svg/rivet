@@ -1178,18 +1178,22 @@ Private Function pl_DedupTriples(ByRef rawName() As String, ByRef rawVolt() As D
 End Function
 
 ' ==========================================================================
-'  STAGE 3 + 4a -- JOIN (dictionary) + MATRIX VALUES (in memory)
+'  STAGE 3 + 4a -- MATRIX MEMBERSHIP (all Cost Data subs) + State LEFT JOIN
 ' ==========================================================================
 
 '--------------------------------------------------------------------------
 ' pl_BuildMatrix
-'   Loads the four cost columns once, groups records by identity in a
-'   dictionary, resolves each Site Data triple by key lookup (intersection
-'   only), and computes each matched substation's cost-per-MW curve as the
-'   piecewise cumulative-allocation / MW -- the exact SUMIFS definition -- in
-'   one pass per substation. Writes the Matrix as a single block (values, or
-'   bounded live SUMIFS under USE_LIVE_SUMIFS) and returns everything Stage 4
-'   needs in `mtx`, so the sheet is never re-read.
+'   Loads the four cost columns once and groups records by identity in a
+'   dictionary. Matrix rows = EVERY distinct substation identity in Cost Data
+'   column A (name, + voltage where carried) -- NOT the cost/site intersection.
+'   Site Data is a LEFT JOIN used only to attach State: a substation present in
+'   Cost Data but absent from Site Data still gets a full row, with a blank
+'   State. Each row's cost-per-MW curve is the piecewise cumulative-allocation
+'   / MW -- the exact SUMIFS definition -- computed in one pass per substation.
+'   Writes the Matrix as a single block (three identity columns Substation |
+'   Voltage (kV) | State, then the MW x cost body; values, or bounded live
+'   SUMIFS under USE_LIVE_SUMIFS) and returns everything Stage 4 needs in `mtx`,
+'   so the sheet is never re-read.
 '--------------------------------------------------------------------------
 Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet, _
                                 ByVal wsSite As Worksheet, ByRef wsMatrix As Worksheet, _
@@ -1204,7 +1208,7 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     ' back to a full recompute + rewrite.
     Dim reuseVals As Boolean
     reuseVals = reuseExisting And (Not wsMatrix Is Nothing)
-    pl_Status "Stage 3: joining cost and site sets"
+    pl_Status "Stage 3: building matrix from all Cost Data substations (State left-joined)"
 
     Dim colName As Long, colVolt As Long, colTrig As Long, colAlloc As Long
     colName = pl_ResolveCol(wsCost, PL_HDR_NAME)
@@ -1231,8 +1235,9 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     cv = wsCost.Range(wsCost.Cells(1, 1), wsCost.Cells(lastCostRow, lastCol)).Value
 
     ' -- one pass over cost rows -->
-    '    dId   : identity key (name [+voltage]) -> id, for the JOIN and to carry
-    '            each matched row's exact criteria.
+    '    dId   : identity key (name [+voltage]) -> id. This is the set of matrix
+    '            rows: every distinct Cost Data substation, and the carrier of
+    '            each identity's exact criteria (also the key for the State join).
     '    dName : name(lower) -> Collection of Array(trig, alloc, vpFlag, volt),
     '            so the matrix/headroom sums apply the SAME criteria as the
     '            SUMIFS/MINIFS -- name+voltage for a voltage-bearing tab, name
@@ -1277,51 +1282,39 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
         Exit Function
     End If
 
-    ' -- site triples (bulk read) --
+    ' -- site triples (bulk read): used ONLY to attach State as a LEFT JOIN.
+    '    Site data never decides which substations appear -- every distinct
+    '    Cost Data identity gets a row whether or not a site entry exists.
+    '    An empty Site Data set is not an error: the run proceeds, State blank. --
     Dim st() As PL_TSiteTriple, stN As Long
     stN = pl_ReadSiteTriples(wsSite, st)
     If stN = 0 Then
-        pl_LogAdd log, "Step 3: no site triples."
-        Exit Function
+        pl_LogAdd log, "Step 3: Site Data has no rows; every Cost Data substation is " & _
+                       "still analyzed with a blank State."
     End If
 
-    ' -- join: intersection only --
-    Dim matchKey() As String: ReDim matchKey(1 To stN)
-    Dim matched As Long: matched = 0
-    Dim dMatched As Object: Set dMatched = CreateObject("Scripting.Dictionary")
+    ' -- left join: cost-identity key -> State (first non-empty match wins).
+    '    Site rows with no Cost Data match are logged as informational only;
+    '    they NEVER remove a Cost Data substation from the matrix. --
+    Dim dState As Object: Set dState = CreateObject("Scripting.Dictionary")
     Dim s As Long, mk As String
     For s = 1 To stN
         mk = pl_ResolveMatchKey(st(s), dId)
-        matchKey(s) = mk
         If Len(mk) > 0 Then
-            matched = matched + 1
-            If Not dMatched.Exists(mk) Then dMatched.Add mk, True
+            If Len(Trim$(st(s).State)) > 0 And Not dState.Exists(mk) Then
+                dState.Add mk, st(s).State
+            End If
         Else
-            pl_LogAdd log, "  [Align: site w/o cost] (" & _
+            pl_LogAdd log, "  [Attach: site row w/o Cost Data match, ignored] (" & _
                 pl_TripleStr(st(s).Name, st(s).Voltage, st(s).VoltParsed, st(s).State) & ")"
         End If
     Next s
-    ' cost identities never matched
-    Dim c As Long
-    For c = 1 To nId
-        Dim ckey As String: ckey = pl_CostKey(idName(c), idVolt(c), idVP(c))
-        If Not dMatched.Exists(ckey) Then
-            pl_LogAdd log, "  [Align: cost w/o site] " & idName(c) & _
-                IIf(idVP(c), " " & idVolt(c) & " kV", " (bare)")
-        End If
-    Next c
 
-    If matched = 0 Then
-        pl_LogAdd log, "Step 3: site and cost sets do not intersect (0 matches)."
-        MsgBox "No substation is present in both sets; the Matrix would be empty.", _
-               vbExclamation, "Interconnect Pipeline"
-        Exit Function
-    End If
-
-    ' -- MW axis + allocate result --
+    ' -- MW axis + allocate result. Matrix membership = ALL distinct Cost Data
+    '    substations (nId of them), NOT the cost/site intersection. --
     Dim mw() As Double, m As Long
     m = pl_MwAxis(mw)
-    Dim n As Long: n = matched
+    Dim n As Long: n = nId
     ReDim mtx.mw(1 To m)
     Dim j As Long
     For j = 1 To m: mtx.mw(j) = mw(j): Next j
@@ -1360,69 +1353,76 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
         For j = 1 To m: outBlk(1, IDC + j) = mw(j): Next j
     End If
 
-    Dim idIdx As Long, i As Long, rec As Variant, x As Double, tSum As Double, minTrig As Double
+    ' -- one row per distinct Cost Data identity (i runs over cost identities,
+    '    NOT site rows). State is attached from the left join; a substation with
+    '    no site match still gets a full row with a blank State. --
+    Dim i As Long, rec As Variant, x As Double, tSum As Double, minTrig As Double
     Dim haveMin As Boolean, useV As Boolean, vSel As Double, inCrit As Boolean
-    i = 0
-    For s = 1 To stN
-        If Len(matchKey(s)) > 0 Then
-            i = i + 1
-            idIdx = dId(matchKey(s))
-            useV = idVP(idIdx): vSel = idVolt(idIdx)
-            mtx.names(i) = pl_IdentityLabel(st(s).Name, st(s).Voltage, st(s).VoltParsed, st(s).State)
-            mtx.keyName(i) = idName(idIdx): mtx.keyVolt(i) = vSel: mtx.keyUseVolt(i) = useV
-
-            ' headroom is always taken from the records (cheap), by the row's
-            ' exact criteria -- identical to MINIFS.
-            Dim recCol As Collection: Set recCol = dName(LCase$(Trim$(idName(idIdx))))
-            haveMin = False: minTrig = 0
-            For Each rec In recCol
-                inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
-                If inCrit And rec(0) > 0 Then
-                    If Not haveMin Then
-                        minTrig = rec(0)
-                        haveMin = True
-                    ElseIf rec(0) < minTrig Then
-                        minTrig = rec(0)
-                    End If
-                End If
-            Next rec
-            mtx.headroom(i) = IIf(haveMin, minTrig, 0)
-
-            If reuseOK Then
-                For j = 1 To m
-                    If IsNumeric(matVals(i + 1, IDC + j)) Then
-                        mtx.costM(i, j) = CDbl(matVals(i + 1, IDC + j))
-                    Else
-                        mtx.costM(i, j) = 0
-                    End If
-                Next j
-            Else
-                ' three separate identity columns -- never a concatenated label
-                outBlk(i + 1, 1) = st(s).Name
-                If st(s).VoltParsed Then
-                    outBlk(i + 1, 2) = st(s).Voltage
-                Else
-                    outBlk(i + 1, 2) = ""
-                End If
-                outBlk(i + 1, 3) = st(s).State
-                For j = 1 To m
-                    x = mw(j): tSum = 0
-                    For Each rec In recCol
-                        inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
-                        If inCrit Then If rec(0) <= x Then tSum = tSum + rec(1)
-                    Next rec
-                    mtx.costM(i, j) = tSum / x
-                    ' body cell content (bounded live SUMIFS by default, else value)
-                    If USE_LIVE_SUMIFS Then
-                        outBlk(i + 1, IDC + j) = pl_SumifsFormula(wsCost.Name, colAlloc, colName, colTrig, colVolt, _
-                                                idName(idIdx), useV, vSel, pl_ColLetter(IDC + j) & "$1", 2, lastCostRow)
-                    Else
-                        outBlk(i + 1, IDC + j) = mtx.costM(i, j)
-                    End If
-                Next j
-            End If
+    Dim ckey As String, stState As String
+    For i = 1 To nId
+        useV = idVP(i): vSel = idVolt(i)
+        ckey = pl_CostKey(idName(i), idVolt(i), idVP(i))
+        If dState.Exists(ckey) Then
+            stState = dState(ckey)
+        Else
+            stState = ""                      ' no site match: State blank, row kept
         End If
-    Next s
+        mtx.names(i) = pl_IdentityLabel(idName(i), idVolt(i), idVP(i), stState)
+        mtx.keyName(i) = idName(i): mtx.keyVolt(i) = vSel: mtx.keyUseVolt(i) = useV
+
+        ' headroom is always taken from the records (cheap), by this identity's
+        ' exact criteria -- identical to MINIFS.
+        Dim recCol As Collection: Set recCol = dName(LCase$(Trim$(idName(i))))
+        haveMin = False: minTrig = 0
+        For Each rec In recCol
+            inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
+            If inCrit And rec(0) > 0 Then
+                If Not haveMin Then
+                    minTrig = rec(0)
+                    haveMin = True
+                ElseIf rec(0) < minTrig Then
+                    minTrig = rec(0)
+                End If
+            End If
+        Next rec
+        mtx.headroom(i) = IIf(haveMin, minTrig, 0)
+
+        If reuseOK Then
+            For j = 1 To m
+                If IsNumeric(matVals(i + 1, IDC + j)) Then
+                    mtx.costM(i, j) = CDbl(matVals(i + 1, IDC + j))
+                Else
+                    mtx.costM(i, j) = 0
+                End If
+            Next j
+        Else
+            ' three separate identity columns -- never a concatenated label
+            outBlk(i + 1, 1) = idName(i)
+            If idVP(i) Then
+                outBlk(i + 1, 2) = idVolt(i)
+            Else
+                outBlk(i + 1, 2) = ""
+            End If
+            outBlk(i + 1, 3) = stState
+            For j = 1 To m
+                x = mw(j): tSum = 0
+                For Each rec In recCol
+                    inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
+                    If inCrit Then
+                        If rec(0) <= x Then tSum = tSum + rec(1)
+                    End If
+                Next rec
+                mtx.costM(i, j) = tSum / x
+                ' body cell content (bounded live SUMIFS by default, else value)
+                If USE_LIVE_SUMIFS Then
+                    outBlk(i + 1, IDC + j) = pl_SumifsFormula(wsCost.Name, colAlloc, colName, colTrig, colVolt, _
+                                            idName(i), useV, vSel, pl_ColLetter(IDC + j) & "$1", 2, lastCostRow)
+                Else
+                    outBlk(i + 1, IDC + j) = mtx.costM(i, j)
+                End If
+            Next j
+        End If
+    Next i
 
     ' -- write matrix in one block (skipped when reusing the saved checkpoint) --
     If Not reuseOK Then
@@ -1441,14 +1441,17 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
         wsMatrix.Range(wsMatrix.Cells(2, IDC + 1), wsMatrix.Cells(n + 1, m + IDC)).NumberFormat = "$#,##0"
     End If
 
+    ' matchedCount is retained as the field name but now holds the count of ALL
+    ' distinct Cost Data substations (matrix membership is no longer an intersection).
     mtx.matchedCount = n: mtx.mwCount = m
     mtx.costName = wsCost.Name
     mtx.colName = colName: mtx.colVolt = colVolt: mtx.colTrig = colTrig: mtx.colAlloc = colAlloc
     mtx.costLastRow = lastCostRow
     mtx.ok = True
 
-    pl_LogAdd log, "STAGE 3/4 -- Matrix (" & wsMatrix.Name & "): " & n & " matched x " & m & _
-                   " MW; cost cols by header (name=" & pl_ColLetter(colName) & ", trigger=" & _
+    pl_LogAdd log, "STAGE 3/4 -- Matrix (" & wsMatrix.Name & "): " & n & " substations x " & m & _
+                   " MW (all distinct Cost Data substations; State left-joined from Site Data); " & _
+                   "cost cols by header (name=" & pl_ColLetter(colName) & ", trigger=" & _
                    pl_ColLetter(colTrig) & ", alloc=" & pl_ColLetter(colAlloc) & "); " & _
                    IIf(USE_LIVE_SUMIFS, "live SUMIFS", "values") & "."
     pl_BuildMatrix = True
@@ -2648,6 +2651,9 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 11) Header-row DETECTION: field-name row is chosen, not the band row
     pl_HeaderDetectSelfTest passCount, failCount
 
+    ' 12) Matrix membership = all Cost Data subs; State is a left-join attachment
+    pl_MatrixMembershipSelfTest passCount, failCount
+
     Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
                 " errors (a compile break cannot be asserted from runtime)."
 End Sub
@@ -2697,6 +2703,103 @@ Fail:
     If Not ws Is Nothing Then ws.Delete
     Application.DisplayAlerts = True
     Assert False, "Header-detect self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+' Matrix membership: rows = EVERY distinct Cost Data substation; State is a
+' LEFT JOIN (blank when the substation has no Site Data match); a Cost Data
+' substation absent from Site Data is NEVER dropped. Also proves the identity is
+' three separate columns and the body cells are live SUMIFS. Uses scratch sheets.
+Private Sub pl_MatrixMembershipSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+
+    ' Cost Data: Cecelia has TWO rows (both source files), Marlin has one.
+    Dim wsC As Worksheet: Set wsC = ThisWorkbook.Worksheets.Add
+    wsC.Cells(1, 1).Value = PL_HDR_NAME
+    wsC.Cells(1, 2).Value = PL_HDR_VOLT
+    wsC.Cells(1, 3).Value = PL_HDR_TRIGGER
+    wsC.Cells(1, 4).Value = PL_HDR_ALLOC
+    wsC.Cells(2, 1).Value = "Cecelia": wsC.Cells(2, 2).Value = 138: wsC.Cells(2, 3).Value = 100: wsC.Cells(2, 4).Value = 5000000#
+    wsC.Cells(3, 1).Value = "Cecelia": wsC.Cells(3, 2).Value = 138: wsC.Cells(3, 3).Value = 150: wsC.Cells(3, 4).Value = 3000000#
+    wsC.Cells(4, 1).Value = "Marlin": wsC.Cells(4, 2).Value = 230: wsC.Cells(4, 3).Value = 120: wsC.Cells(4, 4).Value = 4000000#
+
+    ' Site Data: Cecelia present (Kentucky); Marlin ABSENT (no state to attach).
+    Dim wsS As Worksheet: Set wsS = ThisWorkbook.Worksheets.Add
+    wsS.Cells(1, 1).Value = PL_HDR_NAME
+    wsS.Cells(1, 2).Value = "State"
+    wsS.Cells(1, 3).Value = PL_HDR_VOLT
+    wsS.Cells(2, 1).Value = "Cecelia": wsS.Cells(2, 2).Value = "Kentucky": wsS.Cells(2, 3).Value = 138
+
+    Dim log As PL_TLog: pl_LogInit log
+    Dim mtx As PL_TMatrix
+    Dim wsM As Worksheet: Set wsM = Nothing
+    Dim okB As Boolean
+    okB = pl_BuildMatrix(log, wsC, wsS, wsM, mtx, False)
+    Assert okB, "Matrix membership: pl_BuildMatrix succeeds", passCount, failCount
+
+    ' Every distinct Cost Data substation appears exactly once.
+    Assert mtx.matchedCount = 2, _
+           "Matrix membership: both distinct Cost Data subs appear (Cecelia + Marlin)", passCount, failCount
+    Dim iCec As Long, iMar As Long, cCec As Long, ii As Long
+    iCec = 0: iMar = 0: cCec = 0
+    For ii = 1 To mtx.matchedCount
+        If mtx.keyName(ii) = "Cecelia" Then
+            iCec = ii: cCec = cCec + 1
+        End If
+        If mtx.keyName(ii) = "Marlin" Then iMar = ii
+    Next ii
+    Assert (iCec > 0) And (cCec = 1) And (iMar > 0), _
+           "Matrix membership: Cecelia present exactly once, Marlin present", passCount, failCount
+
+    ' State is a LEFT JOIN: filled for Cecelia, blank (not dropped) for Marlin.
+    Assert StrComp(CStr(wsM.Cells(iCec + 1, 3).Value & ""), "Kentucky", vbTextCompare) = 0, _
+           "Matrix state: Cecelia State left-joined from Site Data (Kentucky)", passCount, failCount
+    Assert Len(Trim$(CStr(wsM.Cells(iMar + 1, 3).Value & ""))) = 0, _
+           "Matrix state: Marlin (no Site Data) still appears with a BLANK State", passCount, failCount
+
+    ' Identity is three separate columns -- never a concatenated label.
+    Assert (StrComp(CStr(wsM.Cells(1, 1).Value), "Substation", vbTextCompare) = 0) _
+           And (StrComp(CStr(wsM.Cells(1, 2).Value), PL_HDR_VOLT, vbTextCompare) = 0) _
+           And (StrComp(CStr(wsM.Cells(1, 3).Value), "State", vbTextCompare) = 0), _
+           "Matrix identity: three separate columns (name / voltage / state)", passCount, failCount
+    Assert (StrComp(CStr(wsM.Cells(iMar + 1, 1).Value), "Marlin", vbTextCompare) = 0) _
+           And (CDbl(wsM.Cells(iMar + 1, 2).Value) = 230), _
+           "Matrix identity: name and voltage are not concatenated", passCount, failCount
+
+    ' Body cells are live SUMIFS keyed to the substation.
+    Dim f As String: f = wsM.Cells(iCec + 1, 4).Formula
+    Assert (Left$(f, 8) = "=SUMIFS(") And (InStr(f, "138") > 0), _
+           "Matrix body: cells are live SUMIFS", passCount, failCount
+
+    ' The cost curve sums BOTH Cecelia rows above the 2nd trigger (150 MW):
+    ' 5,000,000 + 3,000,000 = 8,000,000, cost-per-MW = 8,000,000 / MW.
+    Dim jj As Long, jHi As Long: jHi = 0
+    For jj = 1 To mtx.mwCount
+        If mtx.mw(jj) >= 150 Then
+            jHi = jj
+            Exit For
+        End If
+    Next jj
+    Assert (jHi > 0) And (Abs(mtx.costM(iCec, jHi) - 8000000# / mtx.mw(jHi)) < 0.01), _
+           "Matrix body: Cecelia curve sums both source rows above the 2nd trigger", passCount, failCount
+
+    ' Headroom = first trigger MW per substation.
+    Assert mtx.headroom(iCec) = 100, "Matrix headroom: Cecelia = first trigger (100)", passCount, failCount
+    Assert mtx.headroom(iMar) = 120, "Matrix headroom: Marlin = first trigger (120)", passCount, failCount
+
+    If Not wsM Is Nothing Then wsM.Delete
+    wsS.Delete
+    wsC.Delete
+    Application.DisplayAlerts = prevAlerts
+    Exit Sub
+Fail:
+    On Error Resume Next
+    If Not wsM Is Nothing Then wsM.Delete
+    If Not wsS Is Nothing Then wsS.Delete
+    If Not wsC Is Nothing Then wsC.Delete
+    Application.DisplayAlerts = True
+    Assert False, "Matrix-membership self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' Fix 1 verification: given a file's rows-2-down block containing real data, a
