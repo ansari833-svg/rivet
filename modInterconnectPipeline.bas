@@ -2803,15 +2803,15 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
            "Stage 4 zero-cost: leading $0 cells are valid, matrix runs", passCount, failCount
 
     ' (b) A genuinely negative cost still errors, with a clear reason.
-    Dim nm As PL_TMatrix
-    nm.ok = True: nm.matchedCount = 1: nm.mwCount = 8
-    ReDim nm.mw(1 To 8)
-    For zj = 1 To 8: nm.mw(zj) = zmw(zj): Next zj
-    ReDim nm.names(1 To 1): nm.names(1) = "Napoleon 138 kV (Indiana)"
-    ReDim nm.costM(1 To 1, 1 To 8)
-    For zj = 1 To 8: nm.costM(1, zj) = zm.costM(1, zj): Next zj
-    nm.costM(1, 2) = -5#
-    Assert (Not pl_Stage4MatrixValid(nm, zrsn)) And (InStr(zrsn, "negative cost") > 0), _
+    Dim negM As PL_TMatrix
+    negM.ok = True: negM.matchedCount = 1: negM.mwCount = 8
+    ReDim negM.mw(1 To 8)
+    For zj = 1 To 8: negM.mw(zj) = zmw(zj): Next zj
+    ReDim negM.names(1 To 1): negM.names(1) = "Napoleon 138 kV (Indiana)"
+    ReDim negM.costM(1 To 1, 1 To 8)
+    For zj = 1 To 8: negM.costM(1, zj) = zm.costM(1, zj): Next zj
+    negM.costM(1, 2) = -5#
+    Assert (Not pl_Stage4MatrixValid(negM, zrsn)) And (InStr(zrsn, "negative cost") > 0), _
            "Stage 4 zero-cost: a negative cost still errors explicitly", passCount, failCount
 
     ' (c) Segmentize splits the leading zero region as its own T=0 segment
