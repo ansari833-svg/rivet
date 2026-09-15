@@ -233,7 +233,8 @@ Private Type PL_TMatrix
     matchedCount As Long
     mwCount      As Long
     mw()         As Double        ' 1..m
-    names()      As String        ' 1..n identity labels (row order)
+    names()      As String        ' 1..n CLEAN substation name (row order)
+    state()      As String        ' 1..n state, left-joined from Site Data ("" if none)
     costM()      As Double        ' 1..n, 1..m cost-per-MW values
     headroom()   As Double        ' 1..n minimum trigger MW (0 = none)
     keyName()    As String        ' 1..n cost-side key (name)
@@ -264,15 +265,9 @@ Private Const SLOPE_RANK_MODE As Long = 1
 
 ' Layout anchors (change these to move the whole layout)
 Private Const TITLE_ROW       As Long = 1
-Private Const TABLE_HDR_ROW   As Long = 3         ' Block A headers; data begins on the next row
-Private Const N_FIXED_COLS    As Long = 7         ' cols A..G before the per-threshold pairs
-Private Const CHART_GAP_ROWS  As Long = 2         ' blank rows between table and chart
-Private Const CHART_ROWS      As Long = 44        ' vertical rows reserved for the chart band
+Private Const TABLE_HDR_ROW   As Long = 3         ' analysis-table headers; data begins on the next row
+Private Const N_FIXED_COLS    As Long = 7         ' aTable cols A..G before the per-threshold quads
 Private Const COLB_WIDTH      As Double = 60      ' fixed width of the Fitted Function column
-
-' Chart dimensions, in points
-Private Const CHART_W         As Double = 1100
-Private Const CHART_H         As Double = 620
 
 ' Number formats
 Private Const FMT_DOLLAR      As String = "$#,##0"
@@ -1746,21 +1741,31 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     End If
 
     ' -- left join: cost-identity key -> State (first non-empty match wins).
-    '    Site rows with no Cost Data match are logged as informational only;
-    '    they NEVER remove a Cost Data substation from the matrix. --
+    '    Both sides key through pl_CostKey -> pl_NormSubName, so a site name with
+    '    the voltage embedded ("Big Cajun 1 230kV") normalizes to the same key as
+    '    the clean cost name ("Big Cajun 1" @ 230) and the genuine pair matches.
+    '    Site rows with no Cost Data match are logged (raw + normalized keys, so
+    '    residuals are diagnosable); they NEVER remove a Cost Data substation. --
     Dim dState As Object: Set dState = CreateObject("Scripting.Dictionary")
     Dim s As Long, mk As String
+    Dim siteMatched As Long, siteUnmatched As Long
     For s = 1 To stN
         mk = pl_ResolveMatchKey(st(s), dId)
         If Len(mk) > 0 Then
+            siteMatched = siteMatched + 1
             If Len(Trim$(st(s).State)) > 0 And Not dState.Exists(mk) Then
                 dState.Add mk, st(s).State
             End If
         Else
-            pl_LogAdd log, "  [Attach: site row w/o Cost Data match, ignored] (" & _
-                pl_TripleStr(st(s).Name, st(s).Voltage, st(s).VoltParsed, st(s).State) & ")"
+            siteUnmatched = siteUnmatched + 1
+            pl_LogAdd log, "  [Attach: site row w/o Cost Data match] raw='" & st(s).Name & _
+                "' norm-key='" & pl_CostKey(st(s).Name, st(s).Voltage, st(s).VoltParsed) & _
+                "' (" & pl_TripleStr(st(s).Name, st(s).Voltage, st(s).VoltParsed, st(s).State) & ")"
         End If
     Next s
+    pl_LogAdd log, "STAGE 3 -- Site->Cost match: " & stN & " site triple(s), " & nId & _
+                   " cost substation(s); matched " & siteMatched & ", unmatched " & siteUnmatched & _
+                   " (shared name normalization; unmatched should be < ~100)."
 
     ' -- MW axis + allocate result. Matrix membership = ALL distinct Cost Data
     '    substations (nId of them), NOT the cost/site intersection. --
@@ -1771,6 +1776,7 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     Dim j As Long
     For j = 1 To m: mtx.mw(j) = mw(j): Next j
     ReDim mtx.names(1 To n)
+    ReDim mtx.state(1 To n)
     ReDim mtx.costM(1 To n, 1 To m)
     ReDim mtx.headroom(1 To n)
     ReDim mtx.keyName(1 To n): ReDim mtx.keyVolt(1 To n): ReDim mtx.keyUseVolt(1 To n)
@@ -1819,7 +1825,10 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
         Else
             stState = ""                      ' no site match: State blank, row kept
         End If
-        mtx.names(i) = pl_IdentityLabel(idName(i), idVolt(i), idVP(i), stState)
+        ' CLEAN name only -- voltage and state are kept as separate fields and
+        ' written as separate columns; never concatenated into the name label.
+        mtx.names(i) = idName(i)
+        mtx.state(i) = stState
         mtx.keyName(i) = idName(i): mtx.keyVolt(i) = vSel: mtx.keyUseVolt(i) = useV
 
         ' headroom is always taken from the records (cheap), by this identity's
@@ -1976,8 +1985,29 @@ Private Function pl_ResolveMatchKey(ByRef tr As PL_TSiteTriple, ByVal dId As Obj
 End Function
 
 ' Identity key for a cost tab: name (+voltage when the tab carried one).
+' Shared substation-name normalization for MATCHING, applied identically to the
+' cost-side name and the site-side Summary!A name so their keys agree. It strips
+' the embedded voltage token (230kV / 230 kV / 230. kV), collapses nbsp/multiple
+' spaces, trims, and lower-cases for a case-insensitive compare.
+'   "Big Cajun 1 230kV" (site raw) -> "big cajun 1"
+'   "Big Cajun 1"       (cost, already clean) -> "big cajun 1"   => they match.
+' It does NOT strip a trailing integer: on the cost side the file counter was
+' already removed at tab-parse time, and the site side has no file counter, so a
+' trailing number here (e.g. the unit in "Big Cajun 1") is part of the real name
+' and must be preserved -- stripping it would merge distinct units.
+Private Function pl_NormSubName(ByVal raw As String) As String
+    Dim work As String: work = pl_NormSpaces(raw)
+    Dim vFound As Boolean, vVal As Double, vStart As Long, vEnd As Long
+    pl_ExtractVoltage work, vFound, vVal, vStart, vEnd
+    If vFound Then
+        work = pl_NormSpaces(Left$(work, vStart - 1) & " " & Mid$(work, vEnd + 1))
+    End If
+    pl_NormSubName = LCase$(pl_NormSpaces(work))
+End Function
+
+' Identity key: NORMALIZED name (shared on both sides) + voltage when carried.
 Private Function pl_CostKey(ByVal nm As String, ByVal v As Double, ByVal vp As Boolean) As String
-    pl_CostKey = LCase$(Trim$(nm)) & "|" & IIf(vp, pl_NumStr(v), "")
+    pl_CostKey = pl_NormSubName(nm) & "|" & IIf(vp, pl_NumStr(v), "")
 End Function
 
 ' ==========================================================================
@@ -2054,22 +2084,20 @@ Private Function pl_RunAnalysisAndScoring(ByVal wsMatrix As Worksheet, ByRef log
         Exit Function
     End If
 
+    ' One unified analysis table: identity split into Substation | Voltage (kV) |
+    ' State, headline results (Weighted Score, percentiles, Headroom, Flattening)
+    ' next to the name, then the per-threshold ranks and the detailed blocks. No
+    ' chart (Excel caps series at 256; ~1,691 substations overflow it).
     pl_Status "Stage 4: writing analysis"
-    Dim srcMWRow As Long, srcFirstDataRow As Long
-    Dim hlpMWCol As Long, hlpFirstThreshCol As Long, hlpFirstRow As Long, hlpRows As Long
-    WriteSheet wsOut, mw, names, costM, n, m, aTable, totalCols, _
-               rkCount, rkMaxMW, rkSlope, rankA, rankB, _
-               srcMWRow, srcFirstDataRow, hlpMWCol, hlpFirstThreshCol, hlpFirstRow, hlpRows
+    Dim lastTblRow As Long
+    lastTblRow = WriteSheet(wsOut, mtx, mw, costM, n, m, aTable, rankA, rankB)
 
-    pl_Status "Stage 4: scoring"
-    pl_WriteScoring wsOut, mw, names, costM, n, m, rankA, rankB, totalCols, mtx
+    pl_Status "Stage 4: leaderboard"
+    Dim lbLast As Long
+    BuildLeaderboard wsOut, lastTblRow + 3, mtx.names, n, rkCount, rkMaxMW, rkSlope, rankA, rankB, lbLast
 
-    ' single recompute at the very end, then the chart is built last
     pl_Status "Stage 4: recalculating"
     Application.CalculateFull
-    pl_Status "Stage 4: chart"
-    BuildChart wsOut, mw, costM, n, m, srcMWRow, srcFirstDataRow, _
-               hlpMWCol, hlpFirstThreshCol, hlpFirstRow, hlpRows
 
     ' confirm the analysis sheet was created and populated
     Dim outRows As Long: outRows = pl_SheetDataRows(wsOut)
@@ -2145,184 +2173,6 @@ Private Function pl_Stage4MatrixValid(ByRef mtx As PL_TMatrix, ByRef reason As S
     pl_Stage4MatrixValid = True
 End Function
 
-'--------------------------------------------------------------------------
-' pl_WriteScoring
-'   Writes the live weight cell $B$2 and the scoring block: Flattening pctile,
-'   per-band Breadth/Slope pctile + Band Score, Weighted Score, Weighted Score
-'   pctile, Headroom (MW), Headroom pctile. Percentiles/score/headroom are
-'   computed in VBA (values path, default) or written as bounded live formulas
-'   (USE_LIVE_FORMULAS); both paths agree. Single block write.
-'--------------------------------------------------------------------------
-Private Sub pl_WriteScoring(ByVal ws As Worksheet, ByRef mw() As Double, _
-                            ByRef names() As String, ByRef costM() As Double, _
-                            ByVal n As Long, ByVal m As Long, _
-                            ByRef rankA() As Long, ByRef rankB() As Long, ByVal totalCols As Long, _
-                            ByRef mtx As PL_TMatrix)
-    Dim thr As Variant: thr = GetThresholds()
-    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
-    Dim i As Long, tt As Long, j As Long
-    Dim EMPTY_LIT As String: EMPTY_LIT = Chr$(34) & Chr$(34)
-
-    ' -- live weight cell --
-    ws.Cells(2, 1).Value = "Threshold weight (applies to every band):"
-    ws.Cells(2, 2).Value = PL_WEIGHT_B2
-    ws.Cells(2, 2).Font.Bold = True
-    ws.Cells(2, 1).Font.Italic = True
-
-    ' ==== VBA metric computation (used for the values path; the parity self-
-    '      test proves these equal the live-formula path) ====
-    ' Flattening raw = the geometric knee, rounded to 1 dp to match Block A col E.
-    Dim knee() As Double: ReDim knee(1 To n)
-    Dim c() As Double: ReDim c(1 To m)
-    Dim T() As Double: ReDim T(1 To m)
-    For i = 1 To n
-        For j = 1 To m: c(j) = costM(i, j): T(j) = c(j) * mw(j): Next j
-        Dim segs() As TSegment: segs = Segmentize(mw, T, m)
-        Dim li As Long: li = LongestSegIdx(mw, segs, UBound(segs))
-        knee(i) = Round(KneeXStar(mw, T, segs(li)), 1)
-    Next i
-    Dim flatPct() As Long: flatPct = pl_RawBucketArray(knee, n)
-
-    ' Rank-based band percentiles (rank 1 = best).
-    Dim breadthPct() As Long, slopePct() As Long
-    ReDim breadthPct(1 To n, 1 To nt): ReDim slopePct(1 To n, 1 To nt)
-    Dim col1() As Long
-    For tt = 1 To nt
-        col1 = pl_RankBucketArray(rankA, tt, n)
-        For i = 1 To n: breadthPct(i, tt) = col1(i): Next i
-        col1 = pl_RankBucketArray(rankB, tt, n)
-        For i = 1 To n: slopePct(i, tt) = col1(i): Next i
-    Next tt
-
-    ' Band score + weighted score (value).
-    Dim weighted() As Double: ReDim weighted(1 To n)
-    Dim bandScore() As Double: ReDim bandScore(1 To n, 1 To nt)
-    For i = 1 To n
-        weighted(i) = flatPct(i)
-        For tt = 1 To nt
-            bandScore(i, tt) = PL_WEIGHT_B2 * (breadthPct(i, tt) + slopePct(i, tt))
-            weighted(i) = weighted(i) + bandScore(i, tt)
-        Next tt
-    Next i
-    Dim wsPct() As Long: wsPct = pl_RawBucketArray(weighted, n)
-
-    ' Headroom raw + percentile (blank/excluded when 0).
-    Dim headroom() As Double: ReDim headroom(1 To n)
-    Dim part() As Boolean: ReDim part(1 To n)
-    For i = 1 To n
-        headroom(i) = mtx.headroom(i)
-        part(i) = (headroom(i) > 0)
-    Next i
-    Dim hrPct() As Long: hrPct = pl_RawBucketArrayMasked(headroom, part, n)
-
-    ' ==== column layout ====
-    Dim c0 As Long: c0 = totalCols + 2         ' spacer after Block A
-    Dim r0 As Long: r0 = 3                     ' align with Block A header row
-    Dim scFlat As Long: scFlat = c0 + 1
-    Dim scWS As Long: scWS = c0 + 2 + 3 * nt
-    Dim scWSP As Long: scWSP = scWS + 1
-    Dim scHR As Long: scHR = scWS + 2
-    Dim scHRP As Long: scHRP = scWS + 3
-    Dim nCols As Long: nCols = scHRP - c0 + 1
-
-    ' Block A anchors for live-path population ranges.
-    Dim dataTop As Long: dataTop = 4          ' TABLE_HDR_ROW + 1
-    Dim dataBot As Long: dataBot = dataTop + n - 1
-    Dim firstDR As Long: firstDR = r0 + 1
-    Dim lastDR As Long: lastDR = r0 + n
-
-    ' ==== build the block (values or formula strings) ====
-    Dim blk() As Variant: ReDim blk(1 To n + 1, 1 To nCols)
-    blk(1, 1) = "Substation"
-    blk(1, 2) = "Flattening Pctile (1-5)"
-    For tt = 0 To nt - 1
-        Dim bo As Long: bo = 3 + 3 * tt        ' 1-based block col of this band's breadth
-        blk(1, bo) = ThreshLabel(CDbl(thr(LBound(thr) + tt))) & " Breadth (0-5)"
-        blk(1, bo + 1) = ThreshLabel(CDbl(thr(LBound(thr) + tt))) & " Slope (0-5)"
-        blk(1, bo + 2) = ThreshLabel(CDbl(thr(LBound(thr) + tt))) & " Band Score"
-    Next tt
-    blk(1, scWS - c0 + 1) = "Weighted Score (max 165)"
-    blk(1, scWSP - c0 + 1) = "Weighted Score Pctile (1-5)"
-    blk(1, scHR - c0 + 1) = "Headroom (MW)"
-    blk(1, scHRP - c0 + 1) = "Headroom Pctile (1-5)"
-
-    Dim r As Long
-    For i = 1 To n
-        r = i + 1
-        Dim rr As Long: rr = r0 + i
-        blk(r, 1) = names(i)
-
-        If USE_LIVE_FORMULAS Then
-            ' Flattening pctile: raw-is-better over Block A knee column (E = col 5).
-            blk(r, 2) = pl_RawPctFormula("E", dataTop, dataBot, "E" & rr)
-            Dim sumRefs As String: sumRefs = ""
-            For tt = 0 To nt - 1
-                Dim bcol As Long: bcol = 3 + 3 * tt
-                Dim rankAcol As String: rankAcol = pl_ColLetter(10 + 4 * tt)   ' Block A Rank-by-breadth
-                Dim rankBcol As String: rankBcol = pl_ColLetter(11 + 4 * tt)   ' Block A Rank-by-slope
-                blk(r, bcol) = pl_RankPctFormula(rankAcol, dataTop, dataBot, rankAcol & rr)
-                blk(r, bcol + 1) = pl_RankPctFormula(rankBcol, dataTop, dataBot, rankBcol & rr)
-                blk(r, bcol + 2) = "=$B$2*(" & pl_ColLetter(c0 + bcol - 1) & rr & "+" & _
-                                   pl_ColLetter(c0 + bcol) & rr & ")"
-                If Len(sumRefs) > 0 Then sumRefs = sumRefs & "+"
-                sumRefs = sumRefs & pl_ColLetter(c0 + bcol + 1) & rr
-            Next tt
-            blk(r, scWS - c0 + 1) = "=" & pl_ColLetter(scFlat) & rr & "+" & sumRefs
-            blk(r, scWSP - c0 + 1) = pl_RawPctFormula(pl_ColLetter(scWS), firstDR, lastDR, pl_ColLetter(scWS) & rr)
-            blk(r, scHR - c0 + 1) = "=IFERROR(IF(" & _
-                pl_MinifsFormula(mtx.costName, mtx.colTrig, mtx.colName, mtx.colVolt, _
-                                 mtx.keyName(i), mtx.keyUseVolt(i), mtx.keyVolt(i), 2, mtx.costLastRow) & _
-                "=0," & EMPTY_LIT & "," & _
-                pl_MinifsFormula(mtx.costName, mtx.colTrig, mtx.colName, mtx.colVolt, _
-                                 mtx.keyName(i), mtx.keyUseVolt(i), mtx.keyVolt(i), 2, mtx.costLastRow) & _
-                ")," & EMPTY_LIT & ")"
-            blk(r, scHRP - c0 + 1) = "=IFERROR(" & _
-                Mid$(pl_RawPctFormula(pl_ColLetter(scHR), firstDR, lastDR, pl_ColLetter(scHR) & rr), 2) & _
-                "," & EMPTY_LIT & ")"
-        Else
-            blk(r, 2) = flatPct(i)
-            For tt = 1 To nt
-                Dim bo2 As Long: bo2 = 3 + 3 * (tt - 1)
-                blk(r, bo2) = breadthPct(i, tt)
-                blk(r, bo2 + 1) = slopePct(i, tt)
-                blk(r, bo2 + 2) = bandScore(i, tt)
-            Next tt
-            blk(r, scWS - c0 + 1) = weighted(i)
-            blk(r, scWSP - c0 + 1) = wsPct(i)
-            If part(i) Then
-                blk(r, scHR - c0 + 1) = headroom(i)
-                blk(r, scHRP - c0 + 1) = hrPct(i)
-            Else
-                blk(r, scHR - c0 + 1) = ""
-                blk(r, scHRP - c0 + 1) = ""
-            End If
-        End If
-    Next i
-
-    If USE_LIVE_FORMULAS Then
-        ws.Range(ws.Cells(r0, c0), ws.Cells(r0 + n, scHRP)).Formula = blk
-    Else
-        ws.Range(ws.Cells(r0, c0), ws.Cells(r0 + n, scHRP)).Value = blk
-    End If
-
-    ' -- formats (whole columns once) --
-    ws.Range(ws.Cells(r0 + 1, scHR), ws.Cells(r0 + n, scHR)).NumberFormat = "#,##0"
-    With ws.Range(ws.Cells(r0 + 1, scHRP), ws.Cells(r0 + n, scHRP))
-        .NumberFormat = "0": .HorizontalAlignment = xlCenter
-    End With
-    With ws.Range(ws.Cells(r0 + 1, scWSP), ws.Cells(r0 + n, scWSP))
-        .NumberFormat = "0": .HorizontalAlignment = xlCenter
-    End With
-
-    ' -- header styling + note --
-    ws.Range(ws.Cells(r0, c0), ws.Cells(r0, scHRP)).Font.Bold = True
-    ws.Range(ws.Cells(r0, c0), ws.Cells(r0, scHRP)).Borders(xlEdgeBottom).LineStyle = xlContinuous
-    ws.Cells(r0 + n + 2, c0).Value = _
-        "Weighted Score max = 165 = flattening (5) + 4 bands x $B$2 x (breadth 5 + slope 5). " & _
-        "Practical max today = 125 ($25MM band scores 0 for all). Single $B$2 weights the " & _
-        "threshold axis as a whole. Headroom (MW) + its percentile are standalone -- NOT scored."
-    ws.Cells(r0 + n + 2, c0).Font.Italic = True
-End Sub
 
 ' ==========================================================================
 '  SCORING PRIMITIVES  (VBA mirror of the sheet formulas; parity-tested)
@@ -3135,8 +2985,75 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 14) File accounting: every selected file accounted for (LOST vs redundant)
     pl_FileAccountingSelfTest passCount, failCount
 
+    ' 15) Site<->Cost matching: shared name normalization makes genuine pairs match
+    pl_NameMatchSelfTest passCount, failCount
+
+    ' 16) Analysis layout: identity split + Weighted Score references resolve
+    pl_AnalysisLayoutSelfTest passCount, failCount
+
     Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
                 " errors (a compile break cannot be asserted from runtime)."
+End Sub
+
+' Fix 4: the SHARED normalization must make a site name with the voltage embedded
+' key-equal to the clean cost name, so the genuine pair matches. Also checks the
+' named cases from the bug report and that unit numbers in the name survive.
+Private Sub pl_NameMatchSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    ' embedded-voltage site name normalizes to the clean cost name
+    Assert (pl_NormSubName("Big Cajun 1 230kV") = "big cajun 1"), _
+           "NormName: 'Big Cajun 1 230kV' -> 'big cajun 1' (unit # kept, voltage stripped)", passCount, failCount
+    Assert (pl_NormSubName("Ponderosa 500 kV") = "ponderosa"), _
+           "NormName: 'Ponderosa 500 kV' -> 'ponderosa'", passCount, failCount
+    Assert (pl_NormSubName("Grimes 138. kV") = "grimes"), _
+           "NormName: 'Grimes 138. kV' -> 'grimes'", passCount, failCount
+
+    ' the actual match mechanism: pl_CostKey agrees on both sides for genuine pairs
+    Dim cases As Variant, volt As Variant, k As Long
+    cases = Array("Big Cajun 1", "Ponderosa", "Cincinnati", "Mockingbird", "Grimes")
+    volt = Array(230#, 500#, 345#, 138#, 138#)
+    For k = LBound(cases) To UBound(cases)
+        Dim site As String, cost As String
+        ' site side carries the voltage embedded in the name; cost side is clean
+        site = pl_CostKey(CStr(cases(k)) & " " & CStr(CLng(volt(k))) & "kV", CDbl(volt(k)), True)
+        cost = pl_CostKey(CStr(cases(k)), CDbl(volt(k)), True)
+        Assert (site = cost), _
+               "Match: site '" & CStr(cases(k)) & " " & CStr(CLng(volt(k))) & "kV' == cost '" & _
+               CStr(cases(k)) & "' @ " & CStr(CLng(volt(k))), passCount, failCount
+    Next k
+End Sub
+
+' Fix 3: trace the analysis column map for the default nt=4 layout and confirm
+' the Weighted Score's component references resolve to the NEW column positions
+' (flattening pctile + one band-score column per threshold; band score itself =
+' $B$2 * (breadth pctile + slope pctile)). Mirrors the map inside WriteSheet.
+Private Sub pl_AnalysisLayoutSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    Dim nt As Long: nt = 4
+    Dim cWS As Long: cWS = 4
+    Dim cFlatP As Long: cFlatP = 9
+    Dim cRank0 As Long: cRank0 = 10
+    Dim cDet0 As Long: cDet0 = (cRank0 + 2 * nt) + 5      ' = 23 for nt=4
+
+    ' identity is the first three columns, headline results next to the name
+    Assert (pl_ColLetter(1) = "A" And pl_ColLetter(2) = "B" And pl_ColLetter(3) = "C"), _
+           "Layout: identity = A/B/C (Substation | Voltage | State)", passCount, failCount
+    Assert (pl_ColLetter(cWS) = "D" And pl_ColLetter(5) = "E" And pl_ColLetter(6) = "F"), _
+           "Layout: Weighted Score/WS pctile/Headroom at D/E/F (next to name)", passCount, failCount
+    Assert (pl_ColLetter(cFlatP) = "I"), "Layout: Flattening pctile at I", passCount, failCount
+
+    ' Weighted Score = flattening pctile + sum of band-score columns
+    Dim expect As String, k As Long
+    expect = "=" & pl_ColLetter(cFlatP) & "4"
+    For k = 0 To nt - 1
+        expect = expect & "+" & pl_ColLetter(cDet0 + 5 * k + 4) & "4"
+    Next k
+    Assert (expect = "=I4+AA4+AF4+AK4+AP4"), _
+           "Layout: Weighted Score (row 4) = I4+AA4+AF4+AK4+AP4", passCount, failCount
+
+    ' first band score = $B$2 * (its breadth pctile + slope pctile)
+    Dim band0 As String
+    band0 = "=$B$2*(" & pl_ColLetter(cDet0 + 2) & "4+" & pl_ColLetter(cDet0 + 3) & "4)"
+    Assert (band0 = "=$B$2*(Y4+Z4)"), _
+           "Layout: $25MM band score = $B$2*(Y4+Z4)", passCount, failCount
 End Sub
 
 ' The real header bug: source cost sheets have a "band" row above the field-name
@@ -4409,160 +4326,240 @@ Private Function SheetExists(ByVal wb As Workbook, ByVal nm As String) As Boolea
 End Function
 
 ' ============================================================
-'  SHEET WRITER
-'  Writes Block A (analysis table), Block C (source-data copy) and
-'  Block D (threshold helper curves). Returns, via ByRef, the anchor
-'  rows/cols the chart builder needs. All writes are bulk range
-'  assignments.
+'  UNIFIED ANALYSIS TABLE WRITER
+'  One contiguous table on Cost Curve Analysis. Identity is split into
+'  three columns (Substation | Voltage (kV) | State) -- never concatenated.
+'  Headline results sit next to the name, then the per-threshold rank
+'  columns, then the detailed metric + threshold blocks. Every live-formula
+'  reference is derived from the same column-index map below, so the
+'  references always point at the columns' real positions. Returns the last
+'  used row (the max-165 note), so the leaderboard can be placed under it.
+'
+'  Column map (1-based), computed from nt:
+'    1 Substation | 2 Voltage (kV) | 3 State
+'    4 Weighted Score | 5 WS Pctile | 6 Headroom | 7 Headroom Pctile
+'    8 Flattening Point | 9 Flattening Pctile
+'    10.. per threshold: Rank by Breadth, Rank by Slope   (2*nt cols)
+'    then Fitted, Segments, Step-Change, Slope at Knee, Slowdown   (5 cols)
+'    then per threshold: MW Range, Slope over Range, Breadth (0-5),
+'                        Slope (0-5), Band Score   (5*nt cols)
 ' ============================================================
 
-Private Sub WriteSheet(ByVal ws As Worksheet, ByRef mw() As Double, _
-                       ByRef names() As String, ByRef costM() As Double, _
-                       ByVal n As Long, ByVal m As Long, ByRef aTable() As Variant, _
-                       ByVal totalCols As Long, _
-                       ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
-                       ByRef rkSlope() As Double, ByRef rankA() As Long, ByRef rankB() As Long, _
-                       ByRef srcMWRow As Long, ByRef srcFirstDataRow As Long, _
-                       ByRef hlpMWCol As Long, ByRef hlpFirstThreshCol As Long, _
-                       ByRef hlpFirstRow As Long, ByRef hlpRows As Long)
-
+Private Function WriteSheet(ByVal ws As Worksheet, ByRef mtx As PL_TMatrix, _
+                            ByRef mw() As Double, ByRef costM() As Double, _
+                            ByVal n As Long, ByVal m As Long, ByRef aTable() As Variant, _
+                            ByRef rankA() As Long, ByRef rankB() As Long) As Long
     Dim thr As Variant: thr = GetThresholds()
     Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
-    Dim i As Long, j As Long, t As Long
+    Dim i As Long, t As Long
+    Dim EMPTY_LIT As String: EMPTY_LIT = Chr$(34) & Chr$(34)
 
-    ' ---- Title -----------------------------------------------
+    ' ---- column-index map ----
+    Const cSub As Long = 1, cVolt As Long = 2, cState As Long = 3
+    Const cWS As Long = 4, cWSP As Long = 5, cHR As Long = 6, cHRP As Long = 7
+    Const cFlat As Long = 8, cFlatP As Long = 9, cRank0 As Long = 10
+    Dim cMet0 As Long: cMet0 = cRank0 + 2 * nt
+    Dim cFitted As Long: cFitted = cMet0
+    Dim cSeg As Long: cSeg = cMet0 + 1
+    Dim cStep As Long: cStep = cMet0 + 2
+    Dim cSlopeKnee As Long: cSlopeKnee = cMet0 + 3
+    Dim cSlowdown As Long: cSlowdown = cMet0 + 4
+    Dim cDet0 As Long: cDet0 = cMet0 + 5
+    Dim totalNew As Long: totalNew = cDet0 + 5 * nt - 1
+
+    Dim hdrRow As Long: hdrRow = TABLE_HDR_ROW
+    Dim dataTop As Long: dataTop = hdrRow + 1
+    Dim dataBot As Long: dataBot = hdrRow + n
+
+    ' ---- VBA metric arrays (values path; parity self-test proves == formulas) --
+    Dim knee() As Double: ReDim knee(1 To n)
+    For i = 1 To n: knee(i) = CDbl(aTable(i, 5)): Next i
+    Dim flatPct() As Long: flatPct = pl_RawBucketArray(knee, n)
+
+    Dim breadthPct() As Long, slopePct() As Long
+    ReDim breadthPct(1 To n, 1 To nt): ReDim slopePct(1 To n, 1 To nt)
+    Dim col1() As Long, tt As Long
+    For tt = 1 To nt
+        col1 = pl_RankBucketArray(rankA, tt, n)
+        For i = 1 To n: breadthPct(i, tt) = col1(i): Next i
+        col1 = pl_RankBucketArray(rankB, tt, n)
+        For i = 1 To n: slopePct(i, tt) = col1(i): Next i
+    Next tt
+
+    Dim bandScore() As Double: ReDim bandScore(1 To n, 1 To nt)
+    Dim weighted() As Double: ReDim weighted(1 To n)
+    For i = 1 To n
+        weighted(i) = flatPct(i)
+        For tt = 1 To nt
+            bandScore(i, tt) = PL_WEIGHT_B2 * (breadthPct(i, tt) + slopePct(i, tt))
+            weighted(i) = weighted(i) + bandScore(i, tt)
+        Next tt
+    Next i
+    Dim wsPct() As Long: wsPct = pl_RawBucketArray(weighted, n)
+
+    Dim headroom() As Double: ReDim headroom(1 To n)
+    Dim part() As Boolean: ReDim part(1 To n)
+    For i = 1 To n
+        headroom(i) = mtx.headroom(i)
+        part(i) = (headroom(i) > 0)
+    Next i
+    Dim hrPct() As Long: hrPct = pl_RawBucketArrayMasked(headroom, part, n)
+
+    ' ---- title + live weight cell ----
     ws.Cells(TITLE_ROW, 1).Value = "Interconnection Cost Curve Analysis"
     ws.Cells(TITLE_ROW, 1).Font.Bold = True
     ws.Cells(TITLE_ROW, 1).Font.Size = 14
+    ws.Cells(2, 1).Value = "Threshold weight (applies to every band):"
+    ws.Cells(2, 2).Value = PL_WEIGHT_B2
+    ws.Cells(2, 1).Font.Italic = True
+    ws.Cells(2, 2).Font.Bold = True
 
-    ' ---- Block A header row -----------------------------------
-    Dim hdr() As Variant: ReDim hdr(1 To 1, 1 To totalCols)
-    hdr(1, 1) = "Substation"
-    hdr(1, 2) = "Fitted Function"
-    hdr(1, 3) = "Segments"
-    hdr(1, 4) = "Step-Change Points (MW)"
-    hdr(1, 5) = "Knee / Flattening Point (MW)"
-    hdr(1, 6) = "Slope at Knee ($/MW per MW)"
-    hdr(1, 7) = "Marginal Slowdown Point (MW)"
+    ' ---- header row ----
+    Dim hdr() As Variant: ReDim hdr(1 To 1, 1 To totalNew)
+    hdr(1, cSub) = "Substation"
+    hdr(1, cVolt) = "Voltage (kV)"
+    hdr(1, cState) = "State"
+    hdr(1, cWS) = "Weighted Score (max 165)"
+    hdr(1, cWSP) = "Weighted Score Pctile (1-5)"
+    hdr(1, cHR) = "Headroom (MW)"
+    hdr(1, cHRP) = "Headroom Pctile (1-5)"
+    hdr(1, cFlat) = "Flattening Point (MW)"
+    hdr(1, cFlatP) = "Flattening Pctile (1-5)"
     For t = 0 To nt - 1
-        Dim bc As Long: bc = N_FIXED_COLS + 1 + 4 * t
-        hdr(1, bc) = "MW Range <= " & ThreshLabel(CDbl(thr(LBound(thr) + t)))
-        hdr(1, bc + 1) = "Slope over Range ($/MW per MW)"
-        hdr(1, bc + 2) = "Rank by MW Breadth"
-        hdr(1, bc + 3) = SlopeRankHeader()
+        Dim lbl As String: lbl = ThreshLabel(CDbl(thr(LBound(thr) + t)))
+        hdr(1, cRank0 + 2 * t) = "Rank by MW Breadth " & lbl
+        hdr(1, cRank0 + 2 * t + 1) = SlopeRankHeader() & " " & lbl
     Next t
-    ws.Cells(TABLE_HDR_ROW, 1).Resize(1, totalCols).Value = hdr
-
-    ' ---- Block A data (bulk) ----------------------------------
-    ws.Cells(TABLE_HDR_ROW + 1, 1).Resize(n, totalCols).Value = aTable
-
-    ' ---- Block A formatting -----------------------------------
-    Dim dataTop As Long: dataTop = TABLE_HDR_ROW + 1
-    ws.Cells(dataTop, 3).Resize(n, 1).NumberFormat = "0"                     ' segments
-    ws.Cells(dataTop, 5).Resize(n, 1).NumberFormat = FMT_MW1                 ' knee MW
-    ws.Cells(dataTop, 6).Resize(n, 1).NumberFormat = FMT_SLOPE               ' slope at knee
-    ws.Cells(dataTop, 7).Resize(n, 1).NumberFormat = FMT_MW1                 ' slowdown MW
+    hdr(1, cFitted) = "Fitted Function"
+    hdr(1, cSeg) = "Segments"
+    hdr(1, cStep) = "Step-Change Points (MW)"
+    hdr(1, cSlopeKnee) = "Slope at Knee ($/MW per MW)"
+    hdr(1, cSlowdown) = "Marginal Slowdown Point (MW)"
     For t = 0 To nt - 1
-        Dim scol As Long: scol = N_FIXED_COLS + 2 + 4 * t                    ' slope over range
-        ws.Cells(dataTop, scol).Resize(n, 1).NumberFormat = FMT_SLOPE
-        ' Rank columns: centred, plain integer, no colour scale (rank is
-        ' ordinal, so a gradient would imply a magnitude it does not have).
-        ' Whole-column formatting only -- the former per-cell grey "n/a"
-        ' recolour was a cell-by-cell loop (O(n*nt) COM calls) and is dropped
-        ' for the ~2,000-row scale target; the "n/a" text itself is unchanged.
-        Dim rc As Long
-        For rc = scol + 1 To scol + 2
-            With ws.Cells(dataTop, rc).Resize(n, 1)
-                .NumberFormat = "0"
-                .HorizontalAlignment = xlCenter
-            End With
-        Next rc
+        Dim lbl2 As String: lbl2 = ThreshLabel(CDbl(thr(LBound(thr) + t)))
+        hdr(1, cDet0 + 5 * t) = "MW Range <= " & lbl2
+        hdr(1, cDet0 + 5 * t + 1) = "Slope over Range ($/MW per MW)"
+        hdr(1, cDet0 + 5 * t + 2) = lbl2 & " Breadth (0-5)"
+        hdr(1, cDet0 + 5 * t + 3) = lbl2 & " Slope (0-5)"
+        hdr(1, cDet0 + 5 * t + 4) = lbl2 & " Band Score"
     Next t
+    ws.Cells(hdrRow, 1).Resize(1, totalNew).Value = hdr
 
-    StyleHeaderRow ws.Cells(TABLE_HDR_ROW, 1).Resize(1, totalCols)
-
-    ' ---- Block E: Threshold Rankings leaderboard -------------
-    ' Two rows below the chart. Pushes the source-data / helper blocks
-    ' further down so nothing overlaps; chart series still reference the
-    ' source-data copy wherever it lands.
-    Dim tableLastRow As Long: tableLastRow = TABLE_HDR_ROW + n
-    Dim chartTopRow As Long: chartTopRow = tableLastRow + CHART_GAP_ROWS
-    Dim lbTopRow As Long: lbTopRow = chartTopRow + CHART_ROWS + 2
-    Dim lbLastRow As Long
-    BuildLeaderboard ws, lbTopRow, names, n, rkCount, rkMaxMW, rkSlope, rankA, rankB, lbLastRow
-
-    ' ---- Block C: Source Data copy (chart reads THIS) --------
-    Dim srcHdrTextRow As Long: srcHdrTextRow = lbLastRow + 2
-    srcMWRow = srcHdrTextRow + 1
-    srcFirstDataRow = srcMWRow + 1
-
-    ws.Cells(srcHdrTextRow, 1).Value = "Source Data"
-    ws.Cells(srcHdrTextRow, 1).Font.Bold = True
-
-    ' MW header row: col A label, cols 2..m+1 = MW points
-    Dim srcHdr() As Variant: ReDim srcHdr(1 To 1, 1 To m + 1)
-    srcHdr(1, 1) = "Substation"
-    For j = 1 To m: srcHdr(1, j + 1) = mw(j): Next j
-    ws.Cells(srcMWRow, 1).Resize(1, m + 1).Value = srcHdr
-
-    ' name + cost matrix
-    Dim srcBody() As Variant: ReDim srcBody(1 To n, 1 To m + 1)
+    ' ---- data block ----
+    Dim blk() As Variant: ReDim blk(1 To n, 1 To totalNew)
+    Dim rr As Long, baseA As Long
     For i = 1 To n
-        srcBody(i, 1) = names(i)
-        For j = 1 To m: srcBody(i, j + 1) = costM(i, j): Next j
+        rr = hdrRow + i
+        ' identity (always values, always split)
+        blk(i, cSub) = mtx.names(i)
+        If mtx.keyUseVolt(i) Then
+            blk(i, cVolt) = mtx.keyVolt(i)
+        Else
+            blk(i, cVolt) = ""
+        End If
+        blk(i, cState) = mtx.state(i)
+        ' detailed metrics + rank inputs (always values, sourced from aTable)
+        blk(i, cFlat) = knee(i)
+        blk(i, cFitted) = aTable(i, 2)
+        blk(i, cSeg) = aTable(i, 3)
+        blk(i, cStep) = aTable(i, 4)
+        blk(i, cSlopeKnee) = aTable(i, 6)
+        blk(i, cSlowdown) = aTable(i, 7)
+        For t = 0 To nt - 1
+            baseA = N_FIXED_COLS + 1 + 4 * t          ' aTable base col for threshold t
+            blk(i, cRank0 + 2 * t) = aTable(i, baseA + 2)      ' Rank by breadth
+            blk(i, cRank0 + 2 * t + 1) = aTable(i, baseA + 3)  ' Rank by slope
+            blk(i, cDet0 + 5 * t) = aTable(i, baseA)           ' MW range
+            blk(i, cDet0 + 5 * t + 1) = aTable(i, baseA + 1)   ' slope over range
+        Next t
+
+        If USE_LIVE_FORMULAS Then
+            blk(i, cFlatP) = pl_RawPctFormula(pl_ColLetter(cFlat), dataTop, dataBot, pl_ColLetter(cFlat) & rr)
+            Dim sumRefs As String: sumRefs = ""
+            For t = 0 To nt - 1
+                Dim bR As String: bR = pl_ColLetter(cRank0 + 2 * t)
+                Dim sR As String: sR = pl_ColLetter(cRank0 + 2 * t + 1)
+                blk(i, cDet0 + 5 * t + 2) = pl_RankPctFormula(bR, dataTop, dataBot, bR & rr)
+                blk(i, cDet0 + 5 * t + 3) = pl_RankPctFormula(sR, dataTop, dataBot, sR & rr)
+                blk(i, cDet0 + 5 * t + 4) = "=$B$2*(" & pl_ColLetter(cDet0 + 5 * t + 2) & rr & "+" & _
+                                            pl_ColLetter(cDet0 + 5 * t + 3) & rr & ")"
+                If Len(sumRefs) > 0 Then sumRefs = sumRefs & "+"
+                sumRefs = sumRefs & pl_ColLetter(cDet0 + 5 * t + 4) & rr
+            Next t
+            blk(i, cWS) = "=" & pl_ColLetter(cFlatP) & rr & "+" & sumRefs
+            blk(i, cWSP) = pl_RawPctFormula(pl_ColLetter(cWS), dataTop, dataBot, pl_ColLetter(cWS) & rr)
+            Dim mf As String
+            mf = pl_MinifsFormula(mtx.costName, mtx.colTrig, mtx.colName, mtx.colVolt, _
+                                  mtx.keyName(i), mtx.keyUseVolt(i), mtx.keyVolt(i), 2, mtx.costLastRow)
+            blk(i, cHR) = "=IFERROR(IF(" & mf & "=0," & EMPTY_LIT & "," & mf & ")," & EMPTY_LIT & ")"
+            blk(i, cHRP) = "=IFERROR(" & _
+                Mid$(pl_RawPctFormula(pl_ColLetter(cHR), dataTop, dataBot, pl_ColLetter(cHR) & rr), 2) & _
+                "," & EMPTY_LIT & ")"
+        Else
+            blk(i, cFlatP) = flatPct(i)
+            blk(i, cWS) = weighted(i)
+            blk(i, cWSP) = wsPct(i)
+            If part(i) Then
+                blk(i, cHR) = headroom(i)
+                blk(i, cHRP) = hrPct(i)
+            Else
+                blk(i, cHR) = ""
+                blk(i, cHRP) = ""
+            End If
+            For t = 0 To nt - 1
+                blk(i, cDet0 + 5 * t + 2) = breadthPct(i, t + 1)
+                blk(i, cDet0 + 5 * t + 3) = slopePct(i, t + 1)
+                blk(i, cDet0 + 5 * t + 4) = bandScore(i, t + 1)
+            Next t
+        End If
     Next i
-    ws.Cells(srcFirstDataRow, 1).Resize(n, m + 1).Value = srcBody
 
-    ws.Cells(srcMWRow, 2).Resize(1, m).NumberFormat = FMT_MW
-    ws.Cells(srcFirstDataRow, 2).Resize(n, m).NumberFormat = FMT_DOLLAR
-    StyleHeaderRow ws.Cells(srcMWRow, 1).Resize(1, m + 1)
+    If USE_LIVE_FORMULAS Then
+        ws.Cells(dataTop, 1).Resize(n, totalNew).Formula = blk
+    Else
+        ws.Cells(dataTop, 1).Resize(n, totalNew).Value = blk
+    End If
 
-    ' ---- Block D: Threshold Curve Helper ----------------------
-    ' One MW column MW(1)..MW(m) in 1-MW steps, then threshold/MW per
-    ' threshold. Left visible (light-gray font) rather than hidden,
-    ' because hidden cells can drop out of chart series.
-    hlpMWCol = m + 3                                   ' gap column at m+2
-    hlpFirstThreshCol = hlpMWCol + 1
-    Dim hlpHdrRow As Long: hlpHdrRow = srcHdrTextRow
-    Dim hlpSubRow As Long: hlpSubRow = srcMWRow
-    hlpFirstRow = srcFirstDataRow
-    hlpRows = CLng(mw(m) - mw(1)) + 1
-
-    ws.Cells(hlpHdrRow, hlpMWCol).Value = "Threshold Curve Helper"
-    ws.Cells(hlpHdrRow, hlpMWCol).Font.Bold = True
-
-    ' sub-header row
-    ws.Cells(hlpSubRow, hlpMWCol).Value = "MW"
-    For t = LBound(thr) To UBound(thr)
-        ws.Cells(hlpSubRow, hlpFirstThreshCol + (t - LBound(thr))).Value = _
-            ThreshLabel(CDbl(thr(t))) & " total cost"
+    ' ---- number formats (whole columns once) ----
+    ws.Cells(dataTop, cFlat).Resize(n, 1).NumberFormat = FMT_MW1
+    ws.Cells(dataTop, cSlopeKnee).Resize(n, 1).NumberFormat = FMT_SLOPE
+    ws.Cells(dataTop, cSlowdown).Resize(n, 1).NumberFormat = FMT_MW1
+    ws.Cells(dataTop, cHR).Resize(n, 1).NumberFormat = "#,##0"
+    ws.Cells(dataTop, cWS).Resize(n, 1).NumberFormat = "0.0"
+    Dim cen As Variant, k As Long
+    cen = Array(cWSP, cHRP, cFlatP)
+    For k = LBound(cen) To UBound(cen)
+        With ws.Cells(dataTop, CLng(cen(k))).Resize(n, 1)
+            .NumberFormat = "0": .HorizontalAlignment = xlCenter
+        End With
+    Next k
+    For t = 0 To nt - 1
+        With ws.Cells(dataTop, cRank0 + 2 * t).Resize(n, 2)
+            .NumberFormat = "0": .HorizontalAlignment = xlCenter
+        End With
+        ws.Cells(dataTop, cDet0 + 5 * t + 1).Resize(n, 1).NumberFormat = FMT_SLOPE
+        With ws.Cells(dataTop, cDet0 + 5 * t + 2).Resize(n, 2)
+            .NumberFormat = "0": .HorizontalAlignment = xlCenter
+        End With
     Next t
 
-    Dim hlp() As Variant: ReDim hlp(1 To hlpRows, 1 To nt + 1)
-    Dim r As Long, xVal As Double
-    For r = 1 To hlpRows
-        xVal = mw(1) + (r - 1)
-        hlp(r, 1) = xVal
-        For t = LBound(thr) To UBound(thr)
-            hlp(r, 2 + (t - LBound(thr))) = CDbl(thr(t)) / xVal
-        Next t
-    Next r
-    ws.Cells(hlpFirstRow, hlpMWCol).Resize(hlpRows, nt + 1).Value = hlp
+    ' ---- header styling + note ----
+    StyleHeaderRow ws.Cells(hdrRow, 1).Resize(1, totalNew)
+    Dim noteRow As Long: noteRow = dataBot + 2
+    ws.Cells(noteRow, 1).Value = _
+        "Weighted Score max = 165 = flattening (5) + 4 bands x $B$2 x (breadth 5 + slope 5). " & _
+        "Practical max today = 125 ($25MM band scores 0 for all). Single $B$2 weights the " & _
+        "threshold axis as a whole. Headroom (MW) + its percentile are standalone -- NOT scored."
+    ws.Cells(noteRow, 1).Font.Italic = True
 
-    ws.Cells(hlpSubRow, hlpMWCol).Resize(hlpRows + 1, nt + 1).Font.Color = RGB(190, 190, 190)
-    ws.Cells(hlpHdrRow, hlpMWCol).Font.Color = RGB(190, 190, 190)
-    ws.Cells(hlpFirstRow, hlpMWCol).Resize(hlpRows, 1).NumberFormat = FMT_MW
-    ws.Cells(hlpFirstRow, hlpFirstThreshCol).Resize(hlpRows, nt).NumberFormat = FMT_DOLLAR
+    ' ---- column sizing ----
+    ws.Columns(cSub).AutoFit
+    ws.Columns(cState).AutoFit
+    ws.Columns(cFitted).ColumnWidth = COLB_WIDTH
+    ws.Columns(cFitted).WrapText = True
 
-    ' ---- Global column sizing ---------------------------------
-    ws.Columns(1).AutoFit
-    ws.Columns(2).ColumnWidth = COLB_WIDTH
-    ws.Columns(2).WrapText = True
-    Dim cc As Long
-    For cc = 3 To totalCols
-        ws.Columns(cc).AutoFit
-    Next cc
-End Sub
+    WriteSheet = noteRow
+End Function
 
 Private Function ThreshLabel(ByVal L As Double) As String
     ThreshLabel = "$" & Format(L / 1000000#, "0") & "MM"
@@ -4727,247 +4724,6 @@ Private Function LeaderBefore(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Lo
     LeaderBefore = (StrComp(names(i1), names(i2), vbTextCompare) < 0)
 End Function
 
-' ============================================================
-'  CHART BUILDER
-'  xlXYScatterLines so MW sits on a true numeric X axis. Every series
-'  references the copied Block C / Block D data on the output sheet,
-'  so the tab is self-contained and portable.
-' ============================================================
-
-Private Sub BuildChart(ByVal ws As Worksheet, ByRef mw() As Double, _
-                       ByRef costM() As Double, ByVal n As Long, ByVal m As Long, _
-                       ByVal srcMWRow As Long, ByVal srcFirstDataRow As Long, _
-                       ByVal hlpMWCol As Long, ByVal hlpFirstThreshCol As Long, _
-                       ByVal hlpFirstRow As Long, ByVal hlpRows As Long)
-
-    Dim thr As Variant: thr = GetThresholds()
-    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
-
-    Dim tableLastRow As Long: tableLastRow = TABLE_HDR_ROW + n
-    Dim chartTopRow As Long: chartTopRow = tableLastRow + CHART_GAP_ROWS
-
-    Dim chObj As ChartObject
-    Set chObj = ws.ChartObjects.Add( _
-        Left:=ws.Columns(1).Left + 4, _
-        Top:=ws.Rows(chartTopRow).Top, _
-        Width:=CHART_W, Height:=CHART_H)
-
-    Dim ch As Chart: Set ch = chObj.Chart
-    ch.ChartType = xlXYScatterLines
-    ch.PlotVisibleOnly = False                    ' keep light-gray helper cells in the plot
-
-    ' clear any auto-created series
-    Do While ch.SeriesCollection.Count > 0
-        ch.SeriesCollection(1).Delete
-    Loop
-
-    ' ---- Substation series ------------------------------------
-    Dim i As Long
-    For i = 1 To n
-        Dim srsRow As Long: srsRow = srcMWRow + i          ' data row for substation i
-        Dim s As Series: Set s = ch.SeriesCollection.NewSeries
-        s.Name = ws.Cells(srsRow, 1).Value                  ' name from the copied name cell
-        s.XValues = ws.Range(ws.Cells(srcMWRow, 2), ws.Cells(srcMWRow, m + 1))
-        s.Values = ws.Range(ws.Cells(srsRow, 2), ws.Cells(srsRow, m + 1))
-        StyleSubSeries s, i
-    Next i
-
-    ' ---- Threshold series (added last, drawn on top) ---------
-    Dim t As Long
-    For t = 0 To nt - 1
-        Dim st As Series: Set st = ch.SeriesCollection.NewSeries
-        st.Name = ThreshLabel(CDbl(thr(LBound(thr) + t))) & " total cost"
-        st.XValues = ws.Range(ws.Cells(hlpFirstRow, hlpMWCol), _
-                              ws.Cells(hlpFirstRow + hlpRows - 1, hlpMWCol))
-        st.Values = ws.Range(ws.Cells(hlpFirstRow, hlpFirstThreshCol + t), _
-                             ws.Cells(hlpFirstRow + hlpRows - 1, hlpFirstThreshCol + t))
-        StyleThreshSeries st, t, nt
-    Next t
-
-    ' ---- Axes and chrome --------------------------------------
-    Dim gMin As Double, gMax As Double
-    GlobalMinMax costM, n, m, gMin, gMax
-    Dim incr As Double: incr = NiceIncrement(gMax)
-
-    ch.HasTitle = True
-    ch.ChartTitle.Text = "Cost per MW by Substation and Project Size"
-
-    With ch.Axes(xlCategory)
-        .HasTitle = True
-        .AxisTitle.Text = "Project Size (MW)"
-        .MinimumScale = mw(1)
-        .MaximumScale = mw(m)
-        .MajorUnit = ModalStep(mw, m)
-        .HasMajorGridlines = False                 ' no vertical gridlines
-        .HasMinorGridlines = False
-    End With
-
-    With ch.Axes(xlValue)
-        .HasTitle = True
-        .AxisTitle.Text = "Interconnection Cost ($/MW)"
-        .TickLabels.NumberFormat = FMT_DOLLAR
-        .MinimumScale = NiceRound(0.9 * gMin, incr, False)
-        .MaximumScale = NiceRound(1.05 * gMax, incr, True)
-        .HasMajorGridlines = True                  ' light horizontal gridlines only
-        .HasMinorGridlines = False
-        .MajorGridlines.Format.Line.ForeColor.RGB = RGB(217, 217, 217)
-        .MajorGridlines.Format.Line.Weight = 0.5
-    End With
-
-    ch.HasLegend = True
-    ch.Legend.Position = xlLegendPositionRight
-    ch.Legend.Format.Line.Visible = msoFalse
-
-    ch.PlotArea.Format.Fill.Visible = msoTrue
-    ch.PlotArea.Format.Fill.ForeColor.RGB = RGB(255, 255, 255)
-    ch.ChartArea.Format.Line.Visible = msoFalse    ' no chart border
-    ch.ChartArea.Format.Fill.ForeColor.RGB = RGB(255, 255, 255)
-End Sub
-
-' Color cycles a 17-entry palette; dash cycles 4; marker cycles 7.
-' The three cycles run on co-prime-ish period lengths deliberately, so
-' series stay distinguishable even where the palette repeats (n > 17).
-Private Sub StyleSubSeries(ByVal s As Series, ByVal idx0 As Long)
-    Dim pal As Variant: pal = GetPalette()
-    Dim dsh As Variant: dsh = GetDashes()
-    Dim mk As Variant: mk = GetMarkers()
-
-    Dim palN As Long: palN = UBound(pal) - LBound(pal) + 1
-    Dim dshN As Long: dshN = UBound(dsh) - LBound(dsh) + 1
-    Dim mkN As Long: mkN = UBound(mk) - LBound(mk) + 1
-
-    Dim k As Long: k = idx0 - 1
-    Dim col As Long: col = pal(LBound(pal) + (k Mod palN))
-
-    s.Format.Line.ForeColor.RGB = col
-    s.Format.Line.Weight = 1.75
-    s.Border.LineStyle = dsh(LBound(dsh) + (k Mod dshN))
-
-    s.MarkerStyle = mk(LBound(mk) + (k Mod mkN))
-    s.MarkerSize = 5
-    s.MarkerBackgroundColor = col
-    s.MarkerForegroundColor = col                  ' no contrasting marker border
-End Sub
-
-' Threshold helper curves: no markers, dashed, gray-to-black ramp in
-' ascending threshold order, drawn heavier so they sit over the data.
-Private Sub StyleThreshSeries(ByVal s As Series, ByVal idx0 As Long, ByVal count As Long)
-    s.MarkerStyle = xlMarkerStyleNone
-    s.Border.LineStyle = xlDash
-    s.Format.Line.Weight = 2.5
-    s.Format.Line.ForeColor.RGB = ThreshColor(idx0, count)
-End Sub
-
-' ============================================================
-'  Palette / marker / dash tables and small numeric helpers
-' ============================================================
-
-Private Function GetPalette() As Variant
-    GetPalette = Array( _
-        RGB(13, 63, 74), RGB(120, 185, 15), RGB(0, 140, 70), RGB(74, 176, 196), _
-        RGB(193, 39, 45), RGB(232, 163, 61), RGB(106, 76, 147), RGB(31, 119, 180), _
-        RGB(140, 86, 75), RGB(214, 44, 168), RGB(44, 160, 44), RGB(255, 127, 14), _
-        RGB(23, 190, 207), RGB(127, 127, 127), RGB(188, 189, 34), RGB(148, 103, 189), _
-        RGB(0, 0, 0))
-End Function
-
-Private Function GetDashes() As Variant
-    GetDashes = Array(xlContinuous, xlDash, xlDashDot, xlDot)
-End Function
-
-Private Function GetMarkers() As Variant
-    GetMarkers = Array(xlMarkerStyleCircle, xlMarkerStyleSquare, xlMarkerStyleTriangle, _
-                       xlMarkerStyleDiamond, xlMarkerStyleX, xlMarkerStyleStar, _
-                       xlMarkerStylePlus)
-End Function
-
-' Gray-to-black ramp for the threshold series (ascending threshold).
-Private Function ThreshColor(ByVal idx0 As Long, ByVal count As Long) As Long
-    Dim ramp As Variant
-    ramp = Array(RGB(176, 176, 176), RGB(122, 122, 122), RGB(69, 69, 69), RGB(0, 0, 0))
-    Dim rN As Long: rN = UBound(ramp) - LBound(ramp) + 1
-    If idx0 <= rN - 1 Then
-        ThreshColor = ramp(idx0)
-    Else
-        ' more thresholds than table entries: interpolate gray 176 -> 0
-        Dim g As Long
-        If count > 1 Then
-            g = CLng(176 - 176 * idx0 / (count - 1))
-        Else
-            g = 0
-        End If
-        If g < 0 Then g = 0
-        ThreshColor = RGB(g, g, g)
-    End If
-End Function
-
-Private Sub GlobalMinMax(ByRef costM() As Double, ByVal n As Long, ByVal m As Long, _
-                         ByRef gMin As Double, ByRef gMax As Double)
-    Dim i As Long, j As Long
-    gMin = costM(1, 1): gMax = costM(1, 1)
-    For i = 1 To n
-        For j = 1 To m
-            If costM(i, j) < gMin Then gMin = costM(i, j)
-            If costM(i, j) > gMax Then gMax = costM(i, j)
-        Next j
-    Next i
-End Sub
-
-' Modal (most-frequent) consecutive MW step in the header.
-Private Function ModalStep(ByRef mw() As Double, ByVal m As Long) As Double
-    Dim j As Long, k As Long
-    Dim vals() As Double: ReDim vals(1 To m - 1)
-    Dim cnts() As Long: ReDim cnts(1 To m - 1)
-    Dim nv As Long: nv = 0
-    Dim d As Double, found As Boolean
-    For j = 2 To m
-        d = mw(j) - mw(j - 1)
-        found = False
-        For k = 1 To nv
-            If Abs(vals(k) - d) < 0.000001 Then
-                cnts(k) = cnts(k) + 1
-                found = True
-                Exit For
-            End If
-        Next k
-        If Not found Then
-            nv = nv + 1
-            vals(nv) = d
-            cnts(nv) = 1
-        End If
-    Next j
-    Dim best As Long: best = 1
-    For k = 2 To nv
-        If cnts(k) > cnts(best) Then best = k
-    Next k
-    ModalStep = vals(best)
-End Function
-
-' Round outward (ceil) or inward (floor) to a clean increment.
-Private Function NiceRound(ByVal x As Double, ByVal incr As Double, _
-                           ByVal up As Boolean) As Double
-    If incr <= 0 Then
-        NiceRound = x
-        Exit Function
-    End If
-    If up Then
-        NiceRound = -Int(-x / incr) * incr
-    Else
-        NiceRound = Int(x / incr) * incr
-    End If
-End Function
-
-' A clean axis increment ~ one order of magnitude below the max value.
-Private Function NiceIncrement(ByVal gMax As Double) As Double
-    If gMax <= 0 Then
-        NiceIncrement = 1
-        Exit Function
-    End If
-    Dim ord As Double: ord = Int(Log(gMax) / Log(10#))
-    Dim incr As Double: incr = 10# ^ (ord - 1)
-    If incr < 1 Then incr = 1
-    NiceIncrement = incr
-End Function
 
 ' ============================================================
 '  SELF TEST

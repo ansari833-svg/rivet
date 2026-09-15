@@ -71,8 +71,22 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    `Cecelia`) always gets a full row, even with no matching site entry.
    `State` is a **LEFT JOIN** attached from `Site Data`: filled where the
    substation matches (by name, plus voltage when carried), **left blank when
-   there is no match — never a reason to drop the row**. Site rows with no
-   Cost Data match are logged as informational only. The `Matrix` identity is
+   there is no match — never a reason to drop the row**.
+
+   **One shared name normalization on both sides.** The match key runs both the
+   cost-side name and the site-side `Summary!A` name through the same
+   `pl_NormSubName` (via `pl_CostKey`) before comparing: it strips the embedded
+   voltage token (`230kV` / `230 kV` / `230. kV`), collapses nbsp/multiple
+   spaces, trims, and lower-cases. So a site name with the voltage baked in,
+   `Big Cajun 1 230kV`, normalizes to `big cajun 1` and **matches** the clean
+   cost name `Big Cajun 1` @ 230 — where before the raw site string never
+   equalled the parsed cost name and ~400+ genuine pairs reported *no match*
+   (expected < ~100). It preserves a trailing unit number (the `1` in
+   `Big Cajun 1`) so distinct units never merge. Stage 3 logs the reconciliation
+   — *site triples, cost substations, matched, unmatched* — and every remaining
+   unmatched site row with **both its raw name and its normalized key**, so true
+   residuals are diagnosable. Site rows with no Cost Data match are informational
+   only. The `Matrix` identity is
    **three separate columns** — `Substation` (clean name), `Voltage (kV)`,
    `State` — followed by the MW × cost body (never a concatenated
    `Chalkley 230. kV (Louisiana)` label). The body is **live `SUMIFS` by
@@ -106,6 +120,29 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    zero cell yields a **defined** result instead of `#DIV/0!` / overflow.
    Zero-cost substations are **kept** in the ranking and percentiles; this lines
    up with **Headroom (MW)**, which equals the first trigger MW.
+
+   **Column order (identity + headline first).** `Cost Curve Analysis` is one
+   contiguous table whose identity is **three separate columns** —
+   `Substation` (clean name only), `Voltage (kV)`, `State` — never concatenated.
+   The headline results sit next to the name, then the per-threshold ranks, then
+   the detailed blocks, left to right:
+   `Substation | Voltage (kV) | State | Weighted Score | Weighted Score Pctile |
+   Headroom (MW) | Headroom Pctile | Flattening Point | Flattening Pctile |
+   [Rank by MW Breadth / Rank by Slope per threshold] | Fitted Function |
+   Segments | Step-Change Points | Slope at Knee | Marginal Slowdown |
+   [per threshold: MW Range, Slope over Range, Breadth (0-5), Slope (0-5), Band
+   Score]`. Every live-formula reference (`Weighted Score = Flattening pctile +
+   Σ band scores`, each band score `= $B$2·(breadth pctile + slope pctile)`, and
+   every `PERCENTRANK.EXC` population range) is **derived from a single
+   column-index map**, so a column move relocates its references automatically —
+   the math and the 165 ceiling are unchanged, only positions.
+
+   **No chart.** Stage 4 no longer builds a chart. Excel caps a chart at 256
+   series and ~1,691 substations overflowed it (*“A chart can only have up to
+   256 series”*), so the chart routine and its helpers, the Source-Data / helper
+   copy blocks it read, and its progress phase were removed. Stage 4's outputs
+   are the `Cost Curve Analysis` sheet (table + threshold leaderboard) and the
+   reconciliation.
 
 Also produced: a run log **`_Pipeline Log`** (per-file status, dropped
 duplicate triples, join alignment errors), a **`_Pipeline State`** checkpoint
@@ -264,7 +301,7 @@ run settings are set once at entry and restored in `Cleanup` on every exit
 (including the error handler): `ScreenUpdating=False`, `EnableEvents=False`,
 `DisplayAlerts=False`, `Calculation=xlManual`, `AskToUpdateLinks=False`, a live
 `Application.StatusBar`, and a **single `Application.CalculateFull` at the very
-end** (no intermediate recalcs; the chart is built after it).
+end** (no intermediate recalcs).
 
 | Stage | Before (bottleneck) | After |
 |-------|---------------------|-------|
@@ -375,6 +412,16 @@ Score**, and the composite maximum stays 165.
   `_Skipped Files` itemizes all 3 non-contributors; and that the bad-header file
   is flagged **LOST** (its substation appears nowhere else) while the empty
   duplicate is flagged **redundant** (its substation is covered by another file).
+- **Site↔Cost name matching** — the shared `pl_NormSubName` maps
+  `Big Cajun 1 230kV` → `big cajun 1` (voltage stripped, unit number kept),
+  `Ponderosa 500 kV` → `ponderosa`, `Grimes 138. kV` → `grimes`; and `pl_CostKey`
+  produces the **same** key for the embedded-voltage site name and the clean cost
+  name for each of `Big Cajun 1`, `Ponderosa`, `Cincinnati`, `Mockingbird`,
+  `Grimes`, so every genuine pair matches.
+- **Analysis layout** — traces the `nt = 4` column map: identity at `A/B/C`,
+  Weighted Score/pctile/Headroom at `D/E/F`, Flattening pctile at `I`, and the
+  Weighted Score formula resolves to `=I4+AA4+AF4+AK4+AP4` with the first band
+  score `=$B$2*(Y4+Z4)` — confirming references land on the reordered columns.
 - **Matrix shape, headroom, and the 165 ceiling.**
 
 Results print to the Immediate window (**Ctrl+G**). `SelfTest` also prints a
