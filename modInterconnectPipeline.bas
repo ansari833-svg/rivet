@@ -202,6 +202,9 @@ Private Type PL_TCostFile
     Status        As String
     Message       As String
     RowsImported  As Long
+    Outcome       As String     ' categorized: Contributed / Skipped: <reason> / Failed: open error
+    SeenHeaders   As String     ' actual headers seen when the known headers weren't found
+    Loss          As String     ' LOST / redundant / unknown -- set during reconciliation
 End Type
 
 Private Type PL_TSiteTriple
@@ -478,13 +481,20 @@ Public Sub RebuildAudit()
     ok = pl_ComputeAudit(wsCost, wsSk, log, dSubs, fContrib, coll, sf)
     pl_WriteLog log
     If ok Then
+        Dim sel As Long: sel = pl_ReadSelected("Cost Files Selected")
+        Dim selLine As String
+        If sel >= 0 Then
+            selLine = "Files selected:              " & sel & vbCrLf & _
+                      "  = " & fContrib & " contributed + " & sf & " skipped/failed" & _
+                      IIf((fContrib + sf) <> sel, "  (!! " & (sel - (fContrib + sf)) & " UNACCOUNTED)", "") & vbCrLf
+        Else
+            selLine = "Files accounted:             " & (fContrib + sf) & _
+                      "  (" & fContrib & " contributed + " & sf & " skipped; selected count not recorded)" & vbCrLf
+        End If
         MsgBox "Audit rebuilt from sheets (no consolidation re-run):" & vbCrLf & vbCrLf & _
+               selLine & _
                "Distinct substations:        " & dSubs & vbCrLf & _
-               "Contributing source files:   " & fContrib & vbCrLf & _
-               "Substations from >1 file:     " & coll & vbCrLf & _
-               "Skipped/failed files:        " & sf & vbCrLf & vbCrLf & _
-               "Files seen (" & (fContrib + sf) & ") = distinct (" & dSubs & ") + collapsed (" & _
-               (fContrib - dSubs) & ") + skipped/failed (" & sf & ")." & vbCrLf & vbCrLf & _
+               "Substations from >1 file:     " & coll & vbCrLf & vbCrLf & _
                "Full reconciliation written to " & PL_SH_LOG & ".", _
                vbInformation, "Rebuild Audit"
     Else
@@ -563,7 +573,7 @@ Private Function pl_ComputeAudit(ByVal wsCost As Worksheet, ByVal wsSkipped As W
     Next r
 
     distinctSubs = dSub.Count
-    filesContributing = dPair.Count            ' each source file maps to one substation
+    filesContributing = dFile.Count            ' distinct source files that produced rows
     Dim k As Variant
     For Each k In dSubFiles.Keys
         If dSubFiles(k) > 1 Then collapseCount = collapseCount + 1
@@ -574,15 +584,28 @@ Private Function pl_ComputeAudit(ByVal wsCost As Worksheet, ByVal wsSkipped As W
         If slr >= 2 Then skippedFailed = slr - 1
     End If
 
-    Dim dupCollapsed As Long: dupCollapsed = filesContributing - distinctSubs
-    Dim filesSeen As Long: filesSeen = filesContributing + skippedFailed
+    Dim dupCollapsed As Long: dupCollapsed = dPair.Count - distinctSubs
+    Dim accounted As Long: accounted = filesContributing + skippedFailed
+    Dim selected As Long: selected = pl_ReadSelected("Cost Files Selected")
 
     pl_LogAdd log, "AUDIT REBUILT " & Format$(Now, "yyyy-mm-dd hh:nn:ss") & _
                    " (regenerated from sheets; no consolidation re-run)."
+    ' File-level reconciliation, ANCHORED on the selected count.
+    If selected >= 0 Then
+        pl_LogAdd log, "Files: " & selected & " selected = " & filesContributing & " contributed + " & _
+                       skippedFailed & " skipped/failed."
+        If accounted <> selected Then
+            pl_LogAdd log, "  *** UNACCOUNTED: " & (selected - accounted) & " selected file(s) neither " & _
+                           "appear in Cost Data nor in " & PL_SH_SKIPPED & " -- investigate. ***"
+        End If
+    Else
+        pl_LogAdd log, "Files: " & filesContributing & " contributed + " & skippedFailed & _
+                       " skipped/failed = " & accounted & " accounted (selected count not recorded)."
+    End If
+    ' Substation-level view of the contributing files.
     pl_LogAdd log, "Cost Data: " & distinctSubs & " distinct substation(s) from " & _
-                   filesContributing & " contributing source file(s) (" & dFile.Count & " distinct file name(s))."
-    pl_LogAdd log, "Collapsed (>1 file -> 1 substation): " & collapseCount & _
-                   " substation(s), " & dupCollapsed & " extra file(s) merged."
+                   filesContributing & " contributing file(s); " & collapseCount & _
+                   " substation(s) drew from >1 file (" & dupCollapsed & " extra file(s) merged)."
     Dim shown As Long: shown = 0
     For Each k In dSubFiles.Keys
         If dSubFiles(k) > 1 And shown < 8 Then
@@ -591,9 +614,6 @@ Private Function pl_ComputeAudit(ByVal wsCost As Worksheet, ByVal wsSkipped As W
         End If
     Next k
     pl_LogAdd log, "Skipped/failed files (from " & PL_SH_SKIPPED & "): " & skippedFailed & "."
-    pl_LogAdd log, "Reconciliation: files seen (" & filesSeen & ") = distinct substations (" & _
-                   distinctSubs & ") + duplicate files collapsed (" & dupCollapsed & _
-                   ") + skipped/failed (" & skippedFailed & ")."
     pl_ComputeAudit = True
 End Function
 
@@ -695,8 +715,8 @@ Private Sub pl_SaveCheckpoint(ByRef log As PL_TLog, ByVal stage As Long, ByVal r
     pl_LogAdd log, "Stage " & stage & " (" & pl_StageName(stage) & ") checkpoint written and saved (" & rows & " rows)."
 End Sub
 
-' Records one stage's completion (status, rows, timestamp) on _Pipeline State.
-Private Sub pl_MarkStage(ByVal stage As Long, ByVal rows As Long)
+' Returns the _Pipeline State sheet, creating it (with the stage table) if absent.
+Private Function pl_EnsureStateSheet() As Worksheet
     Dim ws As Worksheet
     Set ws = pl_SheetByName(PL_SH_STATE)
     If ws Is Nothing Then
@@ -713,9 +733,50 @@ Private Sub pl_MarkStage(ByVal stage As Long, ByVal rows As Long)
         Next s
         ws.Columns.AutoFit
     End If
+    Set pl_EnsureStateSheet = ws
+End Function
+
+' Records one stage's completion (status, rows, timestamp) on _Pipeline State.
+Private Sub pl_MarkStage(ByVal stage As Long, ByVal rows As Long)
+    Dim ws As Worksheet: Set ws = pl_EnsureStateSheet()
     ws.Cells(1 + stage, 3).Value = rows
     ws.Cells(1 + stage, 4).Value = Format$(Now, "yyyy-mm-dd hh:nn:ss")
 End Sub
+
+' Persists the count of files the user SELECTED for a stage, on _Pipeline State,
+' so the file-level reconciliation (selected = contributed + skipped) can be
+' rebuilt from the sheets even after _Pipeline Log is deleted. Labeled rows below
+' the stage table; pl_ReadSelected looks the label up by name.
+Private Sub pl_RecordSelected(ByVal label As String, ByVal n As Long)
+    Dim ws As Worksheet: Set ws = pl_EnsureStateSheet()
+    Dim r As Long, lr As Long
+    lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For r = PL_STG_COUNT + 3 To lr           ' scan the labeled area below the stage table
+        If StrComp(Trim$(CStr(pl_NZ(ws.Cells(r, 1).Value))), label, vbTextCompare) = 0 Then
+            ws.Cells(r, 2).Value = n
+            Exit Sub
+        End If
+    Next r
+    Dim nr As Long: nr = lr + 1
+    If nr < PL_STG_COUNT + 3 Then nr = PL_STG_COUNT + 3
+    ws.Cells(nr, 1).Value = label
+    ws.Cells(nr, 2).Value = n
+End Sub
+
+' Reads a labeled selected-count from _Pipeline State; -1 when not recorded.
+Private Function pl_ReadSelected(ByVal label As String) As Long
+    pl_ReadSelected = -1
+    Dim ws As Worksheet: Set ws = pl_SheetByName(PL_SH_STATE)
+    If ws Is Nothing Then Exit Function
+    Dim r As Long, lr As Long
+    lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For r = 1 To lr
+        If StrComp(Trim$(CStr(pl_NZ(ws.Cells(r, 1).Value))), label, vbTextCompare) = 0 Then
+            If IsNumeric(ws.Cells(r, 2).Value) Then pl_ReadSelected = CLng(ws.Cells(r, 2).Value)
+            Exit Function
+        End If
+    Next r
+End Function
 
 ' ---- Durable skip/fail record (survives a _Pipeline Log deletion) -----------
 ' A file that failed or was skipped left NO rows in Cost Data, so its outcome
@@ -731,21 +792,26 @@ Private Function pl_ResetSkips() As Worksheet
         Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
         ws.Name = PL_SH_SKIPPED
     End If
-    ws.Range("A1:E1").Value = Array("Stage", "File", "Sheet", "Status", "Reason")
+    ws.Range("A1:G1").Value = Array("Stage", "File", "Sheet", "Outcome", _
+                                    "Intended Substation", "Loss / Coverage", "Reason")
     ws.Rows(1).Font.Bold = True
     pl_ResetSkips = ws
 End Function
 
 ' Appends one skip/fail row to _Skipped Files (created if absent). Never raises.
+' outcome = categorized reason; intendedSub = the substation the file would have
+' been (from its tab name, if readable); loss = LOST / redundant / unknown flag.
 Private Sub pl_AppendSkip(ByVal stage As String, ByVal file As String, _
-                          ByVal sheet As String, ByVal status As String, ByVal reason As String)
+                          ByVal sheet As String, ByVal outcome As String, _
+                          ByVal intendedSub As String, ByVal loss As String, ByVal reason As String)
     On Error Resume Next
     Dim ws As Worksheet
     Set ws = pl_SheetByName(PL_SH_SKIPPED)
     If ws Is Nothing Then
         Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
         ws.Name = PL_SH_SKIPPED
-        ws.Range("A1:E1").Value = Array("Stage", "File", "Sheet", "Status", "Reason")
+        ws.Range("A1:G1").Value = Array("Stage", "File", "Sheet", "Outcome", _
+                                        "Intended Substation", "Loss / Coverage", "Reason")
         ws.Rows(1).Font.Bold = True
     End If
     Dim nr As Long: nr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
@@ -753,8 +819,10 @@ Private Sub pl_AppendSkip(ByVal stage As String, ByVal file As String, _
     ws.Cells(nr, 1).Value = stage
     ws.Cells(nr, 2).Value = file
     ws.Cells(nr, 3).Value = sheet
-    ws.Cells(nr, 4).Value = status
-    ws.Cells(nr, 5).Value = reason
+    ws.Cells(nr, 4).Value = outcome
+    ws.Cells(nr, 5).Value = intendedSub
+    ws.Cells(nr, 6).Value = loss
+    ws.Cells(nr, 7).Value = reason
     On Error GoTo 0
 End Sub
 
@@ -824,6 +892,11 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
         Exit Function
     End If
 
+    ' Anchor of the whole reconciliation: the number of files the USER SELECTED.
+    ' Every one must be accounted for as contributed or skipped/failed.
+    Dim selectedCount As Long: selectedCount = fileCount
+    pl_LogAdd log, "STAGE 1 -- " & selectedCount & " cost file(s) selected."
+
     Dim recs() As PL_TCostFile
     ReDim recs(1 To fileCount)
 
@@ -838,6 +911,7 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
             ElseIf StrComp(recs(i).HeaderSig, refSig, vbTextCompare) <> 0 Then
                 recs(i).IsValid = False
                 recs(i).Status = "Failed"
+                recs(i).Outcome = "Skipped: header signature mismatch"
                 recs(i).Message = "Header signature mismatch vs first valid file"
             End If
         End If
@@ -875,6 +949,7 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
                     If (Not recs(i).IsValid) And _
                        InStr(1, recs(i).Message, "Header signature mismatch", vbTextCompare) > 0 Then
                         recs(i).IsValid = True: recs(i).Status = "Imported"
+                        recs(i).Outcome = "Contributed"
                         recs(i).Message = "Included despite header mismatch (aligned by column)"
                     End If
                 Next i
@@ -929,31 +1004,29 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
     wsCost.Rows(1).Font.Bold = True
     wsCost.Columns.AutoFit
 
-    pl_LogAdd log, "STAGE 1 -- Cost Data (" & wsCost.Name & "): " & processed & _
-                   " file(s), " & totalRows & " data row(s)."
-    For i = 1 To fileCount
-        pl_LogAdd log, "  [" & recs(i).Status & "] " & pl_FileName(recs(i).FilePath) & _
-                       " | tab='" & recs(i).SheetName & "' name='" & recs(i).Substation & "'" & _
-                       IIf(recs(i).VoltParsed, " volt=" & recs(i).Voltage, " volt=(none)") & _
-                       " rows=" & recs(i).RowsImported & _
-                       IIf(Len(recs(i).Message) > 0, " -- " & recs(i).Message, "")
-    Next i
-    If hitLimit Then pl_LogAdd log, "  Worksheet row limit reached; import truncated."
+    ' ---- account for EVERY selected file: contributed vs skipped, LOST vs
+    '      redundant, per-file log line, and a durable _Skipped Files row for
+    '      every non-contributor. Anchored on selectedCount. ----
+    Dim contributed As Long, skipped As Long, lost As Long, redundant As Long, unknown As Long
+    pl_AccountCostFiles recs, fileCount, log, contributed, skipped, lost, redundant, unknown
+    If hitLimit Then pl_LogAdd log, "  Worksheet row limit reached; import truncated (later files unprocessed)."
 
-    ' Persist every skipped/failed cost file to _Skipped Files. These produced no
-    ' Cost Data rows, so their outcome is NOT reconstructable from the sheets --
-    ' this is what keeps RebuildAudit's reconciliation whole after a log deletion.
-    Dim skStatus As String
-    For i = 1 To fileCount
-        If (Not recs(i).IsValid) Or recs(i).RowsImported = 0 Then
-            If StrComp(recs(i).Status, "Imported", vbTextCompare) <> 0 Then
-                skStatus = recs(i).Status
-                If Len(skStatus) = 0 Then skStatus = "Empty (0 rows)"
-                pl_AppendSkip "1 Cost", pl_FileName(recs(i).FilePath), recs(i).SheetName, _
-                              skStatus, recs(i).Message
-            End If
-        End If
-    Next i
+    ' Persist the selected count so RebuildAudit can anchor on it after a log wipe.
+    pl_RecordSelected "Cost Files Selected", selectedCount
+
+    ' Headline reconciliation -- selected is the anchor, never the contributing
+    ' count alone. If the parts don't sum to selected, that is itself a bug.
+    Dim accounted As Long: accounted = contributed + skipped
+    pl_LogAdd log, "STAGE 1 -- Cost Data (" & wsCost.Name & "): " & selectedCount & " selected = " & _
+                   contributed & " contributed + " & skipped & " not contributed" & _
+                   "  (" & totalRows & " data rows)."
+    pl_LogAdd log, "  Of the " & skipped & " not contributed: " & lost & " LOST (unique substation missing), " & _
+                   redundant & " redundant (substation covered elsewhere), " & unknown & " unreadable/unknown."
+    If accounted <> selectedCount Then
+        pl_LogAdd log, "  *** UNACCOUNTED: " & (selectedCount - accounted) & " selected file(s) neither " & _
+                       "contributed nor recorded as skipped -- investigate. ***"
+    End If
+    Debug.Assert accounted = selectedCount
 
     pl_ConsolidateCost = (totalRows > 0)
     Exit Function
@@ -963,42 +1036,213 @@ ErrHandler:
     pl_ConsolidateCost = False
 End Function
 
+' Accounts for every selected cost file. Builds the set of substations actually
+' covered (any file that contributed >=1 row), then for each file:
+'   * contributed (rows > 0)          -> counted, no skip row
+'   * skipped, intended sub missing   -> LOST (only source for that substation)
+'   * skipped, intended sub covered   -> redundant (another file supplied it)
+'   * skipped, substation unreadable  -> unknown
+' Writes one _Pipeline Log line per file (outcome + reason) and one _Skipped
+' Files row per non-contributor. Counts are returned by ref for the headline
+' reconciliation. Pure over recs()/sheets -- the self-test drives it directly.
+Private Sub pl_AccountCostFiles(ByRef recs() As PL_TCostFile, ByVal fileCount As Long, _
+                                ByRef log As PL_TLog, ByRef contributed As Long, _
+                                ByRef skipped As Long, ByRef lost As Long, _
+                                ByRef redundant As Long, ByRef unknown As Long)
+    contributed = 0: skipped = 0: lost = 0: redundant = 0: unknown = 0
+
+    ' 1) substations actually covered (from every contributing file)
+    Dim dCov As Object: Set dCov = CreateObject("Scripting.Dictionary")
+    Dim i As Long, ck As String
+    For i = 1 To fileCount
+        If recs(i).RowsImported > 0 Then
+            ck = pl_CostKey(recs(i).Substation, recs(i).Voltage, recs(i).VoltParsed)
+            If Not dCov.Exists(ck) Then dCov.Add ck, True
+        End If
+    Next i
+
+    ' 2) classify + record every file
+    Dim intended As String, oc As String, k2 As String
+    For i = 1 To fileCount
+        If recs(i).RowsImported > 0 Then
+            contributed = contributed + 1
+            recs(i).Loss = ""
+        Else
+            skipped = skipped + 1
+            intended = Trim$(recs(i).Substation)
+            If Len(intended) = 0 Then
+                recs(i).Loss = "unknown (substation unreadable)"
+                unknown = unknown + 1
+            Else
+                k2 = pl_CostKey(intended, recs(i).Voltage, recs(i).VoltParsed)
+                If dCov.Exists(k2) Then
+                    recs(i).Loss = "redundant skip (substation covered)"
+                    redundant = redundant + 1
+                Else
+                    recs(i).Loss = "LOST -- only source for this substation"
+                    lost = lost + 1
+                End If
+            End If
+            oc = recs(i).Outcome
+            If Len(oc) = 0 Then oc = "Skipped: no rows imported"
+            pl_AppendSkip "1 Cost", pl_FileName(recs(i).FilePath), recs(i).SheetName, _
+                          oc, intended, recs(i).Loss, recs(i).Message
+        End If
+
+        ' one log line per file, contributors and non-contributors alike
+        pl_LogAdd log, "  [" & IIf(recs(i).RowsImported > 0, "Contributed", _
+                       IIf(Len(recs(i).Outcome) > 0, recs(i).Outcome, "Skipped")) & "] " & _
+                       pl_FileName(recs(i).FilePath) & " | sub='" & recs(i).Substation & "'" & _
+                       " rows=" & recs(i).RowsImported & _
+                       IIf(recs(i).RowsImported = 0 And Len(recs(i).Loss) > 0, " | " & recs(i).Loss, "") & _
+                       IIf(Len(recs(i).Message) > 0, " -- " & recs(i).Message, "")
+    Next i
+End Sub
+
 Private Sub pl_ValidateCostFile(ByRef rec As PL_TCostFile)
     Dim wb As Workbook, ws As Worksheet
-    rec.IsValid = False: rec.Status = "Failed"
+    rec.IsValid = False: rec.Status = "Failed": rec.Outcome = ""
 
     On Error GoTo OpenFail
     Set wb = Application.Workbooks.Open(Filename:=rec.FilePath, UpdateLinks:=0, _
                                         ReadOnly:=True, AddToMru:=False)
     On Error GoTo CloseFail
 
-    If wb.Sheets.Count < PL_COST_DATA_IDX Then
-        rec.Message = "Workbook has fewer than " & PL_COST_DATA_IDX & " sheets": GoTo CloseAndExit
-    End If
-    If Not TypeOf wb.Sheets(PL_COST_DATA_IDX) Is Worksheet Then
-        rec.Message = "Sheet " & PL_COST_DATA_IDX & " is not a worksheet": GoTo CloseAndExit
-    End If
+    ' Locate the data sheet by CONTENT -- the worksheet whose leading rows carry
+    ' the known cost headers -- instead of assuming a fixed tab index. This
+    ' recovers files where the data sheet is not the 3rd tab. When no sheet
+    ' matches, pl_LocateCostSheet sets the precise outcome (sheet not found /
+    ' header not found, with the headers actually seen).
+    Set ws = pl_LocateCostSheet(wb, rec)
+    If ws Is Nothing Then GoTo CloseAndExit    ' Outcome + Message already set
 
-    Set ws = wb.Sheets(PL_COST_DATA_IDX)
     rec.SheetName = ws.Name
-    If Not pl_MeasureSheet(ws, rec) Then GoTo CloseAndExit
+    If Not pl_MeasureSheet(ws, rec) Then
+        ' the sheet had headers (that's why it was chosen) but nothing below them
+        rec.Outcome = "Skipped: no data rows"
+        GoTo CloseAndExit
+    End If
 
     rec.HeaderSig = pl_HeaderSig(ws, rec.UsedCols, rec.HeaderRow)
     pl_ParseTab rec.SheetName, rec.Substation, rec.Voltage, rec.VoltParsed
-    rec.IsValid = True: rec.Status = "Imported": rec.Message = ""
+    If Len(Trim$(rec.Substation)) = 0 Then
+        rec.Outcome = "Skipped: empty substation name"
+        rec.Message = "tab name '" & rec.SheetName & "' parsed to an empty substation"
+        GoTo CloseAndExit
+    End If
+    rec.IsValid = True: rec.Status = "Imported": rec.Outcome = "Contributed": rec.Message = ""
 
 CloseAndExit:
     wb.Close SaveChanges:=False
     Set wb = Nothing
     Exit Sub
 OpenFail:
-    rec.Message = "Could not open: " & Err.Description: Exit Sub
+    rec.Outcome = "Failed: open error"
+    rec.Message = "Could not open: " & Err.Description
+    Exit Sub
 CloseFail:
+    rec.Outcome = "Failed: open error"
     rec.Message = "Error inspecting workbook: " & Err.Description
     On Error Resume Next
     If Not wb Is Nothing Then wb.Close SaveChanges:=False
     On Error GoTo 0
 End Sub
+
+' Finds the worksheet that holds the cost data by CONTENT: the first worksheet
+' whose leading rows contain both known headers. Returns Nothing and sets a
+' precise skip Outcome/Message when none matches (recording the headers actually
+' seen on the best-guess sheet, so a wording mismatch is visible in the audit).
+Private Function pl_LocateCostSheet(ByVal wb As Workbook, ByRef rec As PL_TCostFile) As Worksheet
+    Dim ws As Worksheet, ur As Range
+    Dim fr As Long, lc As Long, lr As Long, hr As Long
+    Dim wsCount As Long: wsCount = 0
+    Dim firstWs As Worksheet
+    For Each ws In wb.Worksheets
+        wsCount = wsCount + 1
+        If firstWs Is Nothing Then Set firstWs = ws
+        Set ur = ws.UsedRange
+        If Not ur Is Nothing Then
+            fr = ur.Row
+            lc = ur.Column + ur.Columns.Count - 1
+            lr = ur.Row + ur.Rows.Count - 1
+            hr = pl_DetectHeaderRow(ws, fr, lr, lc)
+            If hr > 0 Then
+                Set pl_LocateCostSheet = ws
+                Exit Function
+            End If
+        End If
+    Next ws
+
+    ' No worksheet carried the known headers -- categorize precisely.
+    If wsCount = 0 Then
+        rec.Outcome = "Skipped: sheet not found"
+        rec.Message = "workbook contains no worksheets"
+    Else
+        rec.Outcome = "Skipped: header not found"
+        Dim probe As Worksheet
+        If wb.Worksheets.Count >= PL_COST_DATA_IDX Then
+            Set probe = wb.Worksheets(PL_COST_DATA_IDX)
+        Else
+            Set probe = firstWs
+        End If
+        rec.SheetName = probe.Name
+        rec.SeenHeaders = pl_TopRowText(probe)
+        rec.Message = "no worksheet contains '" & PL_HDR_TRIGGER & "' + '" & PL_HDR_ALLOC & _
+                      "'; headers seen on '" & probe.Name & "': " & rec.SeenHeaders
+    End If
+    Set pl_LocateCostSheet = Nothing
+End Function
+
+' Returns the most-populated of the first few rows of a sheet as a readable
+' "a | b | c" string (trimmed, empties collapsed, capped) -- used to show the
+' headers actually present when the known headers weren't found.
+Private Function pl_TopRowText(ByVal ws As Worksheet) As String
+    Dim ur As Range: Set ur = ws.UsedRange
+    If ur Is Nothing Then
+        pl_TopRowText = "(empty sheet)"
+        Exit Function
+    End If
+    Dim fr As Long: fr = ur.Row
+    Dim lc As Long: lc = ur.Column + ur.Columns.Count - 1
+    Dim lrEnd As Long: lrEnd = ur.Row + ur.Rows.Count - 1
+    Dim rEnd As Long: rEnd = fr + 4
+    If rEnd > lrEnd Then rEnd = lrEnd
+    If lc > 40 Then lc = 40                      ' cap the scan width
+    Dim best As String, bestCnt As Long
+    Dim r As Long, c As Long, cnt As Long, t As String, v As Variant
+    Dim parts() As String
+    For r = fr To rEnd
+        v = ws.Range(ws.Cells(r, 1), ws.Cells(r, lc)).Value
+        ReDim parts(1 To lc)
+        cnt = 0
+        For c = 1 To lc
+            If lc = 1 Then
+                t = Trim$(CStr(pl_NZ(v)))
+            Else
+                t = Trim$(CStr(pl_NZ(v(1, c))))
+            End If
+            parts(c) = t
+            If Len(t) > 0 Then cnt = cnt + 1
+        Next c
+        If cnt > bestCnt Then
+            bestCnt = cnt
+            best = Join(parts, " | ")
+        End If
+    Next r
+    Do While InStr(best, " |  | ") > 0
+        best = Replace(best, " |  | ", " | ")
+    Loop
+    best = Trim$(best)
+    Do While Left$(best, 2) = "| "
+        best = Trim$(Mid$(best, 3))
+    Loop
+    Do While Right$(best, 2) = " |"
+        best = Trim$(Left$(best, Len(best) - 2))
+    Loop
+    If Len(best) > 200 Then best = Left$(best, 197) & "..."
+    If Len(best) = 0 Then best = "(no header text)"
+    pl_TopRowText = best
+End Function
 
 Private Function pl_MeasureSheet(ByVal ws As Worksheet, ByRef rec As PL_TCostFile) As Boolean
     Dim ur As Range, lastCol As Long, lastRow As Long, firstRow As Long, hdrRow As Long
@@ -1283,7 +1527,7 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
     On Error GoTo Fail
     If ws Is Nothing Then
         pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- no '" & PL_SITE_TAB & "' tab"
-        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped", "no '" & PL_SITE_TAB & "' tab"
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped: sheet not found", "", "", "no '" & PL_SITE_TAB & "' tab"
         wb.Close SaveChanges:=False: Exit Sub
     End If
 
@@ -1291,7 +1535,7 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
     lastRow = ur.Row + ur.Rows.Count - 1
     If lastRow <= PL_HDR_ROW Then
         pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- Summary has no data rows"
-        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped", "Summary has no data rows"
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped: no data rows", "", "", "Summary has no data rows"
         wb.Close SaveChanges:=False: Exit Sub
     End If
 
@@ -1347,7 +1591,7 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
     Exit Sub
 Fail:
     pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- read error: " & Err.Description
-    pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Failed", "read error: " & Err.Description
+    pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Failed: open error", "", "", "read error: " & Err.Description
     On Error Resume Next
     If Not wb Is Nothing Then wb.Close SaveChanges:=False
     On Error GoTo 0
@@ -2888,6 +3132,9 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 13) RebuildAudit regenerates the log/audit from sheets (no re-run)
     pl_RebuildAuditSelfTest passCount, failCount
 
+    ' 14) File accounting: every selected file accounted for (LOST vs redundant)
+    pl_FileAccountingSelfTest passCount, failCount
+
     Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
                 " errors (a compile break cannot be asserted from runtime)."
 End Sub
@@ -3093,6 +3340,80 @@ Fail:
     If Not wsC Is Nothing Then wsC.Delete
     Application.DisplayAlerts = True
     Assert False, "Rebuild-audit self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+' File accounting: EVERY selected file is accounted for as contributed or
+' skipped; non-contributors are itemized in _Skipped Files; a skip is flagged
+' LOST only when no other file covered its substation (else redundant). Drives
+' pl_AccountCostFiles over a synthetic mixed fixture (good / missing-sheet /
+' bad-header / empty), so no external files are opened.
+Private Sub pl_FileAccountingSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+
+    Dim recs() As PL_TCostFile: ReDim recs(1 To 5)
+    ' two good contributors
+    recs(1).FilePath = "Alpha 138kV.xlsx": recs(1).SheetName = "Alpha 138kV": recs(1).Substation = "Alpha"
+    recs(1).Voltage = 138: recs(1).VoltParsed = True: recs(1).RowsImported = 5: recs(1).Outcome = "Contributed"
+    recs(2).FilePath = "Beta 230kV.xlsx": recs(2).SheetName = "Beta 230kV": recs(2).Substation = "Beta"
+    recs(2).Voltage = 230: recs(2).VoltParsed = True: recs(2).RowsImported = 4: recs(2).Outcome = "Contributed"
+    ' missing sheet -> substation unreadable -> unknown
+    recs(3).FilePath = "MissingSheet.xlsx": recs(3).SheetName = "": recs(3).Substation = ""
+    recs(3).RowsImported = 0: recs(3).Outcome = "Skipped: sheet not found"
+    recs(3).Message = "workbook contains no worksheets"
+    ' bad header, tab readable as Gamma -> Gamma nowhere else -> LOST
+    recs(4).FilePath = "Gamma 345kV.xlsx": recs(4).SheetName = "Gamma 345kV": recs(4).Substation = "Gamma"
+    recs(4).Voltage = 345: recs(4).VoltParsed = True: recs(4).RowsImported = 0
+    recs(4).Outcome = "Skipped: header not found": recs(4).Message = "headers seen: Foo | Bar"
+    ' empty file for Alpha -> Alpha already covered by recs(1) -> redundant
+    recs(5).FilePath = "Alpha 138kV (dup).xlsx": recs(5).SheetName = "Alpha 138kV": recs(5).Substation = "Alpha"
+    recs(5).Voltage = 138: recs(5).VoltParsed = True: recs(5).RowsImported = 0
+    recs(5).Outcome = "Skipped: no data rows"
+
+    pl_ResetSkips
+    Dim log As PL_TLog: pl_LogInit log
+    Dim contributed As Long, skipped As Long, lost As Long, redundant As Long, unknown As Long
+    pl_AccountCostFiles recs, 5, log, contributed, skipped, lost, redundant, unknown
+
+    Assert (contributed + skipped) = 5, _
+           "File accounting: selected (5) = contributed + skipped, exactly", passCount, failCount
+    Assert contributed = 2, "File accounting: 2 files contributed", passCount, failCount
+    Assert skipped = 3, "File accounting: 3 files skipped", passCount, failCount
+    Assert lost = 1, "File accounting: 1 LOST (Gamma, only source missing)", passCount, failCount
+    Assert redundant = 1, "File accounting: 1 redundant (Alpha covered elsewhere)", passCount, failCount
+    Assert unknown = 1, "File accounting: 1 unreadable/unknown (missing sheet)", passCount, failCount
+
+    Dim wsK As Worksheet: Set wsK = pl_SheetByName(PL_SH_SKIPPED)
+    Dim okSheet As Boolean: okSheet = Not (wsK Is Nothing)
+    Assert okSheet, "File accounting: _Skipped Files sheet exists", passCount, failCount
+    If okSheet Then
+        Dim lr As Long: lr = wsK.Cells(wsK.Rows.Count, 1).End(xlUp).Row
+        Assert (lr - 1) = 3, "File accounting: _Skipped Files itemizes all 3 non-contributors", passCount, failCount
+        Dim rr As Long, gammaLost As Boolean, alphaRed As Boolean
+        For rr = 2 To lr
+            If StrComp(CStr(wsK.Cells(rr, 5).Value & ""), "Gamma", vbTextCompare) = 0 Then
+                If InStr(CStr(wsK.Cells(rr, 6).Value & ""), "LOST") > 0 Then gammaLost = True
+            End If
+            If StrComp(CStr(wsK.Cells(rr, 5).Value & ""), "Alpha", vbTextCompare) = 0 Then
+                If InStr(CStr(wsK.Cells(rr, 6).Value & ""), "redundant") > 0 Then alphaRed = True
+            End If
+        Next rr
+        Assert gammaLost, "File accounting: Gamma row flagged LOST in _Skipped Files", passCount, failCount
+        Assert alphaRed, "File accounting: Alpha (empty dup) row flagged redundant", passCount, failCount
+    End If
+
+    On Error Resume Next
+    wsK.Delete
+    Application.DisplayAlerts = prevAlerts
+    On Error GoTo 0
+    Exit Sub
+Fail:
+    On Error Resume Next
+    Dim wsK2 As Worksheet: Set wsK2 = pl_SheetByName(PL_SH_SKIPPED)
+    If Not wsK2 Is Nothing Then wsK2.Delete
+    Application.DisplayAlerts = True
+    Assert False, "File-accounting self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' Fix 1 verification: given a file's rows-2-down block containing real data, a

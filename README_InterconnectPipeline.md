@@ -31,8 +31,10 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
 
 1. **Cost / results files → `Cost Data`.** Multi-select the cost workbooks
    (picker rooted at `ThisWorkbook.Path`, falling back to
-   `Application.DefaultFilePath`). Sheet 3 carries the data. The substation name
-   is **parsed from the (messy) tab name into clean `(name, voltage)`**, in this
+   `Application.DefaultFilePath`). The data sheet is **located by content** — the
+   worksheet whose leading rows carry the known headers — rather than assuming a
+   fixed tab index, so files where the data isn't the 3rd tab are still read. The
+   substation name is **parsed from the (messy) tab name into clean `(name, voltage)`**, in this
    precedence: (a) strip a trailing standalone integer — a duplicate-file
    counter — so `Cecelia 138kV 1` and `Cecelia 138kV 2` both lose the `1`/`2`;
    (b) extract voltage tolerantly — a number, then optional punctuation/spaces,
@@ -170,17 +172,60 @@ sheets on demand:
   data sheet, had no header, or an empty `Summary` leaves **no rows** in
   `Cost Data`, so its outcome can’t be reconstructed from the output sheets.
   These are written to a dedicated **`_Skipped Files`** sheet
-  (`Stage | File | Sheet | Status | Reason`) during Stages 1–2 — not only to the
-  deletable `_Pipeline Log` — so a log deletion never erases them.
+  (`Stage | File | Sheet | Outcome | Intended Substation | Loss / Coverage | Reason`)
+  during Stages 1–2 — not only to the deletable `_Pipeline Log` — so a log
+  deletion never erases them.
+
+### Every selected file is accounted for
+
+The reconciliation is **anchored on the count of files the user selected**, never
+on the contributing count alone:
+
+```
+selected = contributed + skipped/failed
+e.g. 2090 selected = 1836 contributed + 254 not contributed
+```
+
+The selected count is captured at pick time (`pl_PickFiles`), carried through, and
+persisted on `_Pipeline State` so the anchor survives a log wipe. If the parts
+don’t sum to `selected`, that is itself a bug — the code asserts it and logs any
+**unaccounted** remainder.
+
+**Every file gets an explicit outcome**, logged per file and (for non-contributors)
+itemized in `_Skipped Files`:
+
+- `Contributed` — *n* data rows read.
+- `Skipped: sheet not found` — no worksheet at all (content search found none).
+- `Skipped: header not found` — no worksheet carried `Size Overload Occurs (MW)`
+  / `Proposed Project Allocation ($)`; **the headers actually seen are logged**, so
+  a wording mismatch is visible.
+- `Skipped: no data rows` — header found but nothing below it.
+- `Skipped: empty substation name` — the tab-name parse yielded no name.
+- `Skipped: header signature mismatch` — a valid sheet whose column layout differs
+  from the first valid file and the user chose to skip it.
+- `Failed: open error` — couldn’t open (locked/corrupt/format), with `Err.Description`.
+
+**LOST vs redundant.** A skip is real substation loss only if **no other file**
+supplied that substation. For each skipped file the intended substation is derived
+from its tab name; if that substation is **absent** from `Cost Data` the row is
+flagged **`LOST — only source for this substation`**, otherwise
+**`redundant skip (substation covered)`**; an unreadable tab name is
+**`unknown`**. The Stage-1 summary counts the split — *of the 254, how many are
+LOST vs redundant vs unreadable* — so a dominant root cause is obvious. The likely
+culprits are surfaced by design: the content-based **sheet** location recovers
+files where the data isn’t the 3rd tab, the content-based **header** match absorbs
+wording variants, and the logged “headers seen” exposes any different-template
+files as a group.
 
 **`Public Sub RebuildAudit()`** regenerates the diagnostic summary from those
 sheets alone, callable any time (including after `_Pipeline Log` is deleted),
 **without re-running consolidation**. It recreates `_Pipeline Log` (fresh) and
-writes: total distinct substations in `Cost Data`; count of contributing source
-files; the files-per-substation collapse counts (with a few examples); and the
-reconciliation line — **files seen = distinct substations + duplicate files
-collapsed + skipped/failed**. That is the “why are there 2,090 files but ~1,600
-substations” answer, recovered with no re-run.
+writes the file-level reconciliation anchored on the persisted selected count
+(**selected = contributed + skipped/failed**, flagging any unaccounted remainder),
+the distinct-substation total, and the files-per-substation collapse counts (with a
+few examples). That is the “why are there 2,090 files but ~1,600 substations”
+answer — and now also the “where did the other 254 go” answer — recovered with no
+re-run.
 
 **Optional external log copy.** With the constant `WRITE_LOG_TO_FILE = True`,
 `pl_WriteLog` also writes the run log to `<workbook base>_PipelineLog.txt` beside
@@ -324,6 +369,12 @@ Score**, and the composite maximum stays 165.
   contributing files, 1 collapsed, 1 skipped/failed) and writes the
   reconciliation *files seen (4) = distinct (2) + collapsed (1) + skipped (1)* —
   with **no consolidation re-run**.
+- **File accounting** — a mixed synthetic fixture of 5 files (two good, one
+  missing-sheet, one bad-header for a unique substation, one empty duplicate of a
+  good one) asserts `selected (5) = contributed (2) + skipped (3)` exactly; that
+  `_Skipped Files` itemizes all 3 non-contributors; and that the bad-header file
+  is flagged **LOST** (its substation appears nowhere else) while the empty
+  duplicate is flagged **redundant** (its substation is covered by another file).
 - **Matrix shape, headroom, and the 165 ceiling.**
 
 Results print to the Immediate window (**Ctrl+G**). `SelfTest` also prints a
