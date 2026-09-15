@@ -2931,23 +2931,23 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 1) Tab-name parsing (strip trailing counter; tolerant kV; clean name)
     Dim nm As String, v As Double, p As Boolean
     pl_ParseTab "Cecelia 138kV 1", nm, v, p
-    Assert (nm = "Cecelia") And p And (v = 138), _
+    Assert ((nm = "Cecelia") And p And (v = 138)), _
            "Tab parse: 'Cecelia 138kV 1' -> ('Cecelia', 138)", passCount, failCount
     pl_ParseTab "Cecelia 138kV 2", nm, v, p
-    Assert (nm = "Cecelia") And p And (v = 138), _
+    Assert ((nm = "Cecelia") And p And (v = 138)), _
            "Tab parse: 'Cecelia 138kV 2' -> ('Cecelia', 138)", passCount, failCount
     pl_ParseTab "Chalkley 230. kV", nm, v, p
-    Assert (nm = "Chalkley") And p And (v = 230), _
+    Assert ((nm = "Chalkley") And p And (v = 230)), _
            "Tab parse: 'Chalkley 230. kV' -> ('Chalkley', 230)", passCount, failCount
     pl_ParseTab "Cunningham", nm, v, p
-    Assert (nm = "Cunningham") And (Not p), _
+    Assert ((nm = "Cunningham") And (Not p)), _
            "Tab parse: 'Cunningham' -> ('Cunningham', blank)", passCount, failCount
 
     ' Two Cecelia tabs differing only by counter share one cost identity key.
     Dim n1 As String, v1 As Double, p1 As Boolean, n2 As String, v2 As Double, p2 As Boolean
     pl_ParseTab "Cecelia 138kV 1", n1, v1, p1
     pl_ParseTab "Cecelia 138kV 2", n2, v2, p2
-    Assert pl_CostKey(n1, v1, p1) = pl_CostKey(n2, v2, p2), _
+    Assert (pl_CostKey(n1, v1, p1) = pl_CostKey(n2, v2, p2)), _
            "Dedupe: the two Cecelia tabs collapse to one cost identity key", passCount, failCount
 
     ' 2) Triple dedupe (dictionary)
@@ -2961,11 +2961,11 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     pl_FillSite rn, rv, rp, rst, rf, rr, 5, "Alpha", 345, True, "NM"
     Dim dt() As PL_TSiteTriple, dropped As Long, dlog As PL_TLog: pl_LogInit dlog
     Dim dc As Long: dc = pl_DedupTriples(rn, rv, rp, rst, 5, rf, rr, dt, dlog, dropped)
-    Assert dc = 3, "Triple dedupe: 5 rows -> 3 distinct (dictionary)", passCount, failCount
-    Assert dropped = 2, "Triple dedupe: 2 duplicates dropped and logged", passCount, failCount
-    Assert pl_HasTriple(dt, dc, "Alpha", 230, True, "NM"), _
+    Assert (dc = 3), "Triple dedupe: 5 rows -> 3 distinct (dictionary)", passCount, failCount
+    Assert (dropped = 2), "Triple dedupe: 2 duplicates dropped and logged", passCount, failCount
+    Assert (pl_HasTriple(dt, dc, "Alpha", 230, True, "NM")), _
            "Triple dedupe: voltage-differ kept separate", passCount, failCount
-    Assert pl_HasTriple(dt, dc, "Alpha", 345, True, "TX"), _
+    Assert (pl_HasTriple(dt, dc, "Alpha", 345, True, "TX")), _
            "Triple dedupe: state-differ kept separate", passCount, failCount
 
     ' 3) Join intersection (dictionary keys)
@@ -2977,24 +2977,24 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     tA.Name = "Alpha": tA.Voltage = 345: tA.VoltParsed = True: tA.State = "NM"
     tB.Name = "Beta": tB.VoltParsed = False: tB.State = "OK"      ' no cost
     tD.Name = "Delta": tD.VoltParsed = False: tD.State = "TX"     ' bare match
-    Assert pl_ResolveMatchKey(tA, dId) = pl_CostKey("Alpha", 345, True), _
+    Assert (pl_ResolveMatchKey(tA, dId) = pl_CostKey("Alpha", 345, True)), _
            "Join: Alpha 345 -> name+voltage match", passCount, failCount
-    Assert pl_ResolveMatchKey(tD, dId) = pl_CostKey("Delta", 0, False), _
+    Assert (pl_ResolveMatchKey(tD, dId) = pl_CostKey("Delta", 0, False)), _
            "Join: Delta -> bare name match", passCount, failCount
-    Assert pl_ResolveMatchKey(tB, dId) = "", "Join: Beta -> no cost (alignment error)", passCount, failCount
+    Assert (pl_ResolveMatchKey(tB, dId) = ""), "Join: Beta -> no cost (alignment error)", passCount, failCount
 
     ' 4) Matrix shape + values (piecewise T/MW == SUMIFS definition)
     Dim mwx() As Double, mc As Long: mc = pl_MwAxis(mwx)
-    Assert (mc = 21) And (mwx(1) = 100) And (mwx(mc) = 300), _
+    Assert ((mc = 21) And (mwx(1) = 100) And (mwx(mc) = 300)), _
            "Matrix axis: 100..300 step 10 = 21 points", passCount, failCount
     ' one substation, tiers T=100 at 100+, T=200 at 200+  => cost(100)=1.0MM etc.
     ' cumulative alloc: trig 100 alloc 100; trig 200 alloc 100.
-    Assert pl_PiecewiseCost(100, 100) = 1, "Matrix value: cost at 100 = T/MW", passCount, failCount
+    Assert (pl_PiecewiseCost(100, 100) = 1), "Matrix value: cost at 100 = T/MW", passCount, failCount
     ' body defaults to live SUMIFS formulas, resolved by header name + MW cell
-    Assert USE_LIVE_SUMIFS = True, "Matrix: USE_LIVE_SUMIFS defaults to True (formulas)", passCount, failCount
+    Assert (USE_LIVE_SUMIFS = True), "Matrix: USE_LIVE_SUMIFS defaults to True (formulas)", passCount, failCount
     Dim fSum As String
     fSum = pl_SumifsFormula("Cost Data", 8, 5, 6, 7, "Cecelia", True, 138, "D$1", 2, 100)
-    Assert (Left$(fSum, 8) = "=SUMIFS(") And (InStr(fSum, "D$1") > 0) And (InStr(fSum, "138") > 0), _
+    Assert ((Left$(fSum, 8) = "=SUMIFS(") And (InStr(fSum, "D$1") > 0) And (InStr(fSum, "138") > 0)), _
            "Matrix: body cell is a bounded SUMIFS formula keyed to the MW cell", passCount, failCount
 
     ' 4b) Stage-4 Matrix-validity guard is explicit, never a silent no-op
@@ -3008,11 +3008,11 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
             gm.costM(gi, gj) = 1000
         Next gj
     Next gi
-    Assert pl_Stage4MatrixValid(gm, rsn), "Stage 4 guard: a valid matrix passes", passCount, failCount
+    Assert (pl_Stage4MatrixValid(gm, rsn)), "Stage 4 guard: a valid matrix passes", passCount, failCount
     Dim em As PL_TMatrix
     em.ok = True: em.matchedCount = 0: em.mwCount = 3
     ReDim em.mw(1 To 3): em.mw(1) = 100: em.mw(2) = 110: em.mw(3) = 120
-    Assert (Not pl_Stage4MatrixValid(em, rsn)) And (InStr(rsn, "0 valid substation rows") > 0), _
+    Assert ((Not pl_Stage4MatrixValid(em, rsn)) And (InStr(rsn, "0 valid substation rows") > 0)), _
            "Stage 4 guard: an emptied matrix stops with the explicit message", passCount, failCount
 
     ' 4c) Zero-cost cells are VALID (headroom); only NEGATIVE costs error.
@@ -3043,7 +3043,7 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
 
     ' (a) Stage 4 accepts the matrix -- leading zeros no longer abort.
     Dim zrsn As String
-    Assert pl_Stage4MatrixValid(zm, zrsn), _
+    Assert (pl_Stage4MatrixValid(zm, zrsn)), _
            "Stage 4 zero-cost: leading $0 cells are valid, matrix runs", passCount, failCount
 
     ' (b) A genuinely negative cost still errors, with a clear reason.
@@ -3055,7 +3055,7 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ReDim negM.costM(1 To 1, 1 To 8)
     For zj = 1 To 8: negM.costM(1, zj) = zm.costM(1, zj): Next zj
     negM.costM(1, 2) = -5#
-    Assert (Not pl_Stage4MatrixValid(negM, zrsn)) And (InStr(zrsn, "negative cost") > 0), _
+    Assert ((Not pl_Stage4MatrixValid(negM, zrsn)) And (InStr(zrsn, "negative cost") > 0)), _
            "Stage 4 zero-cost: a negative cost still errors explicitly", passCount, failCount
 
     ' (c) Segmentize splits the leading zero region as its own T=0 segment
@@ -3067,12 +3067,12 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
 
     ' (d) FittedString renders the leading zero region then the step, no #DIV/0!.
     Dim zfit As String: zfit = FittedString(zmw, zT, zsg, UBound(zsg), 8, zc)
-    Assert (InStr(zfit, "y = 0 / x") > 0) And (InStr(zfit, "100-120 MW") > 0), _
+    Assert ((InStr(zfit, "y = 0 / x") > 0) And (InStr(zfit, "100-120 MW") > 0)), _
            "Stage 4 zero-cost: fitted function shows the leading zero region", passCount, failCount
 
     ' (e) KneeXStar on the all-zero segment is defined (geometric mean), no 0/0.
     Dim zknee As Double: zknee = KneeXStar(zmw, zT, zsg(1))
-    Assert Abs(zknee - Sqr(100# * 120#)) < 0.5, _
+    Assert (Abs(zknee - Sqr(100# * 120#)) < 0.5), _
            "Stage 4 zero-cost: knee on the all-zero segment = Sqr(x1*x2)", passCount, failCount
 
     ' (f) Headroom = first trigger MW = first MW whose cost is > 0.
@@ -3083,11 +3083,11 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
             Exit For
         End If
     Next zj
-    Assert zHR = 130, "Stage 4 zero-cost: headroom = first trigger (130 MW)", passCount, failCount
+    Assert (zHR = 130), "Stage 4 zero-cost: headroom = first trigger (130 MW)", passCount, failCount
 
     ' 5) Scoring ceiling + $25MM band all-zero on the fixture
-    Assert CLng(pl_ScoreCeiling(4)) = 165, "Scoring: weighted-score maximum is 165", passCount, failCount
-    Assert CLng(pl_ScoreCeiling(3)) = 125, "Scoring: practical maximum (3 bands) is 125", passCount, failCount
+    Assert (CLng(pl_ScoreCeiling(4)) = 165), "Scoring: weighted-score maximum is 165", passCount, failCount
+    Assert (CLng(pl_ScoreCeiling(3)) = 125), "Scoring: practical maximum (3 bands) is 125", passCount, failCount
     Dim fmw() As Double, fnames() As String, fcost() As Double, fn As Long, fm As Long
     LoadFixture fmw, fnames, fcost, fn, fm
     Dim rkC() As Long, rkMx() As Double, rkCm() As Double, rkS() As Double, rkH() As Boolean
@@ -3100,16 +3100,16 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     For i = 1 To fn
         If b25a(i) <> 0 Or b25b(i) <> 0 Then allZero = False
     Next i
-    Assert (fn = 17) And allZero, "Scoring: all 17 $25MM band percentiles are 0", passCount, failCount
+    Assert ((fn = 17) And allZero), "Scoring: all 17 $25MM band percentiles are 0", passCount, failCount
 
     ' 6) Headroom
     Dim trg() As Double: ReDim trg(1 To 3): trg(1) = 200: trg(2) = 130: trg(3) = 260
-    Assert pl_MinHeadroom(trg, 3) = 130, "Headroom: 130/200/260 -> 130", passCount, failCount
+    Assert (pl_MinHeadroom(trg, 3) = 130), "Headroom: 130/200/260 -> 130", passCount, failCount
     Dim hv2() As Double: ReDim hv2(1 To 5)
     hv2(1) = 50: hv2(2) = 130: hv2(3) = 200: hv2(4) = 260: hv2(5) = 300
     Dim hb() As Long: hb = pl_RawBucketArray(hv2, 5)
-    Assert hb(5) = 5, "Headroom pctile: largest -> 5", passCount, failCount
-    Assert hb(1) = 1, "Headroom pctile: smallest -> 1", passCount, failCount
+    Assert (hb(5) = 5), "Headroom pctile: largest -> 5", passCount, failCount
+    Assert (hb(1) = 1), "Headroom pctile: smallest -> 1", passCount, failCount
 
     ' 7) Parity: VBA buckets == Excel PERCENTRANK.EXC/CEILING (round-trip)
     pl_ParitySelfTest passCount, failCount
@@ -3163,16 +3163,16 @@ Private Sub pl_HeaderDetectSelfTest(ByRef passCount As Long, ByRef failCount As 
 
     Dim lastCol As Long, lastRow As Long
     lastCol = 5: lastRow = 4
-    Assert pl_DetectHeaderRow(ws, 1, lastRow, lastCol) = 2, _
+    Assert (pl_DetectHeaderRow(ws, 1, lastRow, lastCol) = 2), _
            "Header detect: field-name row (2) chosen, not the band row (1)", passCount, failCount
-    Assert Not pl_RowHasCostHeaders(ws, 1, lastCol), _
+    Assert (Not pl_RowHasCostHeaders(ws, 1, lastCol)), _
            "Header detect: band row is not mistaken for the header", passCount, failCount
-    Assert pl_RowHasCostHeaders(ws, 2, lastCol), _
+    Assert (pl_RowHasCostHeaders(ws, 2, lastCol)), _
            "Header detect: field-name row recognised", passCount, failCount
 
     ' Normalized match: a non-breaking space and a double space still match.
     ws.Range("B2").Value = "Size" & Chr$(160) & "Overload  Occurs (MW)"
-    Assert pl_RowHasCostHeaders(ws, 2, lastCol), _
+    Assert (pl_RowHasCostHeaders(ws, 2, lastCol)), _
            "Header detect: normalized match (nbsp / collapsed whitespace)", passCount, failCount
 
     Application.DisplayAlerts = False
@@ -3183,7 +3183,7 @@ Fail:
     On Error Resume Next
     If Not ws Is Nothing Then ws.Delete
     Application.DisplayAlerts = True
-    Assert False, "Header-detect self-test could not run (" & Err.Description & ")", passCount, failCount
+    Assert (False), "Header-detect self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' Matrix membership: rows = EVERY distinct Cost Data substation; State is a
@@ -3217,10 +3217,10 @@ Private Sub pl_MatrixMembershipSelfTest(ByRef passCount As Long, ByRef failCount
     Dim wsM As Worksheet: Set wsM = Nothing
     Dim okB As Boolean
     okB = pl_BuildMatrix(log, wsC, wsS, wsM, mtx, False)
-    Assert okB, "Matrix membership: pl_BuildMatrix succeeds", passCount, failCount
+    Assert (okB), "Matrix membership: pl_BuildMatrix succeeds", passCount, failCount
 
     ' Every distinct Cost Data substation appears exactly once.
-    Assert mtx.matchedCount = 2, _
+    Assert (mtx.matchedCount = 2), _
            "Matrix membership: both distinct Cost Data subs appear (Cecelia + Marlin)", passCount, failCount
     Dim iCec As Long, iMar As Long, cCec As Long, ii As Long
     iCec = 0: iMar = 0: cCec = 0
@@ -3230,13 +3230,13 @@ Private Sub pl_MatrixMembershipSelfTest(ByRef passCount As Long, ByRef failCount
         End If
         If mtx.keyName(ii) = "Marlin" Then iMar = ii
     Next ii
-    Assert (iCec > 0) And (cCec = 1) And (iMar > 0), _
+    Assert ((iCec > 0) And (cCec = 1) And (iMar > 0)), _
            "Matrix membership: Cecelia present exactly once, Marlin present", passCount, failCount
 
     ' State is a LEFT JOIN: filled for Cecelia, blank (not dropped) for Marlin.
-    Assert StrComp(CStr(wsM.Cells(iCec + 1, 3).Value & ""), "Kentucky", vbTextCompare) = 0, _
+    Assert (StrComp(CStr(wsM.Cells(iCec + 1, 3).Value & ""), "Kentucky", vbTextCompare) = 0), _
            "Matrix state: Cecelia State left-joined from Site Data (Kentucky)", passCount, failCount
-    Assert Len(Trim$(CStr(wsM.Cells(iMar + 1, 3).Value & ""))) = 0, _
+    Assert (Len(Trim$(CStr(wsM.Cells(iMar + 1, 3).Value & ""))) = 0), _
            "Matrix state: Marlin (no Site Data) still appears with a BLANK State", passCount, failCount
 
     ' Identity is three separate columns -- never a concatenated label.
@@ -3250,7 +3250,7 @@ Private Sub pl_MatrixMembershipSelfTest(ByRef passCount As Long, ByRef failCount
 
     ' Body cells are live SUMIFS keyed to the substation.
     Dim f As String: f = wsM.Cells(iCec + 1, 4).Formula
-    Assert (Left$(f, 8) = "=SUMIFS(") And (InStr(f, "138") > 0), _
+    Assert ((Left$(f, 8) = "=SUMIFS(") And (InStr(f, "138") > 0)), _
            "Matrix body: cells are live SUMIFS", passCount, failCount
 
     ' The cost curve sums BOTH Cecelia rows above the 2nd trigger (150 MW):
@@ -3262,12 +3262,12 @@ Private Sub pl_MatrixMembershipSelfTest(ByRef passCount As Long, ByRef failCount
             Exit For
         End If
     Next jj
-    Assert (jHi > 0) And (Abs(mtx.costM(iCec, jHi) - 8000000# / mtx.mw(jHi)) < 0.01), _
+    Assert ((jHi > 0) And (Abs(mtx.costM(iCec, jHi) - 8000000# / mtx.mw(jHi)) < 0.01)), _
            "Matrix body: Cecelia curve sums both source rows above the 2nd trigger", passCount, failCount
 
     ' Headroom = first trigger MW per substation.
-    Assert mtx.headroom(iCec) = 100, "Matrix headroom: Cecelia = first trigger (100)", passCount, failCount
-    Assert mtx.headroom(iMar) = 120, "Matrix headroom: Marlin = first trigger (120)", passCount, failCount
+    Assert (mtx.headroom(iCec) = 100), "Matrix headroom: Cecelia = first trigger (100)", passCount, failCount
+    Assert (mtx.headroom(iMar) = 120), "Matrix headroom: Marlin = first trigger (120)", passCount, failCount
 
     If Not wsM Is Nothing Then wsM.Delete
     wsS.Delete
@@ -3280,7 +3280,7 @@ Fail:
     If Not wsS Is Nothing Then wsS.Delete
     If Not wsC Is Nothing Then wsC.Delete
     Application.DisplayAlerts = True
-    Assert False, "Matrix-membership self-test could not run (" & Err.Description & ")", passCount, failCount
+    Assert (False), "Matrix-membership self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' RebuildAudit: the audit summary regenerates from the persisted sheets alone
@@ -3315,12 +3315,12 @@ Private Sub pl_RebuildAuditSelfTest(ByRef passCount As Long, ByRef failCount As 
     Dim dS As Long, fC As Long, cc As Long, sf As Long
     Dim okA As Boolean
     okA = pl_ComputeAudit(wsC, wsK, log, dS, fC, cc, sf)
-    Assert okA, "RebuildAudit: computes from sheets, no consolidation re-run", passCount, failCount
-    Assert dS = 2, "RebuildAudit: 2 distinct substations (Cecelia + Marlin)", passCount, failCount
-    Assert fC = 3, "RebuildAudit: 3 contributing source files", passCount, failCount
-    Assert cc = 1, "RebuildAudit: Cecelia collapsed from >1 file (1/2)", passCount, failCount
-    Assert sf = 1, "RebuildAudit: 1 skipped/failed file from the persisted record", passCount, failCount
-    Assert (fC + sf) = (dS + (fC - dS) + sf), _
+    Assert (okA), "RebuildAudit: computes from sheets, no consolidation re-run", passCount, failCount
+    Assert (dS = 2), "RebuildAudit: 2 distinct substations (Cecelia + Marlin)", passCount, failCount
+    Assert (fC = 3), "RebuildAudit: 3 contributing source files", passCount, failCount
+    Assert (cc = 1), "RebuildAudit: Cecelia collapsed from >1 file (1/2)", passCount, failCount
+    Assert (sf = 1), "RebuildAudit: 1 skipped/failed file from the persisted record", passCount, failCount
+    Assert ((fC + sf) = (dS + (fC - dS) + sf)), _
            "RebuildAudit: reconciliation identity holds (4 = 2 + 1 + 1)", passCount, failCount
 
     Dim hasRecon As Boolean: hasRecon = False
@@ -3328,7 +3328,7 @@ Private Sub pl_RebuildAuditSelfTest(ByRef passCount As Long, ByRef failCount As 
     For ii = 1 To log.n
         If InStr(log.lines(ii), "Reconciliation: files seen (4)") > 0 Then hasRecon = True
     Next ii
-    Assert hasRecon, "RebuildAudit: reconciliation line written to the rebuilt log", passCount, failCount
+    Assert (hasRecon), "RebuildAudit: reconciliation line written to the rebuilt log", passCount, failCount
 
     wsK.Delete
     wsC.Delete
@@ -3339,7 +3339,7 @@ Fail:
     If Not wsK Is Nothing Then wsK.Delete
     If Not wsC Is Nothing Then wsC.Delete
     Application.DisplayAlerts = True
-    Assert False, "Rebuild-audit self-test could not run (" & Err.Description & ")", passCount, failCount
+    Assert (False), "Rebuild-audit self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' File accounting: EVERY selected file is accounted for as contributed or
@@ -3376,20 +3376,20 @@ Private Sub pl_FileAccountingSelfTest(ByRef passCount As Long, ByRef failCount A
     Dim contributed As Long, skipped As Long, lost As Long, redundant As Long, unknown As Long
     pl_AccountCostFiles recs, 5, log, contributed, skipped, lost, redundant, unknown
 
-    Assert (contributed + skipped) = 5, _
+    Assert ((contributed + skipped) = 5), _
            "File accounting: selected (5) = contributed + skipped, exactly", passCount, failCount
-    Assert contributed = 2, "File accounting: 2 files contributed", passCount, failCount
-    Assert skipped = 3, "File accounting: 3 files skipped", passCount, failCount
-    Assert lost = 1, "File accounting: 1 LOST (Gamma, only source missing)", passCount, failCount
-    Assert redundant = 1, "File accounting: 1 redundant (Alpha covered elsewhere)", passCount, failCount
-    Assert unknown = 1, "File accounting: 1 unreadable/unknown (missing sheet)", passCount, failCount
+    Assert (contributed = 2), "File accounting: 2 files contributed", passCount, failCount
+    Assert (skipped = 3), "File accounting: 3 files skipped", passCount, failCount
+    Assert (lost = 1), "File accounting: 1 LOST (Gamma, only source missing)", passCount, failCount
+    Assert (redundant = 1), "File accounting: 1 redundant (Alpha covered elsewhere)", passCount, failCount
+    Assert (unknown = 1), "File accounting: 1 unreadable/unknown (missing sheet)", passCount, failCount
 
     Dim wsK As Worksheet: Set wsK = pl_SheetByName(PL_SH_SKIPPED)
     Dim okSheet As Boolean: okSheet = Not (wsK Is Nothing)
-    Assert okSheet, "File accounting: _Skipped Files sheet exists", passCount, failCount
+    Assert (okSheet), "File accounting: _Skipped Files sheet exists", passCount, failCount
     If okSheet Then
         Dim lr As Long: lr = wsK.Cells(wsK.Rows.Count, 1).End(xlUp).Row
-        Assert (lr - 1) = 3, "File accounting: _Skipped Files itemizes all 3 non-contributors", passCount, failCount
+        Assert ((lr - 1) = 3), "File accounting: _Skipped Files itemizes all 3 non-contributors", passCount, failCount
         Dim rr As Long, gammaLost As Boolean, alphaRed As Boolean
         For rr = 2 To lr
             If StrComp(CStr(wsK.Cells(rr, 5).Value & ""), "Gamma", vbTextCompare) = 0 Then
@@ -3399,8 +3399,8 @@ Private Sub pl_FileAccountingSelfTest(ByRef passCount As Long, ByRef failCount A
                 If InStr(CStr(wsK.Cells(rr, 6).Value & ""), "redundant") > 0 Then alphaRed = True
             End If
         Next rr
-        Assert gammaLost, "File accounting: Gamma row flagged LOST in _Skipped Files", passCount, failCount
-        Assert alphaRed, "File accounting: Alpha (empty dup) row flagged redundant", passCount, failCount
+        Assert (gammaLost), "File accounting: Gamma row flagged LOST in _Skipped Files", passCount, failCount
+        Assert (alphaRed), "File accounting: Alpha (empty dup) row flagged redundant", passCount, failCount
     End If
 
     On Error Resume Next
@@ -3413,7 +3413,7 @@ Fail:
     Dim wsK2 As Worksheet: Set wsK2 = pl_SheetByName(PL_SH_SKIPPED)
     If Not wsK2 Is Nothing Then wsK2.Delete
     Application.DisplayAlerts = True
-    Assert False, "File-accounting self-test could not run (" & Err.Description & ")", passCount, failCount
+    Assert (False), "File-accounting self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' Fix 1 verification: given a file's rows-2-down block containing real data, a
@@ -3433,7 +3433,7 @@ Private Sub pl_HeaderGuardSelfTest(ByRef passCount As Long, ByRef failCount As L
     ' row 4: data
     blk(4, 1) = "Beta": blk(4, 2) = 230: blk(4, 3) = 150: blk(4, 4) = 6000000#
 
-    Assert StrComp(pl_RowSig(blk, 2, 4), hdrSig, vbTextCompare) = 0, _
+    Assert (StrComp(pl_RowSig(blk, 2, 4), hdrSig, vbTextCompare) = 0), _
            "Header guard: a header-dup row matches the header signature", passCount, failCount
 
     Dim kept As Long, r As Long
@@ -3447,7 +3447,7 @@ Private Sub pl_HeaderGuardSelfTest(ByRef passCount As Long, ByRef failCount As L
             kept = kept + 1
         End If
     Next r
-    Assert kept = 2, "Header guard: keeps 2 data rows, drops the header-dup and the blank", passCount, failCount
+    Assert (kept = 2), "Header guard: keeps 2 data rows, drops the header-dup and the blank", passCount, failCount
 End Sub
 
 ' Round-trips a raw population and a rank population through real Excel formulas
@@ -3502,14 +3502,14 @@ Private Sub pl_ParitySelfTest(ByRef passCount As Long, ByRef failCount As Long)
     ws.Delete
     Application.DisplayAlerts = prevAlerts
 
-    Assert rawOK, "Parity: VBA raw-is-better buckets == Excel PERCENTRANK.EXC", passCount, failCount
-    Assert rankOK, "Parity: VBA rank-based buckets == Excel PERCENTRANK.EXC", passCount, failCount
+    Assert (rawOK), "Parity: VBA raw-is-better buckets == Excel PERCENTRANK.EXC", passCount, failCount
+    Assert (rankOK), "Parity: VBA rank-based buckets == Excel PERCENTRANK.EXC", passCount, failCount
     Exit Sub
 Fail:
     On Error Resume Next
     If Not ws Is Nothing Then ws.Delete
     Application.DisplayAlerts = True
-    Assert False, "Parity self-test could not run (" & Err.Description & ")", passCount, failCount
+    Assert (False), "Parity self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 ' 2,000 synthetic substations: rank + bucket every column and assert the whole
@@ -3583,17 +3583,17 @@ Private Sub pl_CheckpointSelfTest(ByRef passCount As Long, ByRef failCount As Lo
     pl_MarkStage PL_STG_COST, 1
 
     ' A Stage-2 failure now must not touch Cost Data.
-    Assert pl_SheetNonEmpty(PL_SH_COST), _
+    Assert (pl_SheetNonEmpty(PL_SH_COST)), _
            "Durability: Cost Data present + non-empty after a Stage-2 failure", passCount, failCount
-    Assert pl_StageDone(PL_STG_COST), "Durability: Stage 1 checkpoint valid", passCount, failCount
-    Assert Not pl_StageDone(PL_STG_SITE), "Durability: Stage 2 not marked complete", passCount, failCount
-    Assert pl_FirstIncompleteStage() = PL_STG_SITE, _
+    Assert (pl_StageDone(PL_STG_COST)), "Durability: Stage 1 checkpoint valid", passCount, failCount
+    Assert (Not pl_StageDone(PL_STG_SITE)), "Durability: Stage 2 not marked complete", passCount, failCount
+    Assert (pl_FirstIncompleteStage() = PL_STG_SITE), _
            "Resume: first incomplete stage is 2 (Stage 1 skipped, no file re-open)", passCount, failCount
 
     ' Saved-on-disk assertion only when the host has a path.
     If Len(ThisWorkbook.Path) > 0 Then
         ThisWorkbook.Save
-        Assert ThisWorkbook.Saved, "Durability: workbook saved on disk after Stage 1", passCount, failCount
+        Assert (ThisWorkbook.Saved), "Durability: workbook saved on disk after Stage 1", passCount, failCount
     Else
         Debug.Print "  (on-disk save assertion skipped: workbook has no path)"
     End If
@@ -3603,14 +3603,14 @@ Private Sub pl_CheckpointSelfTest(ByRef passCount As Long, ByRef failCount As Lo
     ws2.Range("A1:C1").Value = Array(PL_HDR_NAME, "State", PL_HDR_VOLT)
     ws2.Range("A2:C2").Value = Array("Alpha", "NM", 345)
     pl_MarkStage PL_STG_SITE, 1
-    Assert pl_FirstIncompleteStage() = PL_STG_MATRIX, _
+    Assert (pl_FirstIncompleteStage() = PL_STG_MATRIX), _
            "Resume: with Cost + Site valid, first incomplete stage is 3 (Join/Matrix)", passCount, failCount
 
     ' clean up the sheets this test created (workbook was clean beforehand).
     pl_DeleteIfExists PL_SH_COST
     pl_DeleteIfExists PL_SH_SITE
     pl_DeleteIfExists PL_SH_STATE
-    Assert pl_FirstIncompleteStage() = PL_STG_COST, _
+    Assert (pl_FirstIncompleteStage() = PL_STG_COST), _
            "Resume: with no checkpoints, first incomplete stage is 1 (start fresh)", passCount, failCount
     Application.DisplayAlerts = prevAlerts
     Exit Sub
@@ -3620,7 +3620,7 @@ Fail:
     pl_DeleteIfExists PL_SH_SITE
     pl_DeleteIfExists PL_SH_STATE
     Application.DisplayAlerts = True
-    Assert False, "Checkpoint self-test could not run (" & Err.Description & ")", passCount, failCount
+    Assert (False), "Checkpoint self-test could not run (" & Err.Description & ")", passCount, failCount
 End Sub
 
 Private Sub pl_DeleteIfExists(ByVal nm As String)
@@ -5003,55 +5003,55 @@ Public Sub SelfTest()
     For w = 0 To 1
         i = who(w)
         If i = 0 Then
-            Assert False, "Cunningham/Hobbs row missing", passCount, failCount
+            Assert (False), "Cunningham/Hobbs row missing", passCount, failCount
         Else
             RowVectors costM, mw, i, m, c, T
             Dim segs() As TSegment: segs = Segmentize(mw, T, m)
-            Assert UBound(segs) = 1, GetName(names, i) & ": 1 segment", passCount, failCount
-            Assert segs(1).Ttotal = 47633000#, GetName(names, i) & ": T = 47,633,000", passCount, failCount
+            Assert (UBound(segs) = 1), GetName(names, i) & ": 1 segment", passCount, failCount
+            Assert (segs(1).Ttotal = 47633000#), GetName(names, i) & ": T = 47,633,000", passCount, failCount
             Assert FittedString(mw, T, segs, UBound(segs), m, c) = _
                    "y = 47,633,000 / x  [100-300 MW]", _
                    GetName(names, i) & ": formula string", passCount, failCount
             Dim li As Long: li = LongestSegIdx(mw, segs, UBound(segs))
-            Assert Round(KneeXStar(mw, T, segs(li)), 1) = 173.2, _
+            Assert (Round(KneeXStar(mw, T, segs(li)), 1) = 173.2), _
                    GetName(names, i) & ": knee 173.2 MW", passCount, failCount
-            Assert ThresholdRangeStr(T, mw, m, 25000000#) = "None", _
+            Assert (ThresholdRangeStr(T, mw, m, 25000000#) = "None"), _
                    GetName(names, i) & ": <=$25MM None", passCount, failCount
-            Assert ThresholdRangeStr(T, mw, m, 50000000#) = "All (100-300 MW)", _
+            Assert (ThresholdRangeStr(T, mw, m, 50000000#) = "All (100-300 MW)"), _
                    GetName(names, i) & ": <=$50MM All", passCount, failCount
-            Assert ThresholdRangeStr(T, mw, m, 75000000#) = "All (100-300 MW)", _
+            Assert (ThresholdRangeStr(T, mw, m, 75000000#) = "All (100-300 MW)"), _
                    GetName(names, i) & ": <=$75MM All", passCount, failCount
-            Assert ThresholdRangeStr(T, mw, m, 100000000#) = "All (100-300 MW)", _
+            Assert (ThresholdRangeStr(T, mw, m, 100000000#) = "All (100-300 MW)"), _
                    GetName(names, i) & ": <=$100MM All", passCount, failCount
         End If
     Next w
 
     ' ---- Chaves County (multi-tier) ---------------------------
     If iChv = 0 Then
-        Assert False, "Chaves County row missing", passCount, failCount
+        Assert (False), "Chaves County row missing", passCount, failCount
     Else
         RowVectors costM, mw, iChv, m, c, T
         Dim csg() As TSegment: csg = Segmentize(mw, T, m)
-        Assert UBound(csg) = 5, "Chaves: 5 segments", passCount, failCount
-        Assert csg(1).Ttotal = 49473000#, "Chaves: seg1 T", passCount, failCount
-        Assert csg(2).Ttotal = 98003000#, "Chaves: seg2 T", passCount, failCount
-        Assert csg(3).Ttotal = 185783000#, "Chaves: seg3 T", passCount, failCount
-        Assert csg(4).Ttotal = 205353000#, "Chaves: seg4 T", passCount, failCount
-        Assert csg(5).Ttotal = 207843000#, "Chaves: seg5 T", passCount, failCount
-        Assert StepChangeStr(mw, csg, 5) = "200, 210, 240, 280", _
+        Assert (UBound(csg) = 5), "Chaves: 5 segments", passCount, failCount
+        Assert (csg(1).Ttotal = 49473000#), "Chaves: seg1 T", passCount, failCount
+        Assert (csg(2).Ttotal = 98003000#), "Chaves: seg2 T", passCount, failCount
+        Assert (csg(3).Ttotal = 185783000#), "Chaves: seg3 T", passCount, failCount
+        Assert (csg(4).Ttotal = 205353000#), "Chaves: seg4 T", passCount, failCount
+        Assert (csg(5).Ttotal = 207843000#), "Chaves: seg5 T", passCount, failCount
+        Assert (StepChangeStr(mw, csg, 5) = "200, 210, 240, 280"), _
                "Chaves: step points 200, 210, 240, 280", passCount, failCount
         Dim cli As Long: cli = LongestSegIdx(mw, csg, 5)
-        Assert mw(csg(cli).FirstJ) = 100 And mw(csg(cli).LastJ) = 190, _
+        Assert (mw(csg(cli).FirstJ) = 100 And mw(csg(cli).LastJ) = 190), _
                "Chaves: longest segment 100-190", passCount, failCount
-        Assert Round(KneeXStar(mw, T, csg(cli)), 1) = 137.8, _
+        Assert (Round(KneeXStar(mw, T, csg(cli)), 1) = 137.8), _
                "Chaves: knee 137.8 MW", passCount, failCount
-        Assert ThresholdRangeStr(T, mw, m, 25000000#) = "None", _
+        Assert (ThresholdRangeStr(T, mw, m, 25000000#) = "None"), _
                "Chaves: <=$25MM None", passCount, failCount
-        Assert ThresholdRangeStr(T, mw, m, 50000000#) = "100-190 MW", _
+        Assert (ThresholdRangeStr(T, mw, m, 50000000#) = "100-190 MW"), _
                "Chaves: <=$50MM 100-190 MW", passCount, failCount
-        Assert ThresholdRangeStr(T, mw, m, 75000000#) = "100-190 MW", _
+        Assert (ThresholdRangeStr(T, mw, m, 75000000#) = "100-190 MW"), _
                "Chaves: <=$75MM 100-190 MW", passCount, failCount
-        Assert ThresholdRangeStr(T, mw, m, 100000000#) = "100-200 MW", _
+        Assert (ThresholdRangeStr(T, mw, m, 100000000#) = "100-200 MW"), _
                "Chaves: <=$100MM 100-200 MW", passCount, failCount
     End If
 
@@ -5073,9 +5073,9 @@ Public Sub SelfTest()
         If ptSum <> m Then segSumOK = False
     Next i
 
-    Assert allNone25, "Global: <=$25MM is None for all 17 rows", passCount, failCount
-    Assert Round(gMinT, 0) = 47633000#, "Global: min implied total = 47,633,000", passCount, failCount
-    Assert segSumOK, "Global: segment point counts sum to m for every substation", passCount, failCount
+    Assert (allNone25), "Global: <=$25MM is None for all 17 rows", passCount, failCount
+    Assert (Round(gMinT, 0) = 47633000#), "Global: min implied total = 47,633,000", passCount, failCount
+    Assert (segSumOK), "Global: segment point counts sum to m for every substation", passCount, failCount
 
     ' ---- Ranking assertions (spec section 8) ------------------
     Dim rkCount() As Long, rkMaxMW() As Double, rkCostMax() As Double
@@ -5097,55 +5097,55 @@ Public Sub SelfTest()
     Dim xRR As Long:  xRR = NameIndex(names, n, "Roadrunner")
 
     ' $25MM: zero qualify, all ranks n/a
-    Assert CountRanked(rankA, n, 1) = 0 And CountRanked(rankB, n, 1) = 0, _
+    Assert (CountRanked(rankA, n, 1) = 0 And CountRanked(rankB, n, 1) = 0), _
            "$25MM: no substation ranked (all n/a)", passCount, failCount
 
     ' $50MM: 8 qualify
-    Assert CountRanked(rankA, n, 2) = 8, "$50MM: 8 qualify", passCount, failCount
-    Assert rankA(xCun, 2) = 1 And rankA(xHob, 2) = 1, "$50MM A: Cun/Hob rank 1", passCount, failCount
-    Assert rankA(xEC, 2) = 3, "$50MM A: Eddy County rank 3", passCount, failCount
-    Assert rankA(xEN, 2) = 4, "$50MM A: Eddy North rank 4", passCount, failCount
-    Assert rankA(xCha, 2) = 5, "$50MM A: Chaves rank 5", passCount, failCount
-    Assert rankA(xOa, 2) = 6 And rankA(xPH, 2) = 6 And rankA(xRoo, 2) = 6, _
+    Assert (CountRanked(rankA, n, 2) = 8), "$50MM: 8 qualify", passCount, failCount
+    Assert (rankA(xCun, 2) = 1 And rankA(xHob, 2) = 1), "$50MM A: Cun/Hob rank 1", passCount, failCount
+    Assert (rankA(xEC, 2) = 3), "$50MM A: Eddy County rank 3", passCount, failCount
+    Assert (rankA(xEN, 2) = 4), "$50MM A: Eddy North rank 4", passCount, failCount
+    Assert (rankA(xCha, 2) = 5), "$50MM A: Chaves rank 5", passCount, failCount
+    Assert (rankA(xOa, 2) = 6 And rankA(xPH, 2) = 6 And rankA(xRoo, 2) = 6), _
            "$50MM A: Oasis/PH/Roosevelt tie rank 6", passCount, failCount
-    Assert rkCount(xEC, 2) = 19 And rkCount(xEN, 2) = 18 And rkCount(xCha, 2) = 10, _
+    Assert (rkCount(xEC, 2) = 19 And rkCount(xEN, 2) = 18 And rkCount(xCha, 2) = 10), _
            "$50MM: EddyC 19 / EddyN 18 / Chaves 10 pts", passCount, failCount
-    Assert rankB(xOa, 2) = 1 And rankB(xPH, 2) = 1 And rankB(xRoo, 2) = 1, _
+    Assert (rankB(xOa, 2) = 1 And rankB(xPH, 2) = 1 And rankB(xRoo, 2) = 1), _
            "$50MM B: Oasis/PH/Roosevelt tie rank 1", passCount, failCount
-    Assert rankB(xCha, 2) = 4 And rankB(xEN, 2) = 5 And rankB(xEC, 2) = 6, _
+    Assert (rankB(xCha, 2) = 4 And rankB(xEN, 2) = 5 And rankB(xEC, 2) = 6), _
            "$50MM B: Chaves 4 / EddyN 5 / EddyC 6", passCount, failCount
-    Assert rankB(xCun, 2) = 7 And rankB(xHob, 2) = 7, "$50MM B: Cun/Hob tie rank 7", passCount, failCount
+    Assert (rankB(xCun, 2) = 7 And rankB(xHob, 2) = 7), "$50MM B: Cun/Hob tie rank 7", passCount, failCount
     Assert Round(rkSlope(xOa, 2), 1) = -2754.6 And Round(rkSlope(xCha, 2), 1) = -2531.7 _
        And Round(rkSlope(xEN, 2), 1) = -1691# And Round(rkSlope(xEC, 2), 1) = -1559.2 _
        And Round(rkSlope(xCun, 2), 1) = -1435.4, "$50MM B: slope values", passCount, failCount
 
     ' $75MM: 15 qualify
-    Assert CountRanked(rankA, n, 3) = 15, "$75MM: 15 qualify", passCount, failCount
+    Assert (CountRanked(rankA, n, 3) = 15), "$75MM: 15 qualify", passCount, failCount
     Assert rkCount(xCun, 3) = 21 And rkCount(xEC, 3) = 21 And rkCount(xEN, 3) = 21 _
        And rkCount(xHob, 3) = 21 And rkCount(xKio, 3) = 21, "$75MM: five substations at 21 pts", passCount, failCount
-    Assert rankA(xCun, 3) = 1 And rankA(xHob, 3) = 1, "$75MM A: Cun/Hob rank 1", passCount, failCount
-    Assert rankA(xEC, 3) = 3 And rankA(xKio, 3) = 3, "$75MM A: EddyC/Kiowa tie rank 3 (equal cost@300)", passCount, failCount
-    Assert rankA(xEN, 3) = 5, "$75MM A: Eddy North rank 5", passCount, failCount
-    Assert rkCount(xCD, 3) = 8 And rankA(xCD, 3) = MaxRankVal(rankA, n, 3), _
+    Assert (rankA(xCun, 3) = 1 And rankA(xHob, 3) = 1), "$75MM A: Cun/Hob rank 1", passCount, failCount
+    Assert (rankA(xEC, 3) = 3 And rankA(xKio, 3) = 3), "$75MM A: EddyC/Kiowa tie rank 3 (equal cost@300)", passCount, failCount
+    Assert (rankA(xEN, 3) = 5), "$75MM A: Eddy North rank 5", passCount, failCount
+    Assert (rkCount(xCD, 3) = 8 And rankA(xCD, 3) = MaxRankVal(rankA, n, 3)), _
            "$75MM A: China Draw last on breadth at 8 pts", passCount, failCount
-    Assert rankB(xCD, 3) = 1 And Round(rkSlope(xCD, 3), 1) = -4227.6, _
+    Assert (rankB(xCD, 3) = 1 And Round(rkSlope(xCD, 3), 1) = -4227.6), _
            "$75MM B: China Draw first on slope -4227.6 (inversion)", passCount, failCount
-    Assert rkCount(xCha, 3) = 10 And Round(rkSlope(xCha, 3), 1) = -2531.7, _
+    Assert (rkCount(xCha, 3) = 10 And Round(rkSlope(xCha, 3), 1) = -2531.7), _
            "$75MM: Chaves 10 pts slope -2531.7", passCount, failCount
 
     ' $100MM: 17 qualify, 13 tie at 21 pts
-    Assert CountRanked(rankA, n, 4) = 17, "$100MM: 17 qualify", passCount, failCount
+    Assert (CountRanked(rankA, n, 4) = 17), "$100MM: 17 qualify", passCount, failCount
     Dim c21 As Long: c21 = 0
     For i = 1 To n
         If rkCount(i, 4) = 21 Then c21 = c21 + 1
     Next i
-    Assert c21 = 13, "$100MM: 13 tie at 21 qualifying points", passCount, failCount
-    Assert rkCount(xRR, 4) = 12 And rankA(xRR, 4) = 16 And rankB(xRR, 4) = 1, _
+    Assert (c21 = 13), "$100MM: 13 tie at 21 qualifying points", passCount, failCount
+    Assert (rkCount(xRR, 4) = 12 And rankA(xRR, 4) = 16 And rankB(xRR, 4) = 1), _
            "$100MM: Roadrunner 16th breadth / 1st slope (inversion)", passCount, failCount
-    Assert Round(rkSlope(xRR, 4), 1) = -4428.9, "$100MM B: Roadrunner -4428.9", passCount, failCount
-    Assert rkCount(xCha, 4) = 11 And rankA(xCha, 4) = 17 And rankA(xCha, 4) = MaxRankVal(rankA, n, 4), _
+    Assert (Round(rkSlope(xRR, 4), 1) = -4428.9), "$100MM B: Roadrunner -4428.9", passCount, failCount
+    Assert (rkCount(xCha, 4) = 11 And rankA(xCha, 4) = 17 And rankA(xCha, 4) = MaxRankVal(rankA, n, 4)), _
            "$100MM A: Chaves last on breadth at 11 pts", passCount, failCount
-    Assert rankB(xCha, 4) = 14 And Round(rkSlope(xCha, 4), 1) = -1287.8, _
+    Assert (rankB(xCha, 4) = 14 And Round(rkSlope(xCha, 4), 1) = -1287.8), _
            "$100MM B: Chaves 14th slope -1287.8", passCount, failCount
     Assert Round(rkSlope(xOa, 4), 1) = -730.3 And Round(rkSlope(xPH, 4), 1) = -687.7 _
        And Round(rkSlope(xRoo, 4), 1) = -687.7, "$100MM B: Oasis/PH/Roosevelt flattest", passCount, failCount
@@ -5157,9 +5157,9 @@ Public Sub SelfTest()
         For i = 1 To n
             If rkCount(i, tt) >= 1 Then qc = qc + 1
         Next i
-        Assert CountRanked(rankA, n, tt) = qc, _
+        Assert (CountRanked(rankA, n, tt) = qc), _
                "Struct t" & tt & ": non-na Rank A count == qualifier count", passCount, failCount
-        Assert MaxRankVal(rankA, n, tt) <= qc, _
+        Assert (MaxRankVal(rankA, n, tt) <= qc), _
                "Struct t" & tt & ": max Rank A <= qualifier count", passCount, failCount
     Next tt
 
