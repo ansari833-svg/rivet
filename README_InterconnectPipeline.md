@@ -73,20 +73,30 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    substation matches (by name, plus voltage when carried), **left blank when
    there is no match — never a reason to drop the row**.
 
-   **One shared name normalization on both sides.** The match key runs both the
-   cost-side name and the site-side `Summary!A` name through the same
-   `pl_NormSubName` (via `pl_CostKey`) before comparing: it strips the embedded
-   voltage token (`230kV` / `230 kV` / `230. kV`), collapses nbsp/multiple
-   spaces, trims, and lower-cases. So a site name with the voltage baked in,
-   `Big Cajun 1 230kV`, normalizes to `big cajun 1` and **matches** the clean
-   cost name `Big Cajun 1` @ 230 — where before the raw site string never
-   equalled the parsed cost name and ~400+ genuine pairs reported *no match*
-   (expected < ~100). It preserves a trailing unit number (the `1` in
-   `Big Cajun 1`) so distinct units never merge. Stage 3 logs the reconciliation
-   — *site triples, cost substations, matched, unmatched* — and every remaining
-   unmatched site row with **both its raw name and its normalized key**, so true
-   residuals are diagnosable. Site rows with no Cost Data match are informational
-   only. The `Matrix` identity is
+   **One shared name + voltage normalization on both sides.** The match key runs
+   both the cost-side name and the site-side `Summary!A` name through the same
+   two shared routines (via `pl_CostKey`), so the sides can never drift:
+   - **`pl_NormSubName`** (name-clean): remove the embedded voltage token
+     (`138kV` / `230 kV` / `230. kV`); strip a trailing standalone integer that
+     **followed** the voltage — a file counter, so `Cecelia 138kV 1` and
+     `Cecelia 138kV 2` both become `cecelia` and collapse together — while
+     **keeping** a unit number that preceded the voltage (the `1` in
+     `Big Cajun 1 230kV` → `big cajun 1`, and the already-clean cost name
+     `Big Cajun 1` → `big cajun 1`, so they still match); collapse nbsp/spaces,
+     trim, lower-case.
+   - **`pl_VoltFrom` + `pl_VoltStr`** (voltage): extract the 2–4 digit integer
+     **immediately adjacent** to `kV` (only spaces / one period between), so
+     `Explorer Claremore 138kV` → `138` (never a stray `168`), and render it as a
+     **clean integer** — the key reads `…|138`, never `…|138.`.
+
+   So `Cecelia 138kV 1` (site) keys to `cecelia|138` and matches the clean cost
+   `Cecelia` @ 138. Before these fixes the site keys were malformed
+   (`cecelia 1|138.` — counter kept, voltage with a trailing dot) and ~299
+   genuine pairs reported *no match*; **after, unmatched drops below ~100.**
+   Stage 3 logs the reconciliation — *site triples, cost substations, matched,
+   unmatched* — and every remaining unmatched site row with **both its raw name
+   and its normalized key**, so true residuals are diagnosable. Site rows with no
+   Cost Data match are informational only. The `Matrix` identity is
    **three separate columns** — `Substation` (clean name), `Voltage (kV)`,
    `State` — followed by the MW × cost body (never a concatenated
    `Chalkley 230. kV (Louisiana)` label). The body is **live `SUMIFS` by
@@ -355,9 +365,16 @@ definitions.
 Data trigger column, keyed like the matrix rows), computed from the trigger
 column directly so triggers below the smallest or above the largest sampled MW
 are captured, not clipped. **Headroom Percentile (1–5)** is raw-is-better (more
-headroom is better, no inversion). Reading it: a first trigger at/below the
-smallest sampled MW (100) means effectively **no headroom** in the practical
-range; above the largest (300) means headroom **exceeds the studied range**.
+headroom is better, no inversion). **Headroom = 0 (or no positive trigger) scores
+percentile 0** — the worst case, excluded from the ranked population exactly like
+a threshold non-qualifier: only strictly-positive headrooms are ranked 1–5 among
+themselves, and a zero never lands in a 1–5 bucket and is never blank. Both paths
+enforce this — the values path uses the masked bucket helper
+(`pl_RawBucketArrayMasked`, which returns 0 for the masked-out zeros), and the
+`USE_LIVE_FORMULAS` path writes the headroom blank (so `PERCENTRANK.EXC` excludes
+it) and falls the percentile to 0 via `IFERROR(…,0)`. Reading it: a first trigger
+at/below the smallest sampled MW means effectively **no headroom** in the
+practical range; above the largest means headroom **exceeds the studied range**.
 Headroom is a display-and-rank lens **only — never added to the Weighted
 Score**, and the composite maximum stays 165.
 
@@ -412,12 +429,18 @@ Score**, and the composite maximum stays 165.
   `_Skipped Files` itemizes all 3 non-contributors; and that the bad-header file
   is flagged **LOST** (its substation appears nowhere else) while the empty
   duplicate is flagged **redundant** (its substation is covered by another file).
-- **Site↔Cost name matching** — the shared `pl_NormSubName` maps
-  `Big Cajun 1 230kV` → `big cajun 1` (voltage stripped, unit number kept),
-  `Ponderosa 500 kV` → `ponderosa`, `Grimes 138. kV` → `grimes`; and `pl_CostKey`
-  produces the **same** key for the embedded-voltage site name and the clean cost
-  name for each of `Big Cajun 1`, `Ponderosa`, `Cincinnati`, `Mockingbird`,
-  `Grimes`, so every genuine pair matches.
+- **Site↔Cost name matching** — the shared routines strip the trailing counter
+  (`Cecelia 138kV 1` and `…2` both → `cecelia`, and both `pl_CostKey` to
+  `cecelia|138`, matching the clean cost `Cecelia` @ 138) while keeping a unit
+  number (`Big Cajun 1 230kV` → `big cajun 1`); the voltage extracts the digits
+  adjacent to `kV` (`Explorer Claremore 138kV` → `138`, not `168`) and renders a
+  clean integer (`grimes|138`, never a trailing `.`); and every named bug-report
+  pair (`Big Cajun 1`, `Ponderosa`, `Cincinnati`, `Mockingbird`, `Grimes`)
+  produces the same key on both sides.
+- **Headroom zero** — a 5-substation population (`50, 0, 200, 300, 0`) asserts the
+  two zeros score percentile **0** (masked out), the three positives rank **1–5**
+  among themselves (`300 ≥ 200 ≥ 50`), and only those three enter the ranked
+  population.
 - **Analysis layout** — traces the `nt = 4` column map: identity at `A/B/C`,
   Weighted Score/pctile/Headroom at `D/E/F`, Flattening pctile at `I`, and the
   Weighted Score formula resolves to `=I4+AA4+AF4+AK4+AP4` with the first band

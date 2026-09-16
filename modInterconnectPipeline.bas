@@ -1741,11 +1741,12 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     End If
 
     ' -- left join: cost-identity key -> State (first non-empty match wins).
-    '    Both sides key through pl_CostKey -> pl_NormSubName, so a site name with
-    '    the voltage embedded ("Big Cajun 1 230kV") normalizes to the same key as
-    '    the clean cost name ("Big Cajun 1" @ 230) and the genuine pair matches.
-    '    Site rows with no Cost Data match are logged (raw + normalized keys, so
-    '    residuals are diagnosable); they NEVER remove a Cost Data substation. --
+    '    Both sides key through pl_CostKey (shared pl_NormSubName name-clean +
+    '    pl_VoltFrom/pl_VoltStr integer voltage), so a site name with the voltage
+    '    embedded and a trailing counter ("Cecelia 138kV 1") normalizes to the
+    '    same "cecelia|138" key as the clean cost name ("Cecelia" @ 138) and the
+    '    genuine pair matches. Site rows with no Cost Data match are logged (raw +
+    '    normalized keys, diagnosable); they NEVER remove a Cost Data substation. --
     Dim dState As Object: Set dState = CreateObject("Scripting.Dictionary")
     Dim s As Long, mk As String
     Dim siteMatched As Long, siteUnmatched As Long
@@ -1984,30 +1985,73 @@ Private Function pl_ResolveMatchKey(ByRef tr As PL_TSiteTriple, ByVal dId As Obj
     pl_ResolveMatchKey = ""
 End Function
 
-' Identity key for a cost tab: name (+voltage when the tab carried one).
-' Shared substation-name normalization for MATCHING, applied identically to the
-' cost-side name and the site-side Summary!A name so their keys agree. It strips
-' the embedded voltage token (230kV / 230 kV / 230. kV), collapses nbsp/multiple
-' spaces, trims, and lower-cases for a case-insensitive compare.
-'   "Big Cajun 1 230kV" (site raw) -> "big cajun 1"
-'   "Big Cajun 1"       (cost, already clean) -> "big cajun 1"   => they match.
-' It does NOT strip a trailing integer: on the cost side the file counter was
-' already removed at tab-parse time, and the site side has no file counter, so a
-' trailing number here (e.g. the unit in "Big Cajun 1") is part of the real name
-' and must be preserved -- stripping it would merge distinct units.
+' SHARED name-clean routine for MATCHING, called identically on the cost tab
+' name and the site Summary!A name so the two sides can never drift. Steps:
+'   1. collapse nbsp/multiple spaces, trim
+'   2. remove the embedded voltage token (138kV / 230 kV / 230. kV)
+'   3. strip a trailing standalone integer that FOLLOWED the voltage (a file
+'      counter, e.g. the "1"/"2" in "Cecelia 138kV 1"/"...2") -- but NOT a unit
+'      number that preceded the voltage (the "1" in "Big Cajun 1 230kV"), which
+'      is part of the real name
+'   4. lower-case
+' Results:
+'   "Cecelia 138kV 1" / "Cecelia 138kV 2" -> "cecelia"   (counter stripped)
+'   "Big Cajun 1 230kV"                   -> "big cajun 1" (unit kept)
+'   "Big Cajun 1" (cost, already clean)   -> "big cajun 1" (no voltage -> no
+'                                            counter strip) => matches the site
 Private Function pl_NormSubName(ByVal raw As String) As String
     Dim work As String: work = pl_NormSpaces(raw)
     Dim vFound As Boolean, vVal As Double, vStart As Long, vEnd As Long
     pl_ExtractVoltage work, vFound, vVal, vStart, vEnd
     If vFound Then
-        work = pl_NormSpaces(Left$(work, vStart - 1) & " " & Mid$(work, vEnd + 1))
+        Dim head As String, tail As String
+        head = Left$(work, vStart - 1)
+        tail = Trim$(Mid$(work, vEnd + 1))
+        If pl_IsAllDigits(tail) Then tail = ""      ' trailing counter after the voltage
+        work = pl_NormSpaces(head & " " & tail)
     End If
     pl_NormSubName = LCase$(pl_NormSpaces(work))
 End Function
 
-' Identity key: NORMALIZED name (shared on both sides) + voltage when carried.
+' SHARED voltage-parse routine: the integer voltage adjacent to kV in `raw`, or
+' 0 when none. Uses the same extractor as the name-clean, so both sides agree.
+Private Function pl_VoltFrom(ByVal raw As String) As Double
+    Dim vFound As Boolean, vVal As Double, vStart As Long, vEnd As Long
+    pl_ExtractVoltage pl_NormSpaces(raw), vFound, vVal, vStart, vEnd
+    If vFound Then
+        pl_VoltFrom = vVal
+    Else
+        pl_VoltFrom = 0
+    End If
+End Function
+
+' SHARED voltage-to-key string: a CLEAN integer (no trailing ".", space, or kV),
+' so keys read "...|138", never "...|138." A fractional voltage (rare) keeps its
+' decimals but never a bare trailing dot.
+Private Function pl_VoltStr(ByVal v As Double) As String
+    If v = Int(v) Then
+        pl_VoltStr = CStr(CLng(v))
+    Else
+        pl_VoltStr = pl_NumStr(v)
+    End If
+End Function
+
+' Identity key, built with the shared routines and IDENTICAL on both sides:
+' normalized name + "|" + integer voltage. The voltage in the NAME (via
+' pl_VoltFrom) wins; the passed-in value (a cost tab's parsed voltage, or a site
+' voltage column) is the fallback. So "Cecelia 138kV 1" (site) and clean
+' "Cecelia" @ 138 (cost) both key to "cecelia|138".
 Private Function pl_CostKey(ByVal nm As String, ByVal v As Double, ByVal vp As Boolean) As String
-    pl_CostKey = pl_NormSubName(nm) & "|" & IIf(vp, pl_NumStr(v), "")
+    Dim volt As Double, haveVolt As Boolean
+    Dim nameVolt As Double: nameVolt = pl_VoltFrom(nm)
+    If nameVolt > 0 Then
+        volt = nameVolt: haveVolt = True
+    ElseIf vp Then
+        volt = v: haveVolt = True
+    Else
+        haveVolt = False
+    End If
+    pl_CostKey = pl_NormSubName(nm) & "|" & IIf(haveVolt, pl_VoltStr(volt), "")
 End Function
 
 ' ==========================================================================
@@ -2421,48 +2465,55 @@ Private Function pl_StripTrailingCounter(ByVal work As String) As String
     pl_StripTrailingCounter = work
 End Function
 
-' Find a voltage: a numeric run, then separators, then "kV". Sets found/value
-' and the [startPos..endPos] span (numeric start .. the "V" of kV) to remove.
+' Find a voltage as the 2-4 digit integer IMMEDIATELY preceding "kV" -- the
+' equivalent of the regex (\d{2,4})\s*\.?\s*kV. Only spaces/nbsp/tab and at most
+' one period may sit between the digits and "kV"; the digit run itself is pure
+' digits, so an unrelated number elsewhere in the string is never pulled in
+' ("Explorer Claremore 138kV" -> 138, never 168; "Big Cajun 1 230kV" -> 230, the
+' leading unit "1" is not adjacent to kV). Sets found/value and the
+' [startPos..endPos] span (first digit .. the "V" of kV) to remove.
 Private Sub pl_ExtractVoltage(ByVal work As String, ByRef found As Boolean, _
                               ByRef val As Double, ByRef startPos As Long, ByRef endPos As Long)
     found = False
     Dim lw As String: lw = LCase$(work)
     Dim kpos As Long: kpos = InStr(1, lw, "kv")
     Do While kpos > 0
-        ' the char after "kV" must not be a letter (avoid kVA, names like Skvortsov are handled by the digit test)
+        ' the char after "kV" must not be a letter (avoid kVA / names like Skvortsov)
         Dim okBoundary As Boolean
         okBoundary = (kpos + 2 > Len(work))
         If Not okBoundary Then okBoundary = Not pl_IsAlpha(Mid$(work, kpos + 2, 1))
         If okBoundary Then
+            ' walk left over spaces and at most one period (the "230. kV" case)
             Dim j As Long: j = kpos - 1
+            Dim dotSeen As Boolean: dotSeen = False
             Do While j >= 1
                 Dim c As String: c = Mid$(work, j, 1)
-                If c = " " Or c = "." Or c = "," Or c = "-" Or c = Chr$(160) Or c = vbTab Then
+                If c = " " Or c = Chr$(160) Or c = vbTab Then
                     j = j - 1
+                ElseIf c = "." And Not dotSeen Then
+                    dotSeen = True: j = j - 1
                 Else
                     Exit Do
                 End If
             Loop
+            ' require a contiguous run of digits ending here
             If j >= 1 Then
-                If pl_IsDigitOrDot(Mid$(work, j, 1)) Then
+                If pl_IsAllDigits(Mid$(work, j, 1)) Then
                     Dim numEnd As Long: numEnd = j
                     Do While j >= 1
-                        If pl_IsDigitOrDot(Mid$(work, j, 1)) Then
+                        If pl_IsAllDigits(Mid$(work, j, 1)) Then
                             j = j - 1
                         Else
                             Exit Do
                         End If
                     Loop
                     Dim numStart As Long: numStart = j + 1
-                    Dim cleaned As String
-                    cleaned = pl_CleanNumber(Mid$(work, numStart, numEnd - numStart + 1))
-                    If Len(cleaned) > 0 Then
-                        If IsNumeric(cleaned) Then
-                            Dim v As Double: v = CDbl(cleaned)
-                            If v > 0 And v <= 2000 Then
-                                found = True: val = v: startPos = numStart: endPos = kpos + 1
-                                Exit Sub
-                            End If
+                    Dim digits As String: digits = Mid$(work, numStart, numEnd - numStart + 1)
+                    If Len(digits) >= 2 And Len(digits) <= 4 Then
+                        Dim v As Double: v = CDbl(digits)
+                        If v > 0 And v <= 2000 Then
+                            found = True: val = v: startPos = numStart: endPos = kpos + 1
+                            Exit Sub
                         End If
                     End If
                 End If
@@ -2991,30 +3042,85 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 16) Analysis layout: identity split + Weighted Score references resolve
     pl_AnalysisLayoutSelfTest passCount, failCount
 
+    ' 17) Headroom = 0 scores percentile 0; positives rank among positives
+    pl_HeadroomZeroSelfTest passCount, failCount
+
     Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
                 " errors (a compile break cannot be asserted from runtime)."
 End Sub
 
-' Fix 4: the SHARED normalization must make a site name with the voltage embedded
-' key-equal to the clean cost name, so the genuine pair matches. Also checks the
-' named cases from the bug report and that unit numbers in the name survive.
+' Fix 1: headroom = 0 (or no positive trigger) is excluded from the ranked
+' population and scores percentile 0 -- the worst case, like a non-qualifier --
+' while strictly-positive headrooms rank 1-5 among themselves only.
+Private Sub pl_HeadroomZeroSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    Dim hv() As Double: ReDim hv(1 To 5)
+    hv(1) = 50: hv(2) = 0: hv(3) = 200: hv(4) = 300: hv(5) = 0
+    Dim part() As Boolean: ReDim part(1 To 5)
+    Dim i As Long
+    For i = 1 To 5: part(i) = (hv(i) > 0): Next i
+    Dim b() As Long: b = pl_RawBucketArrayMasked(hv, part, 5)
+
+    Assert (b(2) = 0 And b(5) = 0), _
+           "Headroom 0 -> percentile 0 (masked out, not a ranked bucket)", passCount, failCount
+    Assert (b(1) >= 1 And b(3) >= 1 And b(4) >= 1), _
+           "Positive headroom scores 1-5", passCount, failCount
+    Assert (b(4) >= b(3) And b(3) >= b(1)), _
+           "Headroom ranking among positives: 300 >= 200 >= 50", passCount, failCount
+    Dim ranked As Long: ranked = 0
+    For i = 1 To 5
+        If b(i) > 0 Then ranked = ranked + 1
+    Next i
+    Assert (ranked = 3), _
+           "Only the 3 positive-headroom substations enter the ranked population", passCount, failCount
+End Sub
+
+' Fix 2: the SHARED name-clean + voltage-parse routines must make a site name
+' with the voltage embedded key-equal to the clean cost name, strip the trailing
+' file counter, key voltage as a clean integer (no trailing "."), and extract the
+' digits adjacent to kV. Checks the named bug-report cases.
 Private Sub pl_NameMatchSelfTest(ByRef passCount As Long, ByRef failCount As Long)
-    ' embedded-voltage site name normalizes to the clean cost name
+    ' (a) trailing counter after the voltage is stripped; unit number before it kept
+    Assert (pl_NormSubName("Cecelia 138kV 1") = "cecelia"), _
+           "NormName: 'Cecelia 138kV 1' -> 'cecelia' (counter stripped)", passCount, failCount
+    Assert (pl_NormSubName("Cecelia 138kV 2") = "cecelia"), _
+           "NormName: 'Cecelia 138kV 2' -> 'cecelia' (counter stripped)", passCount, failCount
     Assert (pl_NormSubName("Big Cajun 1 230kV") = "big cajun 1"), _
-           "NormName: 'Big Cajun 1 230kV' -> 'big cajun 1' (unit # kept, voltage stripped)", passCount, failCount
+           "NormName: 'Big Cajun 1 230kV' -> 'big cajun 1' (unit # kept)", passCount, failCount
+    Assert (pl_NormSubName("Big Cajun 1") = "big cajun 1"), _
+           "NormName: clean cost 'Big Cajun 1' -> 'big cajun 1' (no voltage -> unit kept)", passCount, failCount
     Assert (pl_NormSubName("Ponderosa 500 kV") = "ponderosa"), _
            "NormName: 'Ponderosa 500 kV' -> 'ponderosa'", passCount, failCount
     Assert (pl_NormSubName("Grimes 138. kV") = "grimes"), _
            "NormName: 'Grimes 138. kV' -> 'grimes'", passCount, failCount
 
-    ' the actual match mechanism: pl_CostKey agrees on both sides for genuine pairs
+    ' (b) voltage is a clean integer, extracted from the digits adjacent to kV
+    Assert (pl_VoltFrom("Explorer Claremore 138kV") = 138), _
+           "VoltFrom: 'Explorer Claremore 138kV' -> 138 (adjacent digits, not 168)", passCount, failCount
+    Assert (pl_VoltFrom("Big Cajun 1 230kV") = 230), _
+           "VoltFrom: 'Big Cajun 1 230kV' -> 230 (not the unit 1)", passCount, failCount
+    Assert (pl_VoltStr(138#) = "138" And pl_VoltStr(345#) = "345"), _
+           "VoltStr: whole voltage -> clean integer, never '138.'", passCount, failCount
+
+    ' (c) the two Cecelia files collapse to the same key AND match the cost side
+    Assert (pl_CostKey("Cecelia 138kV 1", 0, False) = "cecelia|138"), _
+           "Key: 'Cecelia 138kV 1' -> 'cecelia|138' (no trailing dot)", passCount, failCount
+    Assert (pl_CostKey("Cecelia 138kV 1", 0, False) = pl_CostKey("Cecelia 138kV 2", 0, False)), _
+           "Key: Cecelia ...1 and ...2 collapse to one key", passCount, failCount
+    Assert (pl_CostKey("Cecelia 138kV 1", 0, False) = pl_CostKey("Cecelia", 138#, True)), _
+           "Key: site 'Cecelia 138kV 1' == cost 'Cecelia' @ 138", passCount, failCount
+
+    ' no key anywhere ends with a trailing '.'
+    Dim probe As String: probe = pl_CostKey("Grimes 138. kV", 0, False)
+    Assert (Right$(probe, 1) <> "." And probe = "grimes|138"), _
+           "Key: 'Grimes 138. kV' -> 'grimes|138' (integer voltage, no dot)", passCount, failCount
+
+    ' (d) the named bug-report pairs match: site (voltage embedded) == cost (clean)
     Dim cases As Variant, volt As Variant, k As Long
     cases = Array("Big Cajun 1", "Ponderosa", "Cincinnati", "Mockingbird", "Grimes")
     volt = Array(230#, 500#, 345#, 138#, 138#)
     For k = LBound(cases) To UBound(cases)
         Dim site As String, cost As String
-        ' site side carries the voltage embedded in the name; cost side is clean
-        site = pl_CostKey(CStr(cases(k)) & " " & CStr(CLng(volt(k))) & "kV", CDbl(volt(k)), True)
+        site = pl_CostKey(CStr(cases(k)) & " " & CStr(CLng(volt(k))) & "kV", 0, False)
         cost = pl_CostKey(CStr(cases(k)), CDbl(volt(k)), True)
         Assert (site = cost), _
                "Match: site '" & CStr(cases(k)) & " " & CStr(CLng(volt(k))) & "kV' == cost '" & _
@@ -4491,20 +4597,27 @@ Private Function WriteSheet(ByVal ws As Worksheet, ByRef mtx As PL_TMatrix, _
             Dim mf As String
             mf = pl_MinifsFormula(mtx.costName, mtx.colTrig, mtx.colName, mtx.colVolt, _
                                   mtx.keyName(i), mtx.keyUseVolt(i), mtx.keyVolt(i), 2, mtx.costLastRow)
+            ' Headroom = 0 (or no trigger) is written blank so PERCENTRANK.EXC
+            ' excludes it from the ranked population; its percentile then falls to
+            ' 0 via IFERROR(...,0) -- the worst case, exactly like a non-qualifier.
             blk(i, cHR) = "=IFERROR(IF(" & mf & "=0," & EMPTY_LIT & "," & mf & ")," & EMPTY_LIT & ")"
             blk(i, cHRP) = "=IFERROR(" & _
                 Mid$(pl_RawPctFormula(pl_ColLetter(cHR), dataTop, dataBot, pl_ColLetter(cHR) & rr), 2) & _
-                "," & EMPTY_LIT & ")"
+                ",0)"
         Else
             blk(i, cFlatP) = flatPct(i)
             blk(i, cWS) = weighted(i)
             blk(i, cWSP) = wsPct(i)
+            ' Headroom percentile is ALWAYS written: hrPct is 0 for headroom <= 0
+            ' (masked out of the ranked population by pl_RawBucketArrayMasked) and
+            ' 1-5 for the strictly-positive population -- zero headroom scores 0,
+            ' never a ranked bucket and never blank. The Headroom value stays blank
+            ' when there is no positive headroom.
+            blk(i, cHRP) = hrPct(i)
             If part(i) Then
                 blk(i, cHR) = headroom(i)
-                blk(i, cHRP) = hrPct(i)
             Else
                 blk(i, cHR) = ""
-                blk(i, cHRP) = ""
             End If
             For t = 0 To nt - 1
                 blk(i, cDet0 + 5 * t + 2) = breadthPct(i, t + 1)
