@@ -133,6 +133,7 @@ Private Const PL_SH_ANALYSIS As String = "Cost Curve Analysis"
 Private Const PL_SH_LOG      As String = "_Pipeline Log"
 Private Const PL_SH_STATE    As String = "_Pipeline State"
 Private Const PL_SH_SKIPPED  As String = "_Skipped Files"   ' durable skip/fail record
+Private Const PL_SH_SITEONLY As String = "_Site Only"       ' unmatched site rows (classified)
 
 ' Stage identifiers, in completion order. COST and SITE open source files and
 ' must never be repeated on a resume; MATRIX and ANALYSIS recompute cheaply
@@ -153,6 +154,8 @@ Private Const PL_COST_DATA_IDX  As Long = 3     ' cost workbook: sheet 3 carries
 Private Const PL_SITE_TAB       As String = "Summary"
 Private Const PL_SITE_NAME_COL  As Long = 1     ' Summary!A = substation name
 Private Const PL_SITE_STATE_COL As Long = 3     ' Summary!C = state
+Private Const PL_SITE_LAT_COL   As Long = 4     ' Summary!D = latitude  (metadata only)
+Private Const PL_SITE_LON_COL   As Long = 5     ' Summary!E = longitude (metadata only)
 Private Const PL_SITE_VOLT_COL  As Long = 7     ' Summary!G = voltage (kV)
 
 ' Source headers resolved at run time by NAME on Cost Data (never fixed
@@ -182,6 +185,17 @@ Private Const USE_LIVE_FORMULAS As Boolean = False   ' Stage 6/7 pctiles/score/h
 ' unwritable path is ignored, never fatal. Requires the workbook to be saved.
 Private Const WRITE_LOG_TO_FILE As Boolean = False
 
+' ---------- Debug / test-loop switches ------------------------------------
+' Fast test loop: when > 0, Stage 1 and Stage 2 each process only the first N
+' selected files (logged "TEST MODE: limited to N files"), so the whole pipeline
+' can be exercised on ~20 files in seconds. 0 = unlimited (production).
+Private Const TEST_MAX_FILES As Long = 0
+
+' Reprocess-only-the-problem-files: when True, Stage 1/2 do NOT show the file
+' picker; they read the file paths from the existing "_Skipped Files" sheet and
+' process only those, to iterate on the known troublemakers. Default False.
+Private Const REPROCESS_SKIPPED As Boolean = False
+
 Private Const PL_EXCEL_MAX_ROWS   As Long = 1048576
 Private Const PL_EXCEL_MAX_TAB    As Long = 31
 
@@ -205,6 +219,8 @@ Private Type PL_TCostFile
     Outcome       As String     ' categorized: Contributed / Skipped: <reason> / Failed: open error
     SeenHeaders   As String     ' actual headers seen when the known headers weren't found
     Loss          As String     ' LOST / redundant / unknown -- set during reconciliation
+    ErrNum        As Long       ' Err.Number captured on a failure (0 = none)
+    ErrDesc       As String     ' Err.Description captured on a failure
 End Type
 
 Private Type PL_TSiteTriple
@@ -212,6 +228,9 @@ Private Type PL_TSiteTriple
     Voltage     As Double
     VoltParsed  As Boolean
     State       As String
+    Lat         As Double      ' Summary!D -- carried as metadata, never a join key
+    Lng         As Double      ' Summary!E
+    HasGeo      As Boolean     ' True when lat/long were present/numeric
 End Type
 
 Private Type PL_TCostId
@@ -235,6 +254,8 @@ Private Type PL_TMatrix
     mw()         As Double        ' 1..m
     names()      As String        ' 1..n CLEAN substation name (row order)
     state()      As String        ' 1..n state, left-joined from Site Data ("" if none)
+    lat()        As String        ' 1..n latitude, left-joined ("" if unmatched/absent)
+    lng()        As String        ' 1..n longitude, left-joined ("" if unmatched/absent)
     costM()      As Double        ' 1..n, 1..m cost-per-MW values
     headroom()   As Double        ' 1..n minimum trigger MW (0 = none)
     keyName()    As String        ' 1..n cost-side key (name)
@@ -695,7 +716,7 @@ End Function
 ' already suppressed by the caller so Delete does not prompt.
 Private Sub pl_ClearOutputs()
     Dim nms As Variant, i As Long, ws As Worksheet
-    nms = Array(PL_SH_COST, PL_SH_SITE, PL_SH_MATRIX, PL_SH_ANALYSIS, PL_SH_STATE, PL_SH_SKIPPED)
+    nms = Array(PL_SH_COST, PL_SH_SITE, PL_SH_MATRIX, PL_SH_ANALYSIS, PL_SH_STATE, PL_SH_SKIPPED, PL_SH_SITEONLY)
     For i = LBound(nms) To UBound(nms)
         Set ws = pl_SheetByName(CStr(nms(i)))
         If Not ws Is Nothing Then ws.Delete
@@ -787,26 +808,28 @@ Private Function pl_ResetSkips() As Worksheet
         Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
         ws.Name = PL_SH_SKIPPED
     End If
-    ws.Range("A1:G1").Value = Array("Stage", "File", "Sheet", "Outcome", _
-                                    "Intended Substation", "Loss / Coverage", "Reason")
+    ws.Range("A1:H1").Value = Array("Stage", "File", "Sheet", "Outcome", _
+                                    "Intended Substation", "Loss / Coverage", "Reason", "Path")
     ws.Rows(1).Font.Bold = True
     pl_ResetSkips = ws
 End Function
 
 ' Appends one skip/fail row to _Skipped Files (created if absent). Never raises.
 ' outcome = categorized reason; intendedSub = the substation the file would have
-' been (from its tab name, if readable); loss = LOST / redundant / unknown flag.
+' been (from its tab name, if readable); loss = LOST / redundant / unknown flag;
+' path = the FULL source path (col H) so REPROCESS_SKIPPED can re-open the file.
 Private Sub pl_AppendSkip(ByVal stage As String, ByVal file As String, _
                           ByVal sheet As String, ByVal outcome As String, _
-                          ByVal intendedSub As String, ByVal loss As String, ByVal reason As String)
+                          ByVal intendedSub As String, ByVal loss As String, _
+                          ByVal reason As String, ByVal path As String)
     On Error Resume Next
     Dim ws As Worksheet
     Set ws = pl_SheetByName(PL_SH_SKIPPED)
     If ws Is Nothing Then
         Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
         ws.Name = PL_SH_SKIPPED
-        ws.Range("A1:G1").Value = Array("Stage", "File", "Sheet", "Outcome", _
-                                        "Intended Substation", "Loss / Coverage", "Reason")
+        ws.Range("A1:H1").Value = Array("Stage", "File", "Sheet", "Outcome", _
+                                        "Intended Substation", "Loss / Coverage", "Reason", "Path")
         ws.Rows(1).Font.Bold = True
     End If
     Dim nr As Long: nr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
@@ -818,7 +841,56 @@ Private Sub pl_AppendSkip(ByVal stage As String, ByVal file As String, _
     ws.Cells(nr, 5).Value = intendedSub
     ws.Cells(nr, 6).Value = loss
     ws.Cells(nr, 7).Value = reason
+    ws.Cells(nr, 8).Value = path
     On Error GoTo 0
+End Sub
+
+' Reads distinct full source paths from column H of _Skipped Files whose Stage
+' (col A) begins with stagePrefix ("1" = cost, "2" = site), for REPROCESS_SKIPPED.
+' Returns False when the sheet is absent or holds no matching paths.
+Private Function pl_ReadSkippedPaths(ByVal stagePrefix As String, ByRef outPaths() As String, _
+                                     ByRef outCount As Long) As Boolean
+    outCount = 0
+    Dim ws As Worksheet: Set ws = pl_SheetByName(PL_SH_SKIPPED)
+    If ws Is Nothing Then
+        pl_ReadSkippedPaths = False
+        Exit Function
+    End If
+    Dim lr As Long: lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lr < 2 Then
+        pl_ReadSkippedPaths = False
+        Exit Function
+    End If
+    Dim seen As Object: Set seen = CreateObject("Scripting.Dictionary")
+    ReDim outPaths(1 To lr - 1)
+    Dim r As Long, p As String, k As String, stg As String
+    For r = 2 To lr
+        stg = Trim$(CStr(pl_NZ(ws.Cells(r, 1).Value)))
+        p = Trim$(CStr(pl_NZ(ws.Cells(r, 8).Value)))
+        If Len(p) > 0 And Left$(stg, Len(stagePrefix)) = stagePrefix Then
+            k = LCase$(p)
+            If Not seen.Exists(k) Then
+                seen.Add k, True
+                outCount = outCount + 1
+                outPaths(outCount) = p
+            End If
+        End If
+    Next r
+    If outCount > 0 Then ReDim Preserve outPaths(1 To outCount)
+    pl_ReadSkippedPaths = (outCount > 0)
+End Function
+
+' Incremental durable skip record for one cost file, written as it is processed
+' (so it survives even if a later file aborts the run). pl_AccountCostFiles later
+' rewrites the sheet with the LOST/redundant classification.
+Private Sub pl_AppendSkipRec(ByVal stage As String, ByRef rec As PL_TCostFile)
+    Dim oc As String: oc = rec.Outcome
+    If Len(oc) = 0 Then oc = rec.Status
+    If Len(oc) = 0 Then oc = "Skipped"
+    Dim rsn As String: rsn = rec.Message
+    If rec.ErrNum <> 0 Then rsn = rsn & " [Err #" & rec.ErrNum & " " & rec.ErrDesc & "]"
+    pl_AppendSkip stage, pl_FileName(rec.FilePath), rec.SheetName, oc, _
+                  rec.Substation, "(pending classification)", rsn, rec.FilePath
 End Sub
 
 ' Saves the workbook, prompting once for a location if the host has never been
@@ -878,25 +950,54 @@ End Function
 ' ==========================================================================
 
 Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksheet) As Boolean
+    Dim phase As String: phase = "init"
+    Dim curFile As Long: curFile = 0
+    Dim processed As Long: processed = 0
+    Dim fileCount As Long: fileCount = 0
     On Error GoTo ErrHandler
     pl_ConsolidateCost = False
 
-    Dim files() As String, fileCount As Long
-    If Not pl_PickFiles("Select the COST / results workbooks to consolidate", files, fileCount) Then
-        pl_LogAdd log, "Step 1: no cost files selected."
-        Exit Function
+    ' ---- file source: reprocess the known troublemakers, or the picker ----
+    Dim files() As String
+    phase = "select files"
+    If REPROCESS_SKIPPED Then
+        If Not pl_ReadSkippedPaths("1", files, fileCount) Then
+            pl_LogAdd log, "Step 1: REPROCESS_SKIPPED is on but '" & PL_SH_SKIPPED & "' holds no cost-file paths."
+            MsgBox "REPROCESS_SKIPPED is on, but no file paths were found on '" & PL_SH_SKIPPED & "'." & vbCrLf & _
+                   "Run a normal pass first (it records each skipped file's path), then reprocess.", _
+                   vbExclamation, "Interconnect Pipeline"
+            Exit Function
+        End If
+        pl_LogAdd log, "Step 1: REPROCESS_SKIPPED -- reprocessing " & fileCount & " file(s) from '" & PL_SH_SKIPPED & "'."
+    Else
+        If Not pl_PickFiles("Select the COST / results workbooks to consolidate", files, fileCount) Then
+            pl_LogAdd log, "Step 1: no cost files selected."
+            Exit Function
+        End If
     End If
 
-    ' Anchor of the whole reconciliation: the number of files the USER SELECTED.
-    ' Every one must be accounted for as contributed or skipped/failed.
+    ' ---- fast test loop: cap the file count ----
+    If TEST_MAX_FILES > 0 And fileCount > TEST_MAX_FILES Then
+        fileCount = TEST_MAX_FILES
+        pl_LogAdd log, "TEST MODE: limited to " & fileCount & " files."
+    End If
+
     Dim selectedCount As Long: selectedCount = fileCount
     pl_LogAdd log, "STAGE 1 -- " & selectedCount & " cost file(s) selected."
+
+    ' Fresh durable skip record BEFORE the loops, so each skip/fail is written
+    ' incrementally as it is processed and survives even if a later file aborts.
+    ' In REPROCESS mode the sheet is the SOURCE list (and Stage 2 reads it too),
+    ' so it is preserved rather than cleared.
+    If Not REPROCESS_SKIPPED Then pl_ResetSkips
 
     Dim recs() As PL_TCostFile
     ReDim recs(1 To fileCount)
 
     Dim i As Long, refSig As String, haveRef As Boolean
+    phase = "validation"
     For i = 1 To fileCount
+        curFile = i
         pl_Status "Stage 1: validating " & i & " of " & fileCount
         recs(i).FilePath = files(i)
         pl_ValidateCostFile recs(i)
@@ -910,6 +1011,7 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
                 recs(i).Message = "Header signature mismatch vs first valid file"
             End If
         End If
+        If Not recs(i).IsValid Then pl_AppendSkipRec "1 Cost", recs(i)   ' incremental durable
         DoEvents
     Next i
 
@@ -938,7 +1040,8 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
                      "Cancel = ABORT step 1", vbYesNoCancel + vbQuestion, "Cost header mismatch")
         Select Case ans
             Case vbCancel
-                pl_LogAdd log, "Step 1: aborted at header-mismatch prompt.": Exit Function
+                pl_LogAdd log, "Step 1: aborted at header-mismatch prompt."
+                Exit Function
             Case vbYes
                 For i = 1 To fileCount
                     If (Not recs(i).IsValid) And _
@@ -963,30 +1066,34 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
         Exit Function
     End If
 
+    phase = "create Cost Data"
     Set wsCost = pl_FreshSheet(PL_SH_COST)
     If wsCost Is Nothing Then
         pl_LogAdd log, "Step 1: could not create the Cost Data sheet."
         Exit Function
     End If
 
-    ' Start a fresh durable skip/fail record for this run (Stage 1 always opens
-    ' the run; Stage 2 will append to it).
-    pl_ResetSkips
-
     Dim headerCols As Long: headerCols = recs(firstValid).UsedCols
     wsCost.Cells(1, 1).Value = PL_HDR_NAME
     wsCost.Cells(1, 2).Value = PL_HDR_VOLT
     wsCost.Cells(1, 3).Value = "Source File"
     wsCost.Cells(1, 4).Value = "Source Sheet"
+    phase = "copy headers"
     pl_CopyCostHeaders wsCost, recs(firstValid)
 
-    Dim nextRow As Long, totalRows As Long, processed As Long, hitLimit As Boolean
+    Dim nextRow As Long, totalRows As Long, hitLimit As Boolean
     nextRow = 2
+    phase = "append"
     For i = 1 To fileCount
+        curFile = i
         If recs(i).IsValid Then
             pl_Status "Stage 1: consolidating " & i & " of " & fileCount & " -- " & pl_FileName(recs(i).FilePath)
             If pl_AppendCostFile(wsCost, recs(i), headerCols, nextRow) Then
-                processed = processed + 1: totalRows = totalRows + recs(i).RowsImported
+                If recs(i).RowsImported > 0 Then
+                    processed = processed + 1: totalRows = totalRows + recs(i).RowsImported
+                Else
+                    pl_AppendSkipRec "1 Cost", recs(i)   ' valid but 0 rows / failed on reopen
+                End If
             Else
                 hitLimit = True: Exit For
             End If
@@ -999,18 +1106,15 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
     wsCost.Rows(1).Font.Bold = True
     wsCost.Columns.AutoFit
 
-    ' ---- account for EVERY selected file: contributed vs skipped, LOST vs
-    '      redundant, per-file log line, and a durable _Skipped Files row for
-    '      every non-contributor. Anchored on selectedCount. ----
+    ' ---- account for EVERY selected file (rewrites _Skipped Files with the
+    '      classified rows, replacing the incremental ones). ----
+    phase = "reconcile"
     Dim contributed As Long, skipped As Long, lost As Long, redundant As Long, unknown As Long
     pl_AccountCostFiles recs, fileCount, log, contributed, skipped, lost, redundant, unknown
     If hitLimit Then pl_LogAdd log, "  Worksheet row limit reached; import truncated (later files unprocessed)."
 
-    ' Persist the selected count so RebuildAudit can anchor on it after a log wipe.
     pl_RecordSelected "Cost Files Selected", selectedCount
 
-    ' Headline reconciliation -- selected is the anchor, never the contributing
-    ' count alone. If the parts don't sum to selected, that is itself a bug.
     Dim accounted As Long: accounted = contributed + skipped
     pl_LogAdd log, "STAGE 1 -- Cost Data (" & wsCost.Name & "): " & selectedCount & " selected = " & _
                    contributed & " contributed + " & skipped & " not contributed" & _
@@ -1027,7 +1131,14 @@ Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksh
     Exit Function
 
 ErrHandler:
-    pl_LogAdd log, "Step 1 error #" & Err.Number & ": " & Err.Description
+    ' Pinpoint where Stage 1 failed: phase, file index, how far it got.
+    pl_LogAdd log, "STAGE 1 FAILED in phase '" & phase & "' at file " & curFile & " of " & fileCount & _
+                   " (contributed " & processed & "): #" & Err.Number & " '" & Err.Description & _
+                   "' src='" & Err.Source & "'."
+    ' A run always reaches its log + skipped-files record, even on abort.
+    On Error Resume Next
+    pl_WriteLog log
+    On Error GoTo 0
     pl_ConsolidateCost = False
 End Function
 
@@ -1045,6 +1156,11 @@ Private Sub pl_AccountCostFiles(ByRef recs() As PL_TCostFile, ByVal fileCount As
                                 ByRef skipped As Long, ByRef lost As Long, _
                                 ByRef redundant As Long, ByRef unknown As Long)
     contributed = 0: skipped = 0: lost = 0: redundant = 0: unknown = 0
+
+    ' Rewrite _Skipped Files with the authoritative CLASSIFIED rows, replacing the
+    ' incremental (crash-safety) rows written during the loop. In REPROCESS mode
+    ' the sheet is the source list (shared with Stage 2), so it is left intact.
+    If Not REPROCESS_SKIPPED Then pl_ResetSkips
 
     ' 1) substations actually covered (from every contributing file)
     Dim dCov As Object: Set dCov = CreateObject("Scripting.Dictionary")
@@ -1080,8 +1196,10 @@ Private Sub pl_AccountCostFiles(ByRef recs() As PL_TCostFile, ByVal fileCount As
             End If
             oc = recs(i).Outcome
             If Len(oc) = 0 Then oc = "Skipped: no rows imported"
+            Dim rsn As String: rsn = recs(i).Message
+            If recs(i).ErrNum <> 0 Then rsn = rsn & " [Err #" & recs(i).ErrNum & " " & recs(i).ErrDesc & "]"
             pl_AppendSkip "1 Cost", pl_FileName(recs(i).FilePath), recs(i).SheetName, _
-                          oc, intended, recs(i).Loss, recs(i).Message
+                          oc, intended, recs(i).Loss, rsn, recs(i).FilePath
         End If
 
         ' one log line per file, contributors and non-contributors alike
@@ -1102,6 +1220,11 @@ Private Sub pl_ValidateCostFile(ByRef rec As PL_TCostFile)
     Set wb = Application.Workbooks.Open(Filename:=rec.FilePath, UpdateLinks:=0, _
                                         ReadOnly:=True, AddToMru:=False)
     On Error GoTo CloseFail
+    If wb Is Nothing Then
+        rec.Outcome = "Failed: open error"
+        rec.Message = "Workbooks.Open returned Nothing"
+        Exit Sub
+    End If
 
     ' Locate the data sheet by CONTENT -- the worksheet whose leading rows carry
     ' the known cost headers -- instead of assuming a fixed tab index. This
@@ -1128,7 +1251,9 @@ Private Sub pl_ValidateCostFile(ByRef rec As PL_TCostFile)
     rec.IsValid = True: rec.Status = "Imported": rec.Outcome = "Contributed": rec.Message = ""
 
 CloseAndExit:
-    wb.Close SaveChanges:=False
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
     Set wb = Nothing
     Exit Sub
 OpenFail:
@@ -1344,12 +1469,41 @@ Private Function pl_HeaderSig(ByVal ws As Worksheet, ByVal usedCols As Long, ByV
     pl_HeaderSig = Join(parts, "|")
 End Function
 
+' Returns the worksheet a per-file reopen should use: the VALIDATED sheet by
+' NAME first (pl_LocateCostSheet chose it by content, so a fixed index would grab
+' the wrong tab or a missing one and throw error 9/91), falling back to the index
+' only when the name is absent. Every lookup is guarded; returns Nothing (never
+' raises) so callers can log-and-skip. wb Is Nothing is tolerated.
+Private Function pl_WorksheetByNameOrIdx(ByVal wb As Workbook, ByVal nm As String, _
+                                         ByVal idx As Long) As Worksheet
+    Dim ws As Worksheet
+    If wb Is Nothing Then
+        Set pl_WorksheetByNameOrIdx = Nothing
+        Exit Function
+    End If
+    If Len(nm) > 0 Then
+        On Error Resume Next
+        Set ws = wb.Worksheets(nm)
+        On Error GoTo 0
+    End If
+    If ws Is Nothing And idx >= 1 Then
+        On Error Resume Next
+        If wb.Worksheets.Count >= idx Then Set ws = wb.Worksheets(idx)
+        On Error GoTo 0
+    End If
+    Set pl_WorksheetByNameOrIdx = ws
+End Function
+
 Private Sub pl_CopyCostHeaders(ByVal wsCost As Worksheet, ByRef rec As PL_TCostFile)
     Dim wb As Workbook, ws As Worksheet, c As Long, hv As Variant
     On Error GoTo Done
     Set wb = Application.Workbooks.Open(Filename:=rec.FilePath, UpdateLinks:=0, _
                                         ReadOnly:=True, AddToMru:=False)
-    Set ws = wb.Sheets(PL_COST_DATA_IDX)
+    If wb Is Nothing Then GoTo Done
+    ' Use the VALIDATED sheet by name, not a fixed index (which read the wrong
+    ' sheet / threw error 91 when the data was not on the 3rd tab).
+    Set ws = pl_WorksheetByNameOrIdx(wb, rec.SheetName, PL_COST_DATA_IDX)
+    If ws Is Nothing Then GoTo Done
     hv = ws.Range(ws.Cells(rec.HeaderRow, 1), ws.Cells(rec.HeaderRow, rec.UsedCols)).Value
     Dim outHdr() As Variant: ReDim outHdr(1 To 1, 1 To rec.UsedCols)
     For c = 1 To rec.UsedCols
@@ -1360,11 +1514,10 @@ Private Sub pl_CopyCostHeaders(ByVal wsCost As Worksheet, ByRef rec As PL_TCostF
         End If
     Next c
     wsCost.Range(wsCost.Cells(1, 5), wsCost.Cells(1, 4 + rec.UsedCols)).Value = outHdr
-    wb.Close SaveChanges:=False
-    Exit Sub
 Done:
     On Error Resume Next
     If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
 End Sub
 
 Private Function pl_AppendCostFile(ByVal wsCost As Worksheet, ByRef rec As PL_TCostFile, _
@@ -1378,11 +1531,27 @@ Private Function pl_AppendCostFile(ByVal wsCost As Worksheet, ByRef rec As PL_TC
     On Error GoTo Fail
     Set wb = Application.Workbooks.Open(Filename:=rec.FilePath, UpdateLinks:=0, _
                                         ReadOnly:=True, AddToMru:=False)
-    Set ws = wb.Sheets(PL_COST_DATA_IDX)
+    If wb Is Nothing Then
+        rec.Status = "Failed": rec.Outcome = "Failed: open error"
+        rec.Message = "Workbooks.Open returned Nothing"
+        Exit Function
+    End If
+    ' Use the VALIDATED sheet by name, not a fixed index (error-91 root cause).
+    Set ws = pl_WorksheetByNameOrIdx(wb, rec.SheetName, PL_COST_DATA_IDX)
+    If ws Is Nothing Then
+        rec.Status = "Failed": rec.Outcome = "Failed: sheet not found on reopen"
+        rec.Message = "validated sheet '" & rec.SheetName & "' not found when re-opening to append"
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        Exit Function
+    End If
 
     srcVals = pl_BlockRead(ws, rec.FirstDataRow, rec.LastDataRow, rec.UsedCols)
     If IsEmpty(srcVals) Then
+        On Error Resume Next
         wb.Close SaveChanges:=False
+        On Error GoTo 0
         Exit Function
     End If
 
@@ -1392,7 +1561,10 @@ Private Function pl_AppendCostFile(ByVal wsCost As Worksheet, ByRef rec As PL_TC
     If srcCols < writeCols Then writeCols = srcCols
 
     If nextRow + srcRows - 1 > PL_EXCEL_MAX_ROWS Then
-        wb.Close SaveChanges:=False: pl_AppendCostFile = False: Exit Function
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        pl_AppendCostFile = False: Exit Function
     End If
 
     ReDim outBlock(1 To srcRows, 1 To 4 + writeCols)
@@ -1431,10 +1603,14 @@ Private Function pl_AppendCostFile(ByVal wsCost As Worksheet, ByRef rec As PL_TC
         rec.RowsImported = outR
     End If
 
+    On Error Resume Next
     wb.Close SaveChanges:=False
+    On Error GoTo 0
     Exit Function
 Fail:
-    rec.Status = "Failed": rec.Message = "Import error: " & Err.Description: rec.RowsImported = 0
+    rec.ErrNum = Err.Number: rec.ErrDesc = Err.Description
+    rec.Status = "Failed": rec.Outcome = "Failed: append error"
+    rec.Message = "Import error #" & rec.ErrNum & ": " & rec.ErrDesc: rec.RowsImported = 0
     On Error Resume Next
     If Not wb Is Nothing Then wb.Close SaveChanges:=False
     On Error GoTo 0
@@ -1447,24 +1623,50 @@ End Function
 
 Private Function pl_ConsolidateSite(ByRef log As PL_TLog, ByRef wsSite As Worksheet, _
                                     ByRef distinctCount As Long) As Boolean
+    Dim phase As String: phase = "init"
+    Dim curFile As Long: curFile = 0
+    Dim fileCount As Long: fileCount = 0
     On Error GoTo ErrHandler
     pl_ConsolidateSite = False
 
-    Dim files() As String, fileCount As Long
-    If Not pl_PickFiles("Select the SITE / dedupe workbooks to consolidate", files, fileCount) Then
-        pl_LogAdd log, "Step 2: no site files selected.": Exit Function
+    ' ---- file source: reprocess the site troublemakers, or the picker ----
+    Dim files() As String
+    phase = "select files"
+    If REPROCESS_SKIPPED Then
+        If Not pl_ReadSkippedPaths("2", files, fileCount) Then
+            pl_LogAdd log, "Step 2: REPROCESS_SKIPPED is on but '" & PL_SH_SKIPPED & "' holds no site-file paths."
+            MsgBox "REPROCESS_SKIPPED is on, but no site-file paths were found on '" & PL_SH_SKIPPED & "'.", _
+                   vbExclamation, "Interconnect Pipeline"
+            Exit Function
+        End If
+        pl_LogAdd log, "Step 2: REPROCESS_SKIPPED -- reprocessing " & fileCount & " site file(s)."
+    Else
+        If Not pl_PickFiles("Select the SITE / dedupe workbooks to consolidate", files, fileCount) Then
+            pl_LogAdd log, "Step 2: no site files selected."
+            Exit Function
+        End If
+    End If
+
+    If TEST_MAX_FILES > 0 And fileCount > TEST_MAX_FILES Then
+        fileCount = TEST_MAX_FILES
+        pl_LogAdd log, "TEST MODE: limited to " & fileCount & " files."
     End If
 
     Dim rawName() As String, rawState() As String, rawVolt() As Double
     Dim rawVoltP() As Boolean, rawFile() As String, rawRow() As Long, rawN As Long
+    Dim rawLat() As Double, rawLng() As Double, rawGeo() As Boolean
     rawN = 0
     ReDim rawName(1 To 16): ReDim rawState(1 To 16): ReDim rawVolt(1 To 16)
     ReDim rawVoltP(1 To 16): ReDim rawFile(1 To 16): ReDim rawRow(1 To 16)
+    ReDim rawLat(1 To 16): ReDim rawLng(1 To 16): ReDim rawGeo(1 To 16)
 
     Dim i As Long
+    phase = "read"
     For i = 1 To fileCount
+        curFile = i
         pl_Status "Stage 2: reading " & i & " of " & fileCount & " -- " & pl_FileName(files(i))
-        pl_ReadSiteFile files(i), log, rawName, rawState, rawVolt, rawVoltP, rawFile, rawRow, rawN
+        pl_ReadSiteFile files(i), log, rawName, rawState, rawVolt, rawVoltP, _
+                        rawFile, rawRow, rawLat, rawLng, rawGeo, rawN
         DoEvents
     Next i
 
@@ -1474,9 +1676,10 @@ Private Function pl_ConsolidateSite(ByRef log As PL_TLog, ByRef wsSite As Worksh
         Exit Function
     End If
 
+    phase = "dedupe"
     Dim dt() As PL_TSiteTriple, dropped As Long
     distinctCount = pl_DedupTriples(rawName, rawVolt, rawVoltP, rawState, rawN, _
-                                    rawFile, rawRow, dt, log, dropped)
+                                    rawFile, rawRow, rawLat, rawLng, rawGeo, dt, log, dropped)
 
     Set wsSite = pl_FreshSheet(PL_SH_SITE)
     If wsSite Is Nothing Then
@@ -1484,8 +1687,10 @@ Private Function pl_ConsolidateSite(ByRef log As PL_TLog, ByRef wsSite As Worksh
         Exit Function
     End If
 
-    Dim block() As Variant: ReDim block(1 To distinctCount + 1, 1 To 3)
+    ' Site Data: A=name B=state C=voltage D=Lat E=Long (lat/long are metadata).
+    Dim block() As Variant: ReDim block(1 To distinctCount + 1, 1 To 5)
     block(1, 1) = PL_HDR_NAME: block(1, 2) = "State": block(1, 3) = PL_HDR_VOLT
+    block(1, 4) = "Lat": block(1, 5) = "Long"
     For i = 1 To distinctCount
         block(i + 1, 1) = dt(i).Name
         block(i + 1, 2) = dt(i).State
@@ -1494,8 +1699,15 @@ Private Function pl_ConsolidateSite(ByRef log As PL_TLog, ByRef wsSite As Worksh
         Else
             block(i + 1, 3) = ""
         End If
+        If dt(i).HasGeo Then
+            block(i + 1, 4) = dt(i).Lat
+            block(i + 1, 5) = dt(i).Lng
+        Else
+            block(i + 1, 4) = ""
+            block(i + 1, 5) = ""
+        End If
     Next i
-    wsSite.Range(wsSite.Cells(1, 1), wsSite.Cells(distinctCount + 1, 3)).Value = block
+    wsSite.Range(wsSite.Cells(1, 1), wsSite.Cells(distinctCount + 1, 5)).Value = block
     wsSite.Rows(1).Font.Bold = True
     wsSite.Columns.AutoFit
 
@@ -1505,36 +1717,53 @@ Private Function pl_ConsolidateSite(ByRef log As PL_TLog, ByRef wsSite As Worksh
     Exit Function
 
 ErrHandler:
-    pl_LogAdd log, "Step 2 error #" & Err.Number & ": " & Err.Description
+    pl_LogAdd log, "STAGE 2 FAILED in phase '" & phase & "' at file " & curFile & " of " & fileCount & _
+                   ": #" & Err.Number & " '" & Err.Description & "' src='" & Err.Source & "'."
+    On Error Resume Next
+    pl_WriteLog log
+    On Error GoTo 0
     pl_ConsolidateSite = False
 End Function
 
 Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
                             ByRef rawName() As String, ByRef rawState() As String, _
                             ByRef rawVolt() As Double, ByRef rawVoltP() As Boolean, _
-                            ByRef rawFile() As String, ByRef rawRow() As Long, ByRef rawN As Long)
+                            ByRef rawFile() As String, ByRef rawRow() As Long, _
+                            ByRef rawLat() As Double, ByRef rawLng() As Double, _
+                            ByRef rawGeo() As Boolean, ByRef rawN As Long)
     Dim wb As Workbook, ws As Worksheet, ur As Range, lastRow As Long, r As Long, vals As Variant
     On Error GoTo Fail
     Set wb = Application.Workbooks.Open(Filename:=path, UpdateLinks:=0, ReadOnly:=True, AddToMru:=False)
+    If wb Is Nothing Then
+        pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- open returned Nothing"
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Failed: open error", "", "", "Workbooks.Open returned Nothing", path
+        Exit Sub
+    End If
 
     On Error Resume Next
     Set ws = wb.Worksheets(PL_SITE_TAB)
     On Error GoTo Fail
     If ws Is Nothing Then
         pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- no '" & PL_SITE_TAB & "' tab"
-        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped: sheet not found", "", "", "no '" & PL_SITE_TAB & "' tab"
-        wb.Close SaveChanges:=False: Exit Sub
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped: sheet not found", "", "", "no '" & PL_SITE_TAB & "' tab", path
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        Exit Sub
     End If
 
     Set ur = ws.UsedRange
     lastRow = ur.Row + ur.Rows.Count - 1
     If lastRow <= PL_HDR_ROW Then
         pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- Summary has no data rows"
-        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped: no data rows", "", "", "Summary has no data rows"
-        wb.Close SaveChanges:=False: Exit Sub
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped: no data rows", "", "", "Summary has no data rows", path
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        Exit Sub
     End If
 
-    ' One bulk read of columns A..G (name, state, voltage live inside).
+    ' One bulk read of columns A..G (name=A, state=C, lat=D, long=E, voltage=G).
     vals = ws.Range(ws.Cells(PL_HDR_ROW + 1, 1), ws.Cells(lastRow, PL_SITE_VOLT_COL)).Value
     ' Summary header (row 1) values, to guard against a header re-detected in
     ' the data -- data rows only.
@@ -1551,14 +1780,16 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
     End If
 
     For r = 1 To rows
-        Dim nm As String, stt As String, vv As Variant, vStr As String
+        Dim nm As String, stt As String, vv As Variant, vStr As String, latV As Variant, lonV As Variant
         If IsArray(vals) Then
             nm = Trim$(CStr(pl_NZ(vals(r, PL_SITE_NAME_COL))))
             stt = Trim$(CStr(pl_NZ(vals(r, PL_SITE_STATE_COL))))
             vv = vals(r, PL_SITE_VOLT_COL)
+            latV = vals(r, PL_SITE_LAT_COL)
+            lonV = vals(r, PL_SITE_LON_COL)
         Else
             nm = Trim$(CStr(pl_NZ(vals)))     ' single-cell degenerate
-            stt = "": vv = ""
+            stt = "": vv = "": latV = "": lonV = ""
         End If
         vStr = Trim$(CStr(pl_NZ(vv)))
         Dim isHdr As Boolean
@@ -1567,13 +1798,20 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
                 (StrComp(vStr, hVolt, vbTextCompare) = 0)
         If Len(nm) > 0 And Not isHdr Then
             rawN = rawN + 1
-            If rawN > UBound(rawName) Then pl_GrowRaw rawName, rawState, rawVolt, rawVoltP, rawFile, rawRow
+            If rawN > UBound(rawName) Then _
+                pl_GrowRaw rawName, rawState, rawVolt, rawVoltP, rawFile, rawRow, rawLat, rawLng, rawGeo
             rawName(rawN) = nm
             rawState(rawN) = stt
             If IsNumeric(vv) And Len(Trim$(CStr(pl_NZ(vv)))) > 0 Then
                 rawVolt(rawN) = CDbl(vv): rawVoltP(rawN) = True
             Else
                 rawVolt(rawN) = 0: rawVoltP(rawN) = False
+            End If
+            If IsNumeric(latV) And IsNumeric(lonV) And _
+               Len(Trim$(CStr(pl_NZ(latV)))) > 0 And Len(Trim$(CStr(pl_NZ(lonV)))) > 0 Then
+                rawLat(rawN) = CDbl(latV): rawLng(rawN) = CDbl(lonV): rawGeo(rawN) = True
+            Else
+                rawLat(rawN) = 0: rawLng(rawN) = 0: rawGeo(rawN) = False
             End If
             rawFile(rawN) = pl_FileName(path)
             rawRow(rawN) = PL_HDR_ROW + r
@@ -1582,11 +1820,13 @@ Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
     Next r
 
     pl_LogAdd log, "  [Read] " & pl_FileName(path) & " -- " & added & " Summary row(s)"
+    On Error Resume Next
     wb.Close SaveChanges:=False
+    On Error GoTo 0
     Exit Sub
 Fail:
     pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- read error: " & Err.Description
-    pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Failed: open error", "", "", "read error: " & Err.Description
+    pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Failed: open error", "", "", "read error: " & Err.Description, path
     On Error Resume Next
     If Not wb Is Nothing Then wb.Close SaveChanges:=False
     On Error GoTo 0
@@ -1601,7 +1841,9 @@ End Sub
 Private Function pl_DedupTriples(ByRef rawName() As String, ByRef rawVolt() As Double, _
                                  ByRef rawVoltP() As Boolean, ByRef rawState() As String, _
                                  ByVal rawN As Long, ByRef rawFile() As String, _
-                                 ByRef rawRow() As Long, ByRef dt() As PL_TSiteTriple, _
+                                 ByRef rawRow() As Long, ByRef rawLat() As Double, _
+                                 ByRef rawLng() As Double, ByRef rawGeo() As Boolean, _
+                                 ByRef dt() As PL_TSiteTriple, _
                                  ByRef log As PL_TLog, ByRef dropped As Long) As Long
     Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
     ReDim dt(1 To rawN)
@@ -1618,6 +1860,7 @@ Private Function pl_DedupTriples(ByRef rawName() As String, ByRef rawVolt() As D
             k = k + 1
             dt(k).Name = rawName(i): dt(k).Voltage = rawVolt(i)
             dt(k).VoltParsed = rawVoltP(i): dt(k).State = rawState(i)
+            dt(k).Lat = rawLat(i): dt(k).Lng = rawLng(i): dt(k).HasGeo = rawGeo(i)
         End If
     Next i
     If k > 0 Then ReDim Preserve dt(1 To k)
@@ -1747,26 +1990,67 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     '    same "cecelia|138" key as the clean cost name ("Cecelia" @ 138) and the
     '    genuine pair matches. Site rows with no Cost Data match are logged (raw +
     '    normalized keys, diagnosable); they NEVER remove a Cost Data substation. --
+    ' Name-only cost lookup (normalized name -> a representative cost key) to
+    ' split an unmatched site row into a near-miss (its normalized name matches a
+    ' cost substation but the full key doesn't = LIKELY MATCH BUG) vs a genuine
+    ' NO COST STUDY. Coverage is all-RTO, so there is NO region-based dismissal.
+    Dim dCostName As Object: Set dCostName = CreateObject("Scripting.Dictionary")
+    Dim cc As Long, nn As String
+    For cc = 1 To nId
+        nn = pl_NormSubName(idName(cc))
+        If Not dCostName.Exists(nn) Then dCostName.Add nn, pl_CostKey(idName(cc), idVolt(cc), idVP(cc))
+    Next cc
+
     Dim dState As Object: Set dState = CreateObject("Scripting.Dictionary")
-    Dim s As Long, mk As String
-    Dim siteMatched As Long, siteUnmatched As Long
+    Dim dLat As Object: Set dLat = CreateObject("Scripting.Dictionary")
+    Dim dLng As Object: Set dLng = CreateObject("Scripting.Dictionary")
+
+    ' unmatched site rows (parallel arrays) for _Site Only
+    Dim soName() As String, soVoltS() As String, soState() As String
+    Dim soLat() As String, soLng() As String, soReason() As Long, soClosest() As String
+    Dim soN As Long: soN = 0
+    If stN > 0 Then
+        ReDim soName(1 To stN): ReDim soVoltS(1 To stN): ReDim soState(1 To stN)
+        ReDim soLat(1 To stN): ReDim soLng(1 To stN)
+        ReDim soReason(1 To stN): ReDim soClosest(1 To stN)
+    End If
+
+    Dim s As Long, mk As String, nn2 As String
+    Dim siteMatched As Long, siteUnmatched As Long, nBug As Long, nGap As Long
     For s = 1 To stN
         mk = pl_ResolveMatchKey(st(s), dId)
         If Len(mk) > 0 Then
             siteMatched = siteMatched + 1
-            If Len(Trim$(st(s).State)) > 0 And Not dState.Exists(mk) Then
-                dState.Add mk, st(s).State
+            If Len(Trim$(st(s).State)) > 0 And Not dState.Exists(mk) Then dState.Add mk, st(s).State
+            If st(s).HasGeo Then
+                If Not dLat.Exists(mk) Then dLat.Add mk, pl_NumStr(st(s).Lat)
+                If Not dLng.Exists(mk) Then dLng.Add mk, pl_NumStr(st(s).Lng)
             End If
         Else
             siteUnmatched = siteUnmatched + 1
-            pl_LogAdd log, "  [Attach: site row w/o Cost Data match] raw='" & st(s).Name & _
-                "' norm-key='" & pl_CostKey(st(s).Name, st(s).Voltage, st(s).VoltParsed) & _
-                "' (" & pl_TripleStr(st(s).Name, st(s).Voltage, st(s).VoltParsed, st(s).State) & ")"
+            soN = soN + 1
+            soName(soN) = st(s).Name
+            soVoltS(soN) = IIf(st(s).VoltParsed, pl_VoltStr(st(s).Voltage), "")
+            soState(soN) = st(s).State
+            soLat(soN) = IIf(st(s).HasGeo, pl_NumStr(st(s).Lat), "")
+            soLng(soN) = IIf(st(s).HasGeo, pl_NumStr(st(s).Lng), "")
+            nn2 = pl_NormSubName(st(s).Name)
+            If dCostName.Exists(nn2) Then
+                soReason(soN) = 1: soClosest(soN) = CStr(dCostName(nn2)): nBug = nBug + 1
+            Else
+                soReason(soN) = 2: soClosest(soN) = "": nGap = nGap + 1
+            End If
+            pl_LogAdd log, "  [Site only] raw='" & st(s).Name & "' norm-key='" & _
+                pl_CostKey(st(s).Name, st(s).Voltage, st(s).VoltParsed) & "' -> " & _
+                IIf(soReason(soN) = 1, "Likely match bug (closest cost '" & soClosest(soN) & "')", _
+                    "No cost study found")
         End If
     Next s
+
     pl_LogAdd log, "STAGE 3 -- Site->Cost match: " & stN & " site triple(s), " & nId & _
                    " cost substation(s); matched " & siteMatched & ", unmatched " & siteUnmatched & _
-                   " (shared name normalization; unmatched should be < ~100)."
+                   " (" & nBug & " likely-match-bug, " & nGap & " no-cost-study-found)."
+    pl_WriteSiteOnly soName, soVoltS, soState, soLat, soLng, soReason, soClosest, soN
 
     ' -- MW axis + allocate result. Matrix membership = ALL distinct Cost Data
     '    substations (nId of them), NOT the cost/site intersection. --
@@ -1778,6 +2062,7 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
     For j = 1 To m: mtx.mw(j) = mw(j): Next j
     ReDim mtx.names(1 To n)
     ReDim mtx.state(1 To n)
+    ReDim mtx.lat(1 To n): ReDim mtx.lng(1 To n)
     ReDim mtx.costM(1 To n, 1 To m)
     ReDim mtx.headroom(1 To n)
     ReDim mtx.keyName(1 To n): ReDim mtx.keyVolt(1 To n): ReDim mtx.keyUseVolt(1 To n)
@@ -1826,10 +2111,21 @@ Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet,
         Else
             stState = ""                      ' no site match: State blank, row kept
         End If
-        ' CLEAN name only -- voltage and state are kept as separate fields and
-        ' written as separate columns; never concatenated into the name label.
+        ' CLEAN name only -- voltage/state/lat/long are separate fields, written as
+        ' separate columns; never concatenated into the name label. Lat/long are
+        ' left-joined metadata (present when matched, blank when not), never a key.
         mtx.names(i) = idName(i)
         mtx.state(i) = stState
+        If dLat.Exists(ckey) Then
+            mtx.lat(i) = CStr(dLat(ckey))
+        Else
+            mtx.lat(i) = ""
+        End If
+        If dLng.Exists(ckey) Then
+            mtx.lng(i) = CStr(dLng(ckey))
+        Else
+            mtx.lng(i) = ""
+        End If
         mtx.keyName(i) = idName(i): mtx.keyVolt(i) = vSel: mtx.keyUseVolt(i) = useV
 
         ' headroom is always taken from the records (cheap), by this identity's
@@ -1924,6 +2220,74 @@ ErrHandler:
     pl_BuildMatrix = False
 End Function
 
+' Writes the _Site Only sheet: every site row that found no Cost Data match,
+' each a REVIEW item (all-RTO coverage -> no "out of region" bucket). Reason is
+' "Likely match bug" (its normalized name matched a cost substation, so the
+' closest cost key is shown) or "No cost study found" (genuinely absent). Sorted
+' bugs first, then state, then name. Carries lat/long as metadata.
+Private Sub pl_WriteSiteOnly(ByRef soName() As String, ByRef soVoltS() As String, _
+                             ByRef soState() As String, ByRef soLat() As String, _
+                             ByRef soLng() As String, ByRef soReason() As Long, _
+                             ByRef soClosest() As String, ByVal soN As Long)
+    On Error Resume Next
+    Dim ws As Worksheet: Set ws = pl_SheetByName(PL_SH_SITEONLY)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_SITEONLY
+    Else
+        ws.Cells.Clear
+    End If
+    ws.Range("A1:G1").Value = Array("Substation", "Voltage (kV)", "State", "Lat", "Long", _
+                                    "Reason", "Closest Cost Key")
+    ws.Rows(1).Font.Bold = True
+    If soN < 1 Then
+        ws.Cells(2, 1).Value = "(no unmatched site rows -- every site substation matched a Cost Data substation)"
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    ' order: Reason (1 = bug first, 2 = gap) then state then name
+    Dim ord() As Long: ReDim ord(1 To soN)
+    Dim i As Long
+    For i = 1 To soN: ord(i) = i: Next i
+    Dim a As Long, b As Long, ka As String, kb As String, tmp As Long
+    For a = 2 To soN
+        tmp = ord(a)
+        ka = pl_SiteOnlyKey(soReason(tmp), soState(tmp), soName(tmp))
+        b = a - 1
+        Do While b >= 1
+            kb = pl_SiteOnlyKey(soReason(ord(b)), soState(ord(b)), soName(ord(b)))
+            If kb > ka Then
+                ord(b + 1) = ord(b): b = b - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        ord(b + 1) = tmp
+    Next a
+
+    Dim blk() As Variant: ReDim blk(1 To soN, 1 To 7)
+    Dim rw As Long, jx As Long
+    For rw = 1 To soN
+        jx = ord(rw)
+        blk(rw, 1) = soName(jx)
+        blk(rw, 2) = soVoltS(jx)
+        blk(rw, 3) = soState(jx)
+        blk(rw, 4) = soLat(jx)
+        blk(rw, 5) = soLng(jx)
+        blk(rw, 6) = IIf(soReason(jx) = 1, "Likely match bug", "No cost study found")
+        blk(rw, 7) = soClosest(jx)
+    Next rw
+    ws.Range(ws.Cells(2, 1), ws.Cells(1 + soN, 7)).Value = blk
+    ws.Columns.AutoFit
+    On Error GoTo 0
+End Sub
+
+' Composite sort key for _Site Only: reason level, then state, then name.
+Private Function pl_SiteOnlyKey(ByVal rsnLvl As Long, ByVal sttV As String, ByVal nmV As String) As String
+    pl_SiteOnlyKey = Format$(rsnLvl, "0") & "|" & LCase$(Trim$(sttV)) & "|" & LCase$(Trim$(nmV))
+End Function
+
 Private Function pl_ReadSiteTriples(ByVal wsSite As Worksheet, ByRef st() As PL_TSiteTriple) As Long
     Dim lastRow As Long, r As Long, k As Long
     lastRow = wsSite.Cells(wsSite.Rows.Count, 1).End(xlUp).Row
@@ -1931,8 +2295,9 @@ Private Function pl_ReadSiteTriples(ByVal wsSite As Worksheet, ByRef st() As PL_
         pl_ReadSiteTriples = 0
         Exit Function
     End If
+    ' Site Data: A=name B=state C=voltage D=Lat E=Long.
     Dim v As Variant
-    v = wsSite.Range(wsSite.Cells(PL_HDR_ROW + 1, 1), wsSite.Cells(lastRow, 3)).Value
+    v = wsSite.Range(wsSite.Cells(PL_HDR_ROW + 1, 1), wsSite.Cells(lastRow, 5)).Value
     Dim rows As Long
     If IsArray(v) Then
         rows = UBound(v, 1)
@@ -1942,11 +2307,12 @@ Private Function pl_ReadSiteTriples(ByVal wsSite As Worksheet, ByRef st() As PL_
     ReDim st(1 To rows)
     k = 0
     For r = 1 To rows
-        Dim nm As String, stt As String, vv As Variant
+        Dim nm As String, stt As String, vv As Variant, latV As Variant, lonV As Variant
         If IsArray(v) Then
             nm = Trim$(CStr(pl_NZ(v(r, 1)))): stt = Trim$(CStr(pl_NZ(v(r, 2)))): vv = v(r, 3)
+            latV = v(r, 4): lonV = v(r, 5)
         Else
-            nm = Trim$(CStr(pl_NZ(v))): stt = "": vv = ""
+            nm = Trim$(CStr(pl_NZ(v))): stt = "": vv = "": latV = "": lonV = ""
         End If
         If Len(nm) > 0 Then
             k = k + 1
@@ -1955,6 +2321,12 @@ Private Function pl_ReadSiteTriples(ByVal wsSite As Worksheet, ByRef st() As PL_
                 st(k).Voltage = CDbl(vv): st(k).VoltParsed = True
             Else
                 st(k).Voltage = 0: st(k).VoltParsed = False
+            End If
+            If IsNumeric(latV) And IsNumeric(lonV) And _
+               Len(Trim$(CStr(pl_NZ(latV)))) > 0 And Len(Trim$(CStr(pl_NZ(lonV)))) > 0 Then
+                st(k).Lat = CDbl(latV): st(k).Lng = CDbl(lonV): st(k).HasGeo = True
+            Else
+                st(k).Lat = 0: st(k).Lng = 0: st(k).HasGeo = False
             End If
         End If
     Next r
@@ -2696,11 +3068,14 @@ Private Function pl_TrimRows(ByRef arr() As Variant, ByVal rows As Long, ByVal c
 End Function
 
 Private Sub pl_GrowRaw(ByRef a() As String, ByRef b() As String, ByRef c() As Double, _
-                       ByRef d() As Boolean, ByRef e() As String, ByRef f() As Long)
+                       ByRef d() As Boolean, ByRef e() As String, ByRef f() As Long, _
+                       ByRef g() As Double, ByRef h() As Double, ByRef gp() As Boolean)
     Dim newSize As Long: newSize = UBound(a) * 2
     ReDim Preserve a(1 To newSize): ReDim Preserve b(1 To newSize)
     ReDim Preserve c(1 To newSize): ReDim Preserve d(1 To newSize)
     ReDim Preserve e(1 To newSize): ReDim Preserve f(1 To newSize)
+    ReDim Preserve g(1 To newSize): ReDim Preserve h(1 To newSize)
+    ReDim Preserve gp(1 To newSize)
 End Sub
 
 Private Function pl_ColLetter(ByVal col As Long) As String
@@ -3045,8 +3420,42 @@ Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Lon
     ' 17) Headroom = 0 scores percentile 0; positives rank among positives
     pl_HeadroomZeroSelfTest passCount, failCount
 
+    ' 18) _Site Only classification: near-miss = bug, absent = gap; bugs sort first
+    pl_SiteOnlyClassifySelfTest passCount, failCount
+
     Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
                 " errors (a compile break cannot be asserted from runtime)."
+End Sub
+
+' Fix 4 (classification): an unmatched site whose SHARED-normalized name equals a
+' known cost substation's normalized name is a "Likely match bug" (voltage/counter
+' near-miss), while a name absent from the cost side is "No cost study found".
+' Mirrors the dCostName decision inside pl_BuildMatrix. Also confirms the sort key
+' lists every bug (reason 1) ahead of every gap (reason 2), regardless of state.
+Private Sub pl_SiteOnlyClassifySelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    ' Build the normalized-name -> cost-key dictionary the way pl_BuildMatrix does.
+    Dim dCostName As Object: Set dCostName = CreateObject("Scripting.Dictionary")
+    dCostName(pl_NormSubName("Cecelia 138kV 1")) = "cecelia|138"
+    dCostName(pl_NormSubName("Cunningham 345kV")) = "cunningham|345"
+
+    ' (a) a site name that normalizes onto a cost name -> reason 1 (bug), and the
+    '     closest cost key is surfaced for the reviewer.
+    Dim nnHit As String: nnHit = pl_NormSubName("Cecelia 138kV 2")
+    Assert (dCostName.Exists(nnHit)), _
+           "SiteOnly: 'Cecelia 138kV 2' normalizes onto a cost name (reason 1 = bug)", _
+           passCount, failCount
+    Assert (CStr(dCostName(nnHit)) = "cecelia|138"), _
+           "SiteOnly: closest cost key for the near-miss is surfaced", passCount, failCount
+
+    ' (b) a name absent from the cost side -> reason 2 (no cost study found)
+    Assert (Not dCostName.Exists(pl_NormSubName("Nowhere Junction 138kV"))), _
+           "SiteOnly: an absent name is reason 2 (no cost study found)", passCount, failCount
+
+    ' (c) the sort key lists every bug ahead of every gap, regardless of state/name
+    Assert (pl_SiteOnlyKey(1, "WY", "zzz") < pl_SiteOnlyKey(2, "AL", "aaa")), _
+           "SiteOnly: bugs (reason 1) sort before gaps (reason 2)", passCount, failCount
+    Assert (pl_SiteOnlyKey(1, "AL", "a") < pl_SiteOnlyKey(1, "TX", "a")), _
+           "SiteOnly: within a reason, rows sort by state", passCount, failCount
 End Sub
 
 ' Fix 1: headroom = 0 (or no positive trigger) is excluded from the ranked
@@ -4471,7 +4880,12 @@ Private Function WriteSheet(ByVal ws As Worksheet, ByRef mtx As PL_TMatrix, _
     Dim cSlopeKnee As Long: cSlopeKnee = cMet0 + 3
     Dim cSlowdown As Long: cSlowdown = cMet0 + 4
     Dim cDet0 As Long: cDet0 = cMet0 + 5
-    Dim totalNew As Long: totalNew = cDet0 + 5 * nt - 1
+    ' Lat/Long appended at the far right: left-joined metadata for downstream
+    ' geospatial use, present when the substation matched a site row, else blank.
+    ' Placed last so they never shift the headline / formula columns.
+    Dim cLatOut As Long: cLatOut = cDet0 + 5 * nt
+    Dim cLngOut As Long: cLngOut = cLatOut + 1
+    Dim totalNew As Long: totalNew = cLngOut
 
     Dim hdrRow As Long: hdrRow = TABLE_HDR_ROW
     Dim dataTop As Long: dataTop = hdrRow + 1
@@ -4549,6 +4963,8 @@ Private Function WriteSheet(ByVal ws As Worksheet, ByRef mtx As PL_TMatrix, _
         hdr(1, cDet0 + 5 * t + 3) = lbl2 & " Slope (0-5)"
         hdr(1, cDet0 + 5 * t + 4) = lbl2 & " Band Score"
     Next t
+    hdr(1, cLatOut) = "Lat"
+    hdr(1, cLngOut) = "Long"
     ws.Cells(hdrRow, 1).Resize(1, totalNew).Value = hdr
 
     ' ---- data block ----
@@ -4556,7 +4972,9 @@ Private Function WriteSheet(ByVal ws As Worksheet, ByRef mtx As PL_TMatrix, _
     Dim rr As Long, baseA As Long
     For i = 1 To n
         rr = hdrRow + i
-        ' identity (always values, always split)
+        ' identity (always values, always split); lat/long metadata at the right
+        blk(i, cLatOut) = mtx.lat(i)
+        blk(i, cLngOut) = mtx.lng(i)
         blk(i, cSub) = mtx.names(i)
         If mtx.keyUseVolt(i) Then
             blk(i, cVolt) = mtx.keyVolt(i)

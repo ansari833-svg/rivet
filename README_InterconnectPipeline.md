@@ -55,8 +55,9 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    then the detected source header verbatim); from each source only the **data
    rows** are appended, with blank rows and any header-signature row skipped.
 2. **Site files → `Site Data`.** From each `Summary` tab (name = A, state = C,
-   voltage = G, header on row 1, **data row 2 down**, a header-matching row
-   skipped), de-duplicated on the full **(name, voltage, state) triple** built
+   **lat = D, long = E**, voltage = G, header on row 1, **data row 2 down**, a
+   header-matching row skipped; lat/long are read only when both cells are
+   numeric), de-duplicated on the full **(name, voltage, state) triple** built
    from the parsed fields — key `LCase(name)|voltageNumeric|LCase(state)`. With
    the counter stripped and voltage parsed, `Cecelia 138kV 1` and
    `Cecelia 138kV 2` (same state, 138 kV) produce the same key and collapse to
@@ -92,11 +93,33 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    So `Cecelia 138kV 1` (site) keys to `cecelia|138` and matches the clean cost
    `Cecelia` @ 138. Before these fixes the site keys were malformed
    (`cecelia 1|138.` — counter kept, voltage with a trailing dot) and ~299
-   genuine pairs reported *no match*; **after, unmatched drops below ~100.**
+   genuine pairs reported *no match*; **after, unmatched drops well below that.**
    Stage 3 logs the reconciliation — *site triples, cost substations, matched,
    unmatched* — and every remaining unmatched site row with **both its raw name
-   and its normalized key**, so true residuals are diagnosable. Site rows with no
-   Cost Data match are informational only. The `Matrix` identity is
+   and its normalized key**, so true residuals are diagnosable.
+
+   **Every unmatched site row is a review item — `_Site Only`.** Stage 3 writes a
+   `_Site Only` sheet listing each site that carries **no** matching Cost Data
+   substation, with `Substation | Voltage (kV) | State | Lat | Long | Reason`, and
+   classifies the Reason into exactly two buckets:
+   - **`Likely match bug`** — the site's *normalized* name equals a known cost
+     substation's normalized name but the pair still failed to key-match (a
+     residual voltage / counter near-miss). The closest cost key is written
+     alongside, so the reviewer sees what it *almost* matched.
+   - **`No cost study found`** — the normalized name appears nowhere on the cost
+     side; the keys are clean and the study is genuinely absent.
+
+   Rows are sorted **bugs first**, then by state, and the two counts are logged.
+   **Coverage is treated as the whole RTO footprint — there is no "out-of-region,
+   expected gap" bucket and no covered-region list is hardcoded or derived; every
+   unmatched row is surfaced for review, never silently dismissed.**
+
+   **Lat / long are carried through, never used to match.** `Summary!D` (lat) and
+   `Summary!E` (long) ride into `Site Data` and are left-joined — with `State` —
+   onto the matched `Matrix` / `Cost Curve Analysis` rows (blank when the
+   substation is unmatched) and onto the `_Site Only` rows. Coordinates are
+   **metadata only**: they are never a match key and never gate whether a row is
+   analyzed. The `Matrix` identity is
    **three separate columns** — `Substation` (clean name), `Voltage (kV)`,
    `State` — followed by the MW × cost body (never a concatenated
    `Chalkley 230. kV (Louisiana)` label). The body is **live `SUMIFS` by
@@ -141,7 +164,10 @@ via late binding), no `.Select` / `.Activate` / `Selection`.
    [Rank by MW Breadth / Rank by Slope per threshold] | Fitted Function |
    Segments | Step-Change Points | Slope at Knee | Marginal Slowdown |
    [per threshold: MW Range, Slope over Range, Breadth (0-5), Slope (0-5), Band
-   Score]`. Every live-formula reference (`Weighted Score = Flattening pctile +
+   Score] | Lat | Long`. The `Lat`/`Long` pair is appended at the **far right**
+   (left-joined from `Site Data`, blank when unmatched) so it never shifts the
+   headline or per-threshold columns the layout self-test pins. Every live-formula
+   reference (`Weighted Score = Flattening pctile +
    Σ band scores`, each band score `= $B$2·(breadth pctile + slope pctile)`, and
    every `PERCENTRANK.EXC` population range) is **derived from a single
    column-index map**, so a column move relocates its references automatically —
@@ -158,6 +184,56 @@ Also produced: a run log **`_Pipeline Log`** (per-file status, dropped
 duplicate triples, join alignment errors), a **`_Pipeline State`** checkpoint
 sheet, and a durable **`_Skipped Files`** record — the log is regenerable from
 the sheets via `RebuildAudit` (see below).
+
+---
+
+## Debugging on a subset (two module switches)
+
+Two module-level constants let you iterate on a big batch without re-running the
+whole thing. Both default to "off" so a normal run is unchanged.
+
+- **`TEST_MAX_FILES As Long`** — default `0` (unlimited). When set `> 0`, Stage 1
+  and Stage 2 each process only the **first N** selected files and log
+  *“TEST MODE: limited to N files.”* Use it to smoke-test the full pipeline end
+  to end on a handful of files in seconds.
+- **`REPROCESS_SKIPPED As Boolean`** — default `False`. When `True`, the stage
+  **skips the file picker** and instead reads the file paths straight from the
+  existing **`_Skipped Files`** sheet, reprocessing only those. This closes the
+  loop: run normally once (every skipped/failed file is recorded **with its full
+  path**), flip the switch, and re-run just the troublemakers. Stage 1 reads the
+  Stage-1 rows, Stage 2 the Stage-2 rows; if the sheet holds no paths for the
+  stage, it says so and stops rather than silently doing nothing.
+
+**Every skip is written incrementally, as it happens.** `_Skipped Files` now
+carries a full-path column (`Stage | File | Sheet | Outcome | Intended
+Substation | Loss / Coverage | Reason | Path`), and each skipped/failed file is
+appended **the moment it is processed** — so if a later file aborts the run, the
+record of everything already tried survives on disk. On a clean finish Stage 1
+rewrites those rows with their final LOST / redundant classification.
+
+## Per-file isolation & the error-91 fix
+
+A single unreadable workbook can no longer take down the batch, and the specific
+*“Object variable or With block variable not set” (run-time error 91)* that
+Stage 1 hit was root-caused and fixed:
+
+- **Root cause.** After validation located each cost file's data sheet **by
+  content**, the later reopen-and-append steps grabbed a **fixed tab index**
+  (`Sheets(3)`) instead of the sheet name validation had already chosen. Any file
+  whose data was not the third tab dereferenced the wrong (or a `Nothing`) sheet
+  → error 91. The header-copy and append paths now fetch the sheet through
+  `pl_WorksheetByNameOrIdx(wb, rec.SheetName, …)` — **by the validated name
+  first**, index only as a guarded fallback — and bail cleanly if neither
+  resolves.
+- **Every object is guarded.** Each `Workbooks.Open` is checked `If wb Is
+  Nothing`; each worksheet fetch is checked before use; each close is wrapped
+  `On Error Resume Next … If Not wb Is Nothing Then wb.Close … On Error GoTo 0`
+  so a failed open or a half-open workbook never throws on the way out.
+- **A bad file is logged and skipped, not fatal.** Per-file errors are caught,
+  recorded to `_Skipped Files` (with `Err.Number` / `Err.Description`), and the
+  loop continues. The stage error handler pinpoints *where* it failed — phase
+  (validation vs append), file index, how many contributed — and **always
+  reaches its log + skipped record**, even on abort.
 
 ---
 
@@ -441,6 +517,12 @@ Score**, and the composite maximum stays 165.
   two zeros score percentile **0** (masked out), the three positives rank **1–5**
   among themselves (`300 ≥ 200 ≥ 50`), and only those three enter the ranked
   population.
+- **`_Site Only` classification** — mirrors the `pl_BuildMatrix` decision on a
+  small normalized-name → cost-key dictionary: a site name that normalizes onto a
+  known cost name is **`Likely match bug`** (reason 1) and surfaces the closest
+  cost key; a name absent from the cost side is **`No cost study found`**
+  (reason 2); and `pl_SiteOnlyKey` orders every bug **ahead of** every gap
+  regardless of state, then by state within a reason.
 - **Analysis layout** — traces the `nt = 4` column map: identity at `A/B/C`,
   Weighted Score/pctile/Headroom at `D/E/F`, Flattening pctile at `I`, and the
   Weighted Score formula resolves to `=I4+AA4+AF4+AK4+AP4` with the first band
