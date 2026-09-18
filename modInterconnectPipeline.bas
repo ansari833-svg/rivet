@@ -1,0 +1,5646 @@
+Attribute VB_Name = "modInterconnectPipeline"
+Option Explicit
+
+' ==========================================================================
+'  modInterconnectPipeline.bas
+'  Interconnection Site-Scoring Pipeline -- scaled for ~2,000 substations
+'
+'  PUBLIC ENTRY POINT:  RunInterconnectPipeline   (run via Alt+F8)
+'  TEST HARNESS:        SelfTest                   (in-memory + parity + scale)
+'
+'  Four stages, end to end from a blank workbook, on one Alt+F8 call:
+'    1. Consolidate cost/results files -> Cost Data  (bulk, silent I/O)
+'    2. Consolidate site files -> Site Data          (dictionary dedupe, O(N))
+'    3. Join intersection -> in-memory grouping       (dictionary lookup)
+'    4. Matrix (values) + analysis + ranking + scoring + headroom
+'
+'  =====================================================================
+'  DURABLE & RESUMABLE (checkpoint every stage)
+'  ---------------------------------------------------------------------
+'  Each stage writes its full output to its own sheet AND saves the workbook
+'  before the next stage begins:
+'      cost -> write Cost Data -> Save -> site -> write Site Data -> Save ->
+'      matrix -> write Matrix -> Save -> analysis -> write -> Save.
+'  A crash, a runtime error, or even a VBA compile break in a later stage
+'  leaves every earlier sheet intact and saved on disk. The sheet is the source
+'  of truth: a stage never keeps its only copy in a module-level array across
+'  stages, and a resumed run reads Cost Data / Site Data / Matrix back from
+'  their sheets instead of recomputing them.
+'
+'  Each stage has its own failure handling: on error it saves what exists,
+'  restores application state, logs the reason to _Pipeline State/_Pipeline Log,
+'  and exits with a clear message naming the stages already completed and saved
+'  ("Stage 2 failed: <err>. Completed and saved: Cost Data. Fix and re-run --
+'  it will resume."). One stage's failure never rolls back earlier sheets.
+'
+'  RESUME: at entry the completed stages are detected (each output sheet exists
+'  and is non-empty; _Pipeline State records the last completed stage + row
+'  count + timestamp). When valid checkpoints exist the user is offered Resume
+'  (skip completed stages, start at the first incomplete -- the 2,000-file
+'  Stage 1 is never repeated for a later typo) or Restart (clear outputs, run
+'  from Stage 1). Resume is the default.
+'
+'  If the host is an unsaved blank workbook (no path), the first save prompts
+'  once for a location (falling back to a timestamped .xlsm in
+'  Application.DefaultFilePath); the macro-enabled format (52) is required
+'  because the module lives in the workbook.
+'
+'  COMPILE-SAFETY: a VBA compile error is a project-load failure that halts the
+'  whole run regardless of checkpoints, so the module is kept compile-clean
+'  (one Attribute VB_Name, balanced terminators, no duplicate procedures). The
+'  saved per-stage sheets are what protect the data even across a compile break;
+'  a clean compile is what prevents the halt. Both are needed.
+'
+'  =====================================================================
+'  SCALING (what changed for ~2,000 files/substations; results identical)
+'  ---------------------------------------------------------------------
+'  Global run settings are set once at entry and restored in Cleanup on every
+'  exit including error: ScreenUpdating=False, EnableEvents=False,
+'  DisplayAlerts=False, Calculation=xlManual, AskToUpdateLinks=False, a live
+'  Application.StatusBar progress line, and a SINGLE Application.CalculateFull
+'  at the very end (no intermediate recalcs; the chart is built after it).
+'
+'  Stage 1  Every source workbook is opened UpdateLinks:=0, ReadOnly:=True,
+'           AddToMru:=False and closed immediately (SaveChanges:=False); the
+'           used range is read in one Range.Value grab and iterated in memory;
+'           output rows are accumulated in an array and written one
+'           Range.Value = array per file. One DoEvents + status line per file;
+'           an unreadable file is logged and skipped, never aborting the batch.
+'  Stage 2  Triple dedupe uses a Scripting.Dictionary keyed on a normalised
+'           "name|voltage|state" string -- one O(N) pass, not O(N^2) compares.
+'  Stage 3  The join builds a dictionary of cost-side identities in one pass
+'           and resolves each Site Data triple by key lookup (name, or
+'           name+voltage when the cost tab carried a voltage), not a rescan.
+'  Stage 4  The matrix is computed as VALUES in VBA: the four cost columns are
+'           loaded once and grouped by identity; each substation's
+'           trigger->allocation records are scanned once to accumulate the
+'           cumulative allocation T at each MW breakpoint, divided by MW -- the
+'           exact piecewise T/MW the SUMIFS define -- and written as one block.
+'  Stage 5  Ranking sorts once per column (stable mergesort, O(N log N)) and
+'           assigns competition ranks in a single walk, instead of counting how
+'           many beat each substation across eight columns (the ~32M-op hang).
+'  Stage 6  Percentiles and the Weighted Score are evaluated in VBA against the
+'           same definitions as the formulas and written as value blocks.
+'  Stage 7  Headroom (MW) is the per-substation minimum trigger, taken from the
+'           already-loaded cost data; its percentile is a raw-is-better bucket.
+'
+'  TWO SWITCHES (documented in README):
+'    USE_LIVE_SUMIFS    DEFAULT TRUE -> the Matrix body is live SUMIFS bound to
+'                       used rows ($D$2:$D$<last>, never $D:$D). False -> values.
+'    USE_LIVE_FORMULAS  Default False -> Stage 6/7 percentiles, Weighted Score
+'                       and headroom are computed value blocks. True -> live
+'                       formulas over BOUNDED population ranges.
+'  PARITY GUARANTEE: the values path and the live-formula path produce the same
+'  numbers. The VBA implements PERCENTRANK.EXC exactly (k/(N+1) positioning),
+'  and SelfTest round-trips the fixture through real Excel formulas to prove
+'  the two paths agree cell-for-cell.
+'
+'  SCORING (unchanged definitions; 165 ceiling unchanged):
+'    Flattening / headroom / weighted-score percentiles are raw-is-better:
+'        CEILING(PERCENTRANK.EXC(pop, x) * 5, 1)
+'    The eight band percentiles (breadth+slope over four thresholds) are
+'    rank-based (rank 1 = best):
+'        IFERROR(CEILING((1 - PERCENTRANK.EXC(pop, rank)) * 5, 1), 0)
+'    Weighted Score = Flattening + $B$2 * (sum of the eight band percentiles),
+'    a single live weight $B$2 (default 4) over every band -- the threshold axis
+'    as a whole is worth 4x the flattening axis; the weight does not grade
+'    $25 > $50 > $75 > $100. Composite maximum = 5 + 4*(8*5) = 165. Headroom is
+'    a standalone lens (its own percentile), NOT added to the Weighted Score.
+'
+'  No .Select / .Activate / Selection anywhere; every sheet write is a single
+'  Range.Value/Formula = array per block; number formats applied per column
+'  once. No external references (Scripting.Dictionary via late binding).
+'  Target: Windows Excel, VBA 7.x.
+'
+'  SELF-TEST / VERIFICATION (SelfTest):
+'    * Parity: values path == live-formula path on the fixture (percentile
+'      buckets round-tripped through Excel).
+'    * Ranking: sort-based competition ranks match the naive definition,
+'      including the ties (Cunningham/Hobbs, Pleasant Hill/Roosevelt, the
+'      13-way $100MM breadth tie).
+'    * Dedupe/join: dictionary results match the triple and intersection rules.
+'    * Scale: 2,000 synthetic substations rank/percentile/score without
+'      O(N^2) blow-up (bounded wall-clock).
+'    * Tab parsing, matrix shape, headroom, and the 165 ceiling.
+' ==========================================================================
+
+' ---------- Pipeline configuration (edit here only) ------------------------
+
+Private Const PL_SH_COST     As String = "Cost Data"
+Private Const PL_SH_SITE     As String = "Site Data"
+Private Const PL_SH_MATRIX   As String = "Matrix"
+Private Const PL_SH_ANALYSIS As String = "Cost Curve Analysis"
+Private Const PL_SH_LOG      As String = "_Pipeline Log"
+Private Const PL_SH_STATE    As String = "_Pipeline State"
+Private Const PL_SH_SKIPPED  As String = "_Skipped Files"   ' durable skip/fail record
+Private Const PL_SH_SITEONLY As String = "_Site Only"       ' unmatched site rows (classified)
+
+' Stage identifiers, in completion order. COST and SITE open source files and
+' must never be repeated on a resume; MATRIX and ANALYSIS recompute cheaply
+' from the persisted upstream sheets.
+Private Const PL_STG_COST     As Long = 1
+Private Const PL_STG_SITE     As Long = 2
+Private Const PL_STG_MATRIX   As Long = 3
+Private Const PL_STG_ANALYSIS As Long = 4
+Private Const PL_STG_COUNT    As Long = 4
+
+' Macro-enabled save format for the first save of an unsaved blank host (the
+' module lives in the workbook, so every checkpoint must stay macro-enabled).
+Private Const PL_XLSM_FORMAT  As Long = 52   ' xlOpenXMLWorkbookMacroEnabled
+
+
+Private Const PL_HDR_ROW        As Long = 1
+Private Const PL_COST_DATA_IDX  As Long = 3     ' cost workbook: sheet 3 carries the data
+Private Const PL_SITE_TAB       As String = "Summary"
+Private Const PL_SITE_NAME_COL  As Long = 1     ' Summary!A = substation name
+Private Const PL_SITE_STATE_COL As Long = 3     ' Summary!C = state
+Private Const PL_SITE_LAT_COL   As Long = 4     ' Summary!D = latitude  (metadata only)
+Private Const PL_SITE_LON_COL   As Long = 5     ' Summary!E = longitude (metadata only)
+Private Const PL_SITE_VOLT_COL  As Long = 7     ' Summary!G = voltage (kV)
+
+' Source headers resolved at run time by NAME on Cost Data (never fixed
+' letters -- the four metadata columns shift the source columns right).
+Private Const PL_HDR_NAME    As String = "Substation Name"
+Private Const PL_HDR_VOLT    As String = "Voltage (kV)"
+Private Const PL_HDR_TRIGGER As String = "Size Overload Occurs (MW)"
+Private Const PL_HDR_ALLOC   As String = "Proposed Project Allocation ($)"
+
+' Matrix MW axis: 100, 110, ... 300 (numeric, strictly ascending).
+Private Const PL_MW_MIN  As Double = 100
+Private Const PL_MW_MAX  As Double = 300
+Private Const PL_MW_STEP As Double = 10
+
+' Weighted scoring.
+Private Const PL_WEIGHT_B2  As Double = 4
+Private Const PL_MAX_PCTILE As Long = 5
+
+' Evaluation-path switches (see the header block). Both default False so the
+' finished workbook holds values, not thousands of volatile array formulas.
+Private Const USE_LIVE_SUMIFS   As Boolean = True    ' Stage 4 matrix (default: live formulas)
+Private Const USE_LIVE_FORMULAS As Boolean = False   ' Stage 6/7 pctiles/score/headroom
+
+' Optional external copy of the run log: when True, pl_WriteLog also writes the
+' log lines to "<workbook base>_PipelineLog.txt" beside the saved workbook, so a
+' run's transcript survives independent of any tab deletion. Best-effort: an
+' unwritable path is ignored, never fatal. Requires the workbook to be saved.
+Private Const WRITE_LOG_TO_FILE As Boolean = False
+
+' ---------- Debug / test-loop switches ------------------------------------
+' Fast test loop: when > 0, Stage 1 and Stage 2 each process only the first N
+' selected files (logged "TEST MODE: limited to N files"), so the whole pipeline
+' can be exercised on ~20 files in seconds. 0 = unlimited (production).
+Private Const TEST_MAX_FILES As Long = 0
+
+' Reprocess-only-the-problem-files: when True, Stage 1/2 do NOT show the file
+' picker; they read the file paths from the existing "_Skipped Files" sheet and
+' process only those, to iterate on the known troublemakers. Default False.
+Private Const REPROCESS_SKIPPED As Boolean = False
+
+Private Const PL_EXCEL_MAX_ROWS   As Long = 1048576
+Private Const PL_EXCEL_MAX_TAB    As Long = 31
+
+' ---------- Records ---------------------------------------------------------
+
+Private Type PL_TCostFile
+    FilePath      As String
+    SheetName     As String
+    Substation    As String
+    Voltage       As Double
+    VoltParsed    As Boolean
+    HeaderSig     As String
+    HeaderRow     As Long
+    UsedCols      As Long
+    FirstDataRow  As Long
+    LastDataRow   As Long
+    IsValid       As Boolean
+    Status        As String
+    Message       As String
+    RowsImported  As Long
+    Outcome       As String     ' categorized: Contributed / Skipped: <reason> / Failed: open error
+    SeenHeaders   As String     ' actual headers seen when the known headers weren't found
+    Loss          As String     ' LOST / redundant / unknown -- set during reconciliation
+    ErrNum        As Long       ' Err.Number captured on a failure (0 = none)
+    ErrDesc       As String     ' Err.Description captured on a failure
+End Type
+
+Private Type PL_TSiteTriple
+    Name        As String
+    Voltage     As Double
+    VoltParsed  As Boolean
+    State       As String
+    Lat         As Double      ' Summary!D -- carried as metadata, never a join key
+    Lng         As Double      ' Summary!E
+    HasGeo      As Boolean     ' True when lat/long were present/numeric
+End Type
+
+Private Type PL_TCostId
+    Name        As String
+    Voltage     As Double
+    VoltParsed  As Boolean
+    Matched     As Boolean
+End Type
+
+Private Type PL_TLog
+    lines() As String
+    n       As Long
+End Type
+
+' Everything Stage 3/4 hands to Stage 4's analysis + scoring, so the matrix is
+' computed once in memory and never re-read from the sheet.
+Private Type PL_TMatrix
+    ok           As Boolean
+    matchedCount As Long
+    mwCount      As Long
+    mw()         As Double        ' 1..m
+    names()      As String        ' 1..n CLEAN substation name (row order)
+    state()      As String        ' 1..n state, left-joined from Site Data ("" if none)
+    lat()        As String        ' 1..n latitude, left-joined ("" if unmatched/absent)
+    lng()        As String        ' 1..n longitude, left-joined ("" if unmatched/absent)
+    costM()      As Double        ' 1..n, 1..m cost-per-MW values
+    headroom()   As Double        ' 1..n minimum trigger MW (0 = none)
+    keyName()    As String        ' 1..n cost-side key (name)
+    keyVolt()    As Double        ' 1..n cost-side voltage
+    keyUseVolt() As Boolean       ' 1..n whether the cost tab carried a voltage
+    costName     As String        ' Cost Data sheet name (for live formulas)
+    colName      As Long          ' resolved Cost Data columns (by header)
+    colVolt      As Long
+    colTrig      As Long
+    colAlloc     As Long
+    costLastRow  As Long          ' last used row on Cost Data (for bounded live refs)
+End Type
+
+Private Const OUT_SHEET       As String = "Cost Curve Analysis"
+
+Private Const SEG_TOL         As Double = 0.005   ' relative T tolerance for "same segment"
+Private Const MAX_SEGMENTS    As Long = 8         ' above this, fall back to a power-law fit
+Private Const SLOWDOWN_TOL    As Double = 1500#   ' $/MW per MW: marginal-slowdown slope threshold
+
+' Rank B (slope) direction. Steepest first reads a steep slope as the
+' curve still capturing scale economies (incremental MW still buying
+' meaningful unit-cost reduction); flattest first reads the opposite
+' (curve already flattened, site near efficient size). Both are
+' legitimate, so the direction is a constant rather than a hardcoded sort.
+' 1 = steepest first (largest magnitude gets rank 1)
+' 2 = flattest first (smallest magnitude gets rank 1)
+Private Const SLOPE_RANK_MODE As Long = 1
+
+' Layout anchors (change these to move the whole layout)
+Private Const TITLE_ROW       As Long = 1
+Private Const TABLE_HDR_ROW   As Long = 3         ' analysis-table headers; data begins on the next row
+Private Const N_FIXED_COLS    As Long = 7         ' aTable cols A..G before the per-threshold quads
+Private Const COLB_WIDTH      As Double = 60      ' fixed width of the Fitted Function column
+
+' Number formats
+Private Const FMT_DOLLAR      As String = "$#,##0"
+Private Const FMT_SLOPE       As String = "$#,##0.0"
+Private Const FMT_MW          As String = "#,##0"
+Private Const FMT_MW1         As String = "#,##0.0"
+
+' ---------- Segment record ----------------------------------
+
+Private Type TSegment
+    FirstJ As Long      ' 1-based index of the segment's first MW point
+    LastJ  As Long      ' 1-based index of the segment's last  MW point
+    Ttotal As Double    ' representative total = mean of T over the segment, rounded to $1,000
+End Type
+
+' Module-level stage tag, surfaced by the error handler
+Private mStage As String
+' ==========================================================================
+'  PUBLIC ENTRY POINT
+' ==========================================================================
+
+'--------------------------------------------------------------------------
+' RunInterconnectPipeline
+'   Runs the four stages end to end. The four application flags plus
+'   AskToUpdateLinks are set once here and restored in Cleanup on every exit
+'   (including the error handler); a StatusBar progress line runs throughout;
+'   there are no intermediate recalcs -- a single Application.CalculateFull is
+'   issued at the very end of Stage 4, and the chart is built after it.
+'--------------------------------------------------------------------------
+Public Sub RunInterconnectPipeline()
+
+    Dim savedScreen As Boolean, savedEvents As Boolean, savedAlerts As Boolean
+    Dim savedCalc As XlCalculation, savedLinks As Boolean, savedStatusVis As Boolean
+    Dim stateSaved As Boolean
+
+    Dim log As PL_TLog
+    Dim wsCost As Worksheet, wsSite As Worksheet, wsMatrix As Worksheet
+    Dim mtx As PL_TMatrix
+    Dim analysisOK As Boolean, distinctTriples As Long
+    Dim startStage As Long, failedStage As Long, curStageName As String
+
+    savedScreen = Application.ScreenUpdating
+    savedEvents = Application.EnableEvents
+    savedAlerts = Application.DisplayAlerts
+    savedCalc = Application.Calculation
+    savedLinks = Application.AskToUpdateLinks
+    savedStatusVis = Application.DisplayStatusBar
+    stateSaved = True
+
+    On Error GoTo ErrHandler
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    Application.AskToUpdateLinks = False
+    Application.DisplayStatusBar = True
+
+    pl_LogInit log
+    pl_LogAdd log, "Run started " & Format$(Now, "yyyy-mm-dd hh:nn:ss")
+    pl_Status "Interconnect pipeline: starting"
+
+    ' ---- resume / restart decision (checkpoints = non-empty output sheets) ----
+    startStage = pl_FirstIncompleteStage()
+    If startStage > PL_STG_COST Then
+        Dim ans As VbMsgBoxResult
+        ans = MsgBox("Found completed stages: " & pl_CompletedStagesText() & "." & vbCrLf & vbCrLf & _
+                     IIf(startStage > PL_STG_COUNT, "All four stages are already complete.", _
+                         "Resume from Stage " & startStage & " (" & pl_StageRole(startStage) & _
+                         "), or Restart from Stage 1?") & vbCrLf & vbCrLf & _
+                     "Yes = Resume (skip completed stages; read their sheets back, do not re-open source files)" & vbCrLf & _
+                     "No = Restart from Stage 1 (clears all outputs + _Pipeline State)" & vbCrLf & _
+                     "Cancel = abort", vbYesNoCancel + vbQuestion, "Resume pipeline?")
+        Select Case ans
+            Case vbCancel
+                pl_LogAdd log, "User cancelled at the resume prompt."
+                GoTo Cleanup
+            Case vbNo
+                pl_ClearOutputs
+                startStage = PL_STG_COST
+                pl_LogAdd log, "Restart: outputs cleared; running from Stage 1."
+            Case vbYes
+                pl_LogAdd log, "Resume: starting at Stage " & startStage & "."
+                If startStage > PL_STG_COUNT Then
+                    pl_WriteLog log
+                    MsgBox "All four stages are already complete and saved. " & _
+                           "Choose Restart if you want to re-run from Stage 1.", _
+                           vbInformation, "Interconnect Pipeline"
+                    GoTo Cleanup
+                End If
+        End Select
+    End If
+
+    ' ================= Stage 1 -- Cost Data =================
+    failedStage = PL_STG_COST: curStageName = pl_StageName(PL_STG_COST)
+    If startStage <= PL_STG_COST Then
+        If Not pl_ConsolidateCost(log, wsCost) Then GoTo StageFailed
+        pl_SaveCheckpoint log, PL_STG_COST, pl_SheetDataRows(wsCost)
+    Else
+        Set wsCost = pl_SheetByName(PL_SH_COST)
+        If wsCost Is Nothing Then GoTo StageFailed
+        pl_LogAdd log, "Stage 1 (Cost Data): resumed from checkpoint (" & pl_SheetDataRows(wsCost) & " rows), source files NOT re-opened."
+    End If
+
+    ' ================= Stage 2 -- Site Data =================
+    failedStage = PL_STG_SITE: curStageName = pl_StageName(PL_STG_SITE)
+    If startStage <= PL_STG_SITE Then
+        If Not pl_ConsolidateSite(log, wsSite, distinctTriples) Then GoTo StageFailed
+        pl_SaveCheckpoint log, PL_STG_SITE, pl_SheetDataRows(wsSite)
+    Else
+        Set wsSite = pl_SheetByName(PL_SH_SITE)
+        If wsSite Is Nothing Then GoTo StageFailed
+        distinctTriples = pl_SheetDataRows(wsSite)
+        pl_LogAdd log, "Stage 2 (Site Data): resumed from checkpoint (" & distinctTriples & " triples)."
+    End If
+
+    ' ================= Stage 3 -- Matrix =================
+    failedStage = PL_STG_MATRIX: curStageName = pl_StageName(PL_STG_MATRIX)
+    Dim reuseMatrix As Boolean
+    reuseMatrix = (startStage > PL_STG_MATRIX)     ' Matrix already checkpointed -> read values back
+    If reuseMatrix Then Set wsMatrix = pl_SheetByName(PL_SH_MATRIX)
+    If Not pl_BuildMatrix(log, wsCost, wsSite, wsMatrix, mtx, reuseMatrix) Then GoTo StageFailed
+    If Not reuseMatrix Then
+        pl_SaveCheckpoint log, PL_STG_MATRIX, mtx.matchedCount
+    Else
+        pl_LogAdd log, "Stage 3 (Matrix): resumed from checkpoint (" & mtx.matchedCount & " substations)."
+    End If
+
+    ' ================= Stage 4 -- Analysis + scoring =================
+    failedStage = PL_STG_ANALYSIS: curStageName = pl_StageName(PL_STG_ANALYSIS)
+    analysisOK = pl_RunAnalysisAndScoring(wsMatrix, log, mtx)
+    If Not analysisOK Then
+        ' pl_RunAnalysisAndScoring already logged the reason and showed a
+        ' specific MsgBox; just persist what exists (Stages 1-3) and stop.
+        pl_TrySave
+        pl_WriteLog log
+        GoTo Cleanup
+    End If
+    pl_SaveCheckpoint log, PL_STG_ANALYSIS, mtx.matchedCount
+
+    pl_WriteLog log
+    pl_Status "Interconnect pipeline: done"
+
+    MsgBox "Interconnection pipeline complete." & vbCrLf & vbCrLf & _
+           "Cost Data:  " & wsCost.Name & vbCrLf & _
+           "Site Data:  " & wsSite.Name & "  (" & distinctTriples & " distinct triples)" & vbCrLf & _
+           "Matrix:     " & wsMatrix.Name & "  (" & mtx.matchedCount & " x " & mtx.mwCount & _
+           ", " & IIf(USE_LIVE_SUMIFS, "live SUMIFS", "values") & ")" & vbCrLf & _
+           "Analysis:   written (" & IIf(USE_LIVE_FORMULAS, "live formulas", "values") & ")" & vbCrLf & _
+           "Saved to:   " & IIf(Len(ThisWorkbook.Path) > 0, ThisWorkbook.Name, "(unsaved)") & vbCrLf & _
+           "Run log:    " & PL_SH_LOG & "  (deletable -- regenerate with RebuildAudit)", _
+           vbInformation, "Interconnect Pipeline"
+    GoTo Cleanup
+
+StageFailed:
+    ' A stage returned False (it already logged the reason). Save whatever exists
+    ' so earlier stages survive, report, and exit; a re-run will resume.
+    pl_TrySave
+    pl_LogAdd log, "Stage " & failedStage & " (" & curStageName & ") did not complete."
+    pl_WriteLog log
+    MsgBox "Stage " & failedStage & " (" & curStageName & ") did not complete." & vbCrLf & _
+           "Completed and saved: " & pl_CompletedStagesText() & "." & vbCrLf & _
+           "See " & PL_SH_LOG & " for the reason. Fix and re-run -- it will resume.", _
+           vbExclamation, "Interconnect Pipeline"
+    GoTo Cleanup
+
+Cleanup:
+    If stateSaved Then
+        Application.StatusBar = False
+        Application.DisplayStatusBar = savedStatusVis
+        Application.AskToUpdateLinks = savedLinks
+        Application.Calculation = savedCalc
+        Application.DisplayAlerts = savedAlerts
+        Application.EnableEvents = savedEvents
+        Application.ScreenUpdating = savedScreen
+    End If
+    Exit Sub
+
+ErrHandler:
+    On Error Resume Next
+    pl_LogAdd log, "Stage " & failedStage & " (" & curStageName & ") FATAL #" & Err.Number & ": " & Err.Description
+    pl_TrySave
+    pl_WriteLog log
+    On Error GoTo 0
+    MsgBox "Stage " & failedStage & " (" & curStageName & ") failed: #" & Err.Number & " " & Err.Description & "." & vbCrLf & _
+           "Completed and saved: " & pl_CompletedStagesText() & "." & vbCrLf & _
+           "Fix and re-run -- it will resume.", vbCritical, "Interconnect Pipeline"
+    Resume Cleanup
+End Sub
+
+' ==========================================================================
+'  REBUILD AUDIT  (regenerate the diagnostic summary from the output sheets)
+' ==========================================================================
+'   The _Pipeline Log is a run transcript; deleting it must not force an
+'   (expensive) re-run. Every fact the audit needs is persisted: Cost Data
+'   retains per-row Source File / Source Sheet provenance, and skipped/failed
+'   files (which leave no Cost Data rows) are recorded in _Skipped Files. This
+'   routine recomputes the summary + reconciliation from those sheets alone, so
+'   it is safe to call any time -- including after _Pipeline Log is deleted --
+'   without re-opening a single source workbook.
+Public Sub RebuildAudit()
+    Dim log As PL_TLog: pl_LogInit log
+    Dim wsCost As Worksheet: Set wsCost = pl_SheetByName(PL_SH_COST)
+    Dim wsSk As Worksheet: Set wsSk = pl_SheetByName(PL_SH_SKIPPED)
+    Dim dSubs As Long, fContrib As Long, coll As Long, sf As Long
+    Dim ok As Boolean
+    ok = pl_ComputeAudit(wsCost, wsSk, log, dSubs, fContrib, coll, sf)
+    pl_WriteLog log
+    If ok Then
+        Dim sel As Long: sel = pl_ReadSelected("Cost Files Selected")
+        Dim selLine As String
+        If sel >= 0 Then
+            selLine = "Files selected:              " & sel & vbCrLf & _
+                      "  = " & fContrib & " contributed + " & sf & " skipped/failed" & _
+                      IIf((fContrib + sf) <> sel, "  (!! " & (sel - (fContrib + sf)) & " UNACCOUNTED)", "") & vbCrLf
+        Else
+            selLine = "Files accounted:             " & (fContrib + sf) & _
+                      "  (" & fContrib & " contributed + " & sf & " skipped; selected count not recorded)" & vbCrLf
+        End If
+        MsgBox "Audit rebuilt from sheets (no consolidation re-run):" & vbCrLf & vbCrLf & _
+               selLine & _
+               "Distinct substations:        " & dSubs & vbCrLf & _
+               "Substations from >1 file:     " & coll & vbCrLf & vbCrLf & _
+               "Full reconciliation written to " & PL_SH_LOG & ".", _
+               vbInformation, "Rebuild Audit"
+    Else
+        MsgBox "Could not rebuild the audit: '" & PL_SH_COST & "' is missing or lacks the " & _
+               "'Source File' provenance column. Run the pipeline (Stage 1) first.", _
+               vbExclamation, "Rebuild Audit"
+    End If
+End Sub
+
+' Computes the audit summary from the persisted sheets and appends the summary +
+' reconciliation lines to `log`. wsCost is required; wsSkipped may be Nothing.
+' Returns the key counts by ref so callers (and the self-test) can assert them.
+Private Function pl_ComputeAudit(ByVal wsCost As Worksheet, ByVal wsSkipped As Worksheet, _
+                                 ByRef log As PL_TLog, ByRef distinctSubs As Long, _
+                                 ByRef filesContributing As Long, ByRef collapseCount As Long, _
+                                 ByRef skippedFailed As Long) As Boolean
+    pl_ComputeAudit = False
+    distinctSubs = 0: filesContributing = 0: collapseCount = 0: skippedFailed = 0
+    If wsCost Is Nothing Then
+        pl_LogAdd log, "RebuildAudit: '" & PL_SH_COST & "' is not present -- cannot rebuild."
+        Exit Function
+    End If
+
+    Dim colName As Long, colVolt As Long, colSrc As Long
+    colName = pl_ResolveCol(wsCost, PL_HDR_NAME)
+    colVolt = pl_ResolveCol(wsCost, PL_HDR_VOLT)
+    colSrc = pl_ResolveCol(wsCost, "Source File")
+    If colName = 0 Or colSrc = 0 Then
+        pl_LogAdd log, "RebuildAudit: Cost Data is missing '" & PL_HDR_NAME & "' or 'Source File'."
+        Exit Function
+    End If
+
+    Dim lastRow As Long, lastCol As Long
+    lastRow = wsCost.Cells(wsCost.Rows.Count, colName).End(xlUp).Row
+    lastCol = wsCost.Cells(1, wsCost.Columns.Count).End(xlToLeft).Column
+    If lastRow < 2 Then
+        pl_LogAdd log, "RebuildAudit: Cost Data has no data rows."
+        Exit Function
+    End If
+    Dim cv As Variant
+    cv = wsCost.Range(wsCost.Cells(1, 1), wsCost.Cells(lastRow, lastCol)).Value
+
+    Dim dSub As Object: Set dSub = CreateObject("Scripting.Dictionary")
+    Dim dFile As Object: Set dFile = CreateObject("Scripting.Dictionary")
+    Dim dPair As Object: Set dPair = CreateObject("Scripting.Dictionary")
+    Dim dSubFiles As Object: Set dSubFiles = CreateObject("Scripting.Dictionary")
+
+    Dim r As Long
+    For r = 2 To lastRow
+        Dim nm As String: nm = Trim$(CStr(pl_NZ(cv(r, colName))))
+        If Len(nm) > 0 Then
+            Dim vp As Boolean, vv As Double
+            vp = False: vv = 0
+            If colVolt > 0 Then
+                If IsNumeric(cv(r, colVolt)) And Len(Trim$(CStr(pl_NZ(cv(r, colVolt))))) > 0 Then
+                    vv = CDbl(cv(r, colVolt)): vp = True
+                End If
+            End If
+            Dim idk As String: idk = pl_CostKey(nm, vv, vp)
+            If Not dSub.Exists(idk) Then dSub.Add idk, True
+
+            Dim fpath As String: fpath = LCase$(Trim$(CStr(pl_NZ(cv(r, colSrc)))))
+            If Len(fpath) > 0 Then
+                If Not dFile.Exists(fpath) Then dFile.Add fpath, True
+                Dim pk As String: pk = idk & "||" & fpath
+                If Not dPair.Exists(pk) Then
+                    dPair.Add pk, True
+                    If dSubFiles.Exists(idk) Then
+                        dSubFiles(idk) = dSubFiles(idk) + 1
+                    Else
+                        dSubFiles.Add idk, 1
+                    End If
+                End If
+            End If
+        End If
+    Next r
+
+    distinctSubs = dSub.Count
+    filesContributing = dFile.Count            ' distinct source files that produced rows
+    Dim k As Variant
+    For Each k In dSubFiles.Keys
+        If dSubFiles(k) > 1 Then collapseCount = collapseCount + 1
+    Next k
+
+    If Not wsSkipped Is Nothing Then
+        Dim slr As Long: slr = wsSkipped.Cells(wsSkipped.Rows.Count, 1).End(xlUp).Row
+        If slr >= 2 Then skippedFailed = slr - 1
+    End If
+
+    Dim dupCollapsed As Long: dupCollapsed = dPair.Count - distinctSubs
+    Dim accounted As Long: accounted = filesContributing + skippedFailed
+    Dim selected As Long: selected = pl_ReadSelected("Cost Files Selected")
+
+    pl_LogAdd log, "AUDIT REBUILT " & Format$(Now, "yyyy-mm-dd hh:nn:ss") & _
+                   " (regenerated from sheets; no consolidation re-run)."
+    ' File-level reconciliation, ANCHORED on the selected count.
+    If selected >= 0 Then
+        pl_LogAdd log, "Files: " & selected & " selected = " & filesContributing & " contributed + " & _
+                       skippedFailed & " skipped/failed."
+        If accounted <> selected Then
+            pl_LogAdd log, "  *** UNACCOUNTED: " & (selected - accounted) & " selected file(s) neither " & _
+                           "appear in Cost Data nor in " & PL_SH_SKIPPED & " -- investigate. ***"
+        End If
+    Else
+        pl_LogAdd log, "Files: " & filesContributing & " contributed + " & skippedFailed & _
+                       " skipped/failed = " & accounted & " accounted (selected count not recorded)."
+    End If
+    ' Substation-level view of the contributing files.
+    pl_LogAdd log, "Cost Data: " & distinctSubs & " distinct substation(s) from " & _
+                   filesContributing & " contributing file(s); " & collapseCount & _
+                   " substation(s) drew from >1 file (" & dupCollapsed & " extra file(s) merged)."
+    Dim shown As Long: shown = 0
+    For Each k In dSubFiles.Keys
+        If dSubFiles(k) > 1 And shown < 8 Then
+            pl_LogAdd log, "  collapse: '" & CStr(k) & "' <- " & dSubFiles(k) & " files"
+            shown = shown + 1
+        End If
+    Next k
+    pl_LogAdd log, "Skipped/failed files (from " & PL_SH_SKIPPED & "): " & skippedFailed & "."
+    pl_ComputeAudit = True
+End Function
+
+' ==========================================================================
+'  CHECKPOINT / RESUME / SAVE INFRASTRUCTURE
+' ==========================================================================
+
+' Human name of a stage's output sheet.
+Private Function pl_StageName(ByVal stage As Long) As String
+    Select Case stage
+        Case PL_STG_COST: pl_StageName = PL_SH_COST
+        Case PL_STG_SITE: pl_StageName = PL_SH_SITE
+        Case PL_STG_MATRIX: pl_StageName = PL_SH_MATRIX
+        Case PL_STG_ANALYSIS: pl_StageName = PL_SH_ANALYSIS
+        Case Else: pl_StageName = "(all complete)"
+    End Select
+End Function
+
+' Short role label for the resume prompt (e.g. Stage 3 = "Join/Matrix").
+Private Function pl_StageRole(ByVal stage As Long) As String
+    Select Case stage
+        Case PL_STG_COST: pl_StageRole = "Consolidate Cost"
+        Case PL_STG_SITE: pl_StageRole = "Consolidate Sites"
+        Case PL_STG_MATRIX: pl_StageRole = "Join/Matrix"
+        Case PL_STG_ANALYSIS: pl_StageRole = "Analysis/Scoring"
+        Case Else: pl_StageRole = "done"
+    End Select
+End Function
+
+' A stage is "done" when its output sheet exists and is non-empty (header plus
+' at least one data row). The sheet is the source of truth; _Pipeline State is
+' corroborating metadata only, so a checkpoint survives even a lost state sheet.
+Private Function pl_StageDone(ByVal stage As Long) As Boolean
+    pl_StageDone = pl_SheetNonEmpty(pl_StageName(stage))
+End Function
+
+' First stage (1..PL_STG_COUNT) whose sheet is not done, scanning in order;
+' returns PL_STG_COUNT+1 when every stage is complete.
+Private Function pl_FirstIncompleteStage() As Long
+    Dim s As Long
+    s = PL_STG_COST
+    Do While s <= PL_STG_COUNT
+        If Not pl_StageDone(s) Then Exit Do
+        s = s + 1
+    Loop
+    pl_FirstIncompleteStage = s
+End Function
+
+Private Function pl_CompletedStagesText() As String
+    Dim s As Long, parts As String
+    For s = PL_STG_COST To PL_STG_COUNT
+        If pl_StageDone(s) Then
+            If Len(parts) > 0 Then parts = parts & ", "
+            parts = parts & pl_StageName(s) & " (" & _
+                    Format$(pl_SheetDataRows(pl_SheetByName(pl_StageName(s))), "#,##0") & " rows)"
+        End If
+    Next s
+    If Len(parts) = 0 Then parts = "(none)"
+    pl_CompletedStagesText = parts
+End Function
+
+Private Function pl_SheetByName(ByVal nm As String) As Worksheet
+    On Error Resume Next
+    Set pl_SheetByName = ThisWorkbook.Worksheets(nm)
+    On Error GoTo 0
+End Function
+
+Private Function pl_SheetNonEmpty(ByVal nm As String) As Boolean
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(nm)
+    If ws Is Nothing Then Exit Function
+    pl_SheetNonEmpty = (pl_SheetDataRows(ws) >= 1)
+End Function
+
+' Data rows on a sheet (rows below the header in column A).
+Private Function pl_SheetDataRows(ByVal ws As Worksheet) As Long
+    Dim lastRow As Long
+    If ws Is Nothing Then Exit Function
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lastRow > PL_HDR_ROW Then pl_SheetDataRows = lastRow - PL_HDR_ROW
+End Function
+
+' Clears every pipeline output + state sheet (for Restart). DisplayAlerts is
+' already suppressed by the caller so Delete does not prompt.
+Private Sub pl_ClearOutputs()
+    Dim nms As Variant, i As Long, ws As Worksheet
+    nms = Array(PL_SH_COST, PL_SH_SITE, PL_SH_MATRIX, PL_SH_ANALYSIS, PL_SH_STATE, PL_SH_SKIPPED, PL_SH_SITEONLY)
+    For i = LBound(nms) To UBound(nms)
+        Set ws = pl_SheetByName(CStr(nms(i)))
+        If Not ws Is Nothing Then ws.Delete
+    Next i
+End Sub
+
+' Marks a stage complete in _Pipeline State (created if absent) then saves the
+' workbook -- the per-stage checkpoint.
+Private Sub pl_SaveCheckpoint(ByRef log As PL_TLog, ByVal stage As Long, ByVal rows As Long)
+    pl_MarkStage stage, rows
+    pl_EnsureSaved
+    pl_LogAdd log, "Stage " & stage & " (" & pl_StageName(stage) & ") checkpoint written and saved (" & rows & " rows)."
+End Sub
+
+' Returns the _Pipeline State sheet, creating it (with the stage table) if absent.
+Private Function pl_EnsureStateSheet() As Worksheet
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(PL_SH_STATE)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_STATE
+        ws.Range("A1:D1").Value = Array("Stage", "Output Sheet", "Rows", "Completed")
+        ws.Rows(1).Font.Bold = True
+        Dim s As Long
+        For s = PL_STG_COST To PL_STG_COUNT
+            ws.Cells(1 + s, 1).Value = s
+            ws.Cells(1 + s, 2).Value = pl_StageName(s)
+            ws.Cells(1 + s, 3).Value = ""
+            ws.Cells(1 + s, 4).Value = "pending"
+        Next s
+        ws.Columns.AutoFit
+    End If
+    Set pl_EnsureStateSheet = ws
+End Function
+
+' Records one stage's completion (status, rows, timestamp) on _Pipeline State.
+Private Sub pl_MarkStage(ByVal stage As Long, ByVal rows As Long)
+    Dim ws As Worksheet: Set ws = pl_EnsureStateSheet()
+    ws.Cells(1 + stage, 3).Value = rows
+    ws.Cells(1 + stage, 4).Value = Format$(Now, "yyyy-mm-dd hh:nn:ss")
+End Sub
+
+' Persists the count of files the user SELECTED for a stage, on _Pipeline State,
+' so the file-level reconciliation (selected = contributed + skipped) can be
+' rebuilt from the sheets even after _Pipeline Log is deleted. Labeled rows below
+' the stage table; pl_ReadSelected looks the label up by name.
+Private Sub pl_RecordSelected(ByVal label As String, ByVal n As Long)
+    Dim ws As Worksheet: Set ws = pl_EnsureStateSheet()
+    Dim r As Long, lr As Long
+    lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For r = PL_STG_COUNT + 3 To lr           ' scan the labeled area below the stage table
+        If StrComp(Trim$(CStr(pl_NZ(ws.Cells(r, 1).Value))), label, vbTextCompare) = 0 Then
+            ws.Cells(r, 2).Value = n
+            Exit Sub
+        End If
+    Next r
+    Dim nr As Long: nr = lr + 1
+    If nr < PL_STG_COUNT + 3 Then nr = PL_STG_COUNT + 3
+    ws.Cells(nr, 1).Value = label
+    ws.Cells(nr, 2).Value = n
+End Sub
+
+' Reads a labeled selected-count from _Pipeline State; -1 when not recorded.
+Private Function pl_ReadSelected(ByVal label As String) As Long
+    pl_ReadSelected = -1
+    Dim ws As Worksheet: Set ws = pl_SheetByName(PL_SH_STATE)
+    If ws Is Nothing Then Exit Function
+    Dim r As Long, lr As Long
+    lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For r = 1 To lr
+        If StrComp(Trim$(CStr(pl_NZ(ws.Cells(r, 1).Value))), label, vbTextCompare) = 0 Then
+            If IsNumeric(ws.Cells(r, 2).Value) Then pl_ReadSelected = CLng(ws.Cells(r, 2).Value)
+            Exit Function
+        End If
+    Next r
+End Function
+
+' ---- Durable skip/fail record (survives a _Pipeline Log deletion) -----------
+' A file that failed or was skipped left NO rows in Cost Data, so its outcome
+' cannot be reconstructed from the output sheets. Persist it here so RebuildAudit
+' can complete the reconciliation. Recreated fresh at the start of Stage 1.
+
+Private Function pl_ResetSkips() As Worksheet
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(PL_SH_SKIPPED)
+    If Not ws Is Nothing Then
+        ws.Cells.Clear
+    Else
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_SKIPPED
+    End If
+    ws.Range("A1:H1").Value = Array("Stage", "File", "Sheet", "Outcome", _
+                                    "Intended Substation", "Loss / Coverage", "Reason", "Path")
+    ws.Rows(1).Font.Bold = True
+    pl_ResetSkips = ws
+End Function
+
+' Appends one skip/fail row to _Skipped Files (created if absent). Never raises.
+' outcome = categorized reason; intendedSub = the substation the file would have
+' been (from its tab name, if readable); loss = LOST / redundant / unknown flag;
+' path = the FULL source path (col H) so REPROCESS_SKIPPED can re-open the file.
+Private Sub pl_AppendSkip(ByVal stage As String, ByVal file As String, _
+                          ByVal sheet As String, ByVal outcome As String, _
+                          ByVal intendedSub As String, ByVal loss As String, _
+                          ByVal reason As String, ByVal path As String)
+    On Error Resume Next
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(PL_SH_SKIPPED)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_SKIPPED
+        ws.Range("A1:H1").Value = Array("Stage", "File", "Sheet", "Outcome", _
+                                        "Intended Substation", "Loss / Coverage", "Reason", "Path")
+        ws.Rows(1).Font.Bold = True
+    End If
+    Dim nr As Long: nr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    If nr < 2 Then nr = 2
+    ws.Cells(nr, 1).Value = stage
+    ws.Cells(nr, 2).Value = file
+    ws.Cells(nr, 3).Value = sheet
+    ws.Cells(nr, 4).Value = outcome
+    ws.Cells(nr, 5).Value = intendedSub
+    ws.Cells(nr, 6).Value = loss
+    ws.Cells(nr, 7).Value = reason
+    ws.Cells(nr, 8).Value = path
+    On Error GoTo 0
+End Sub
+
+' Reads distinct full source paths from column H of _Skipped Files whose Stage
+' (col A) begins with stagePrefix ("1" = cost, "2" = site), for REPROCESS_SKIPPED.
+' Returns False when the sheet is absent or holds no matching paths.
+Private Function pl_ReadSkippedPaths(ByVal stagePrefix As String, ByRef outPaths() As String, _
+                                     ByRef outCount As Long) As Boolean
+    outCount = 0
+    Dim ws As Worksheet: Set ws = pl_SheetByName(PL_SH_SKIPPED)
+    If ws Is Nothing Then
+        pl_ReadSkippedPaths = False
+        Exit Function
+    End If
+    Dim lr As Long: lr = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    If lr < 2 Then
+        pl_ReadSkippedPaths = False
+        Exit Function
+    End If
+    Dim seen As Object: Set seen = CreateObject("Scripting.Dictionary")
+    ReDim outPaths(1 To lr - 1)
+    Dim r As Long, p As String, k As String, stg As String
+    For r = 2 To lr
+        stg = Trim$(CStr(pl_NZ(ws.Cells(r, 1).Value)))
+        p = Trim$(CStr(pl_NZ(ws.Cells(r, 8).Value)))
+        If Len(p) > 0 And Left$(stg, Len(stagePrefix)) = stagePrefix Then
+            k = LCase$(p)
+            If Not seen.Exists(k) Then
+                seen.Add k, True
+                outCount = outCount + 1
+                outPaths(outCount) = p
+            End If
+        End If
+    Next r
+    If outCount > 0 Then ReDim Preserve outPaths(1 To outCount)
+    pl_ReadSkippedPaths = (outCount > 0)
+End Function
+
+' Incremental durable skip record for one cost file, written as it is processed
+' (so it survives even if a later file aborts the run). pl_AccountCostFiles later
+' rewrites the sheet with the LOST/redundant classification.
+Private Sub pl_AppendSkipRec(ByVal stage As String, ByRef rec As PL_TCostFile)
+    Dim oc As String: oc = rec.Outcome
+    If Len(oc) = 0 Then oc = rec.Status
+    If Len(oc) = 0 Then oc = "Skipped"
+    Dim rsn As String: rsn = rec.Message
+    If rec.ErrNum <> 0 Then rsn = rsn & " [Err #" & rec.ErrNum & " " & rec.ErrDesc & "]"
+    pl_AppendSkip stage, pl_FileName(rec.FilePath), rec.SheetName, oc, _
+                  rec.Substation, "(pending classification)", rsn, rec.FilePath
+End Sub
+
+' Saves the workbook, prompting once for a location if the host has never been
+' saved (blank workbook). A macro-enabled format is required.
+Private Sub pl_EnsureSaved()
+    If Len(ThisWorkbook.Path) > 0 Then
+        ThisWorkbook.Save
+    Else
+        pl_FirstSaveAs
+    End If
+End Sub
+
+Private Sub pl_FirstSaveAs()
+    Dim base As String, dflt As String, chosen As Variant
+    base = Application.DefaultFilePath
+    If Len(base) = 0 Then base = ThisWorkbook.Path
+    dflt = base & Application.PathSeparator & "InterconnectPipeline_" & Format$(Now, "yyyymmdd_hhnnss") & ".xlsm"
+
+    chosen = Application.GetSaveAsFilename(InitialFileName:=dflt, _
+                FileFilter:="Excel Macro-Enabled Workbook (*.xlsm), *.xlsm", _
+                Title:="Save the pipeline workbook (checkpoint target)")
+    If VarType(chosen) = vbBoolean Then
+        ' user cancelled the picker -> fall back to the timestamped default so a
+        ' checkpoint always has somewhere to go.
+        chosen = dflt
+    End If
+    ThisWorkbook.SaveAs Filename:=CStr(chosen), FileFormat:=PL_XLSM_FORMAT
+End Sub
+
+' Best-effort save used on failure paths: never prompts, never raises.
+Private Sub pl_TrySave()
+    On Error Resume Next
+    If Len(ThisWorkbook.Path) > 0 Then ThisWorkbook.Save
+    On Error GoTo 0
+End Sub
+
+' Clears (or creates) a canonical output sheet without prompting -- the
+' Resume/Restart choice is the single overwrite decision, so stages that run
+' always overwrite their own canonical sheet.
+Private Function pl_FreshSheet(ByVal baseName As String) As Worksheet
+    Dim ws As Worksheet, co As ChartObject
+    Set ws = pl_SheetByName(baseName)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = baseName
+    Else
+        On Error Resume Next
+        For Each co In ws.ChartObjects: co.Delete: Next co
+        On Error GoTo 0
+        ws.Cells.Clear
+    End If
+    Set pl_FreshSheet = ws
+End Function
+
+' ==========================================================================
+'  STAGE 1 -- CONSOLIDATE COST / RESULTS FILES  -> Cost Data  (bulk, silent)
+' ==========================================================================
+
+Private Function pl_ConsolidateCost(ByRef log As PL_TLog, ByRef wsCost As Worksheet) As Boolean
+    Dim phase As String: phase = "init"
+    Dim curFile As Long: curFile = 0
+    Dim processed As Long: processed = 0
+    Dim fileCount As Long: fileCount = 0
+    On Error GoTo ErrHandler
+    pl_ConsolidateCost = False
+
+    ' ---- file source: reprocess the known troublemakers, or the picker ----
+    Dim files() As String
+    phase = "select files"
+    If REPROCESS_SKIPPED Then
+        If Not pl_ReadSkippedPaths("1", files, fileCount) Then
+            pl_LogAdd log, "Step 1: REPROCESS_SKIPPED is on but '" & PL_SH_SKIPPED & "' holds no cost-file paths."
+            MsgBox "REPROCESS_SKIPPED is on, but no file paths were found on '" & PL_SH_SKIPPED & "'." & vbCrLf & _
+                   "Run a normal pass first (it records each skipped file's path), then reprocess.", _
+                   vbExclamation, "Interconnect Pipeline"
+            Exit Function
+        End If
+        pl_LogAdd log, "Step 1: REPROCESS_SKIPPED -- reprocessing " & fileCount & " file(s) from '" & PL_SH_SKIPPED & "'."
+    Else
+        If Not pl_PickFiles("Select the COST / results workbooks to consolidate", files, fileCount) Then
+            pl_LogAdd log, "Step 1: no cost files selected."
+            Exit Function
+        End If
+    End If
+
+    ' ---- fast test loop: cap the file count ----
+    If TEST_MAX_FILES > 0 And fileCount > TEST_MAX_FILES Then
+        fileCount = TEST_MAX_FILES
+        pl_LogAdd log, "TEST MODE: limited to " & fileCount & " files."
+    End If
+
+    Dim selectedCount As Long: selectedCount = fileCount
+    pl_LogAdd log, "STAGE 1 -- " & selectedCount & " cost file(s) selected."
+
+    ' Fresh durable skip record BEFORE the loops, so each skip/fail is written
+    ' incrementally as it is processed and survives even if a later file aborts.
+    ' In REPROCESS mode the sheet is the SOURCE list (and Stage 2 reads it too),
+    ' so it is preserved rather than cleared.
+    If Not REPROCESS_SKIPPED Then pl_ResetSkips
+
+    Dim recs() As PL_TCostFile
+    ReDim recs(1 To fileCount)
+
+    Dim i As Long, refSig As String, haveRef As Boolean
+    phase = "validation"
+    For i = 1 To fileCount
+        curFile = i
+        pl_Status "Stage 1: validating " & i & " of " & fileCount
+        recs(i).FilePath = files(i)
+        pl_ValidateCostFile recs(i)
+        If recs(i).IsValid Then
+            If Not haveRef Then
+                refSig = recs(i).HeaderSig: haveRef = True
+            ElseIf StrComp(recs(i).HeaderSig, refSig, vbTextCompare) <> 0 Then
+                recs(i).IsValid = False
+                recs(i).Status = "Failed"
+                recs(i).Outcome = "Skipped: header signature mismatch"
+                recs(i).Message = "Header signature mismatch vs first valid file"
+            End If
+        End If
+        If Not recs(i).IsValid Then pl_AppendSkipRec "1 Cost", recs(i)   ' incremental durable
+        DoEvents
+    Next i
+
+    Dim passCount As Long, failCount As Long, mismatch As Long
+    For i = 1 To fileCount
+        If recs(i).IsValid Then
+            passCount = passCount + 1
+        Else
+            failCount = failCount + 1
+            If InStr(1, recs(i).Message, "Header signature mismatch", vbTextCompare) > 0 Then _
+                mismatch = mismatch + 1
+        End If
+    Next i
+
+    If passCount = 0 And mismatch = 0 Then
+        pl_LogAdd log, "Step 1: no valid cost files (" & failCount & " failed)."
+        MsgBox "No valid cost files to consolidate.", vbExclamation, "Interconnect Pipeline"
+        Exit Function
+    End If
+
+    If mismatch > 0 Then
+        Dim ans As VbMsgBoxResult
+        ans = MsgBox(mismatch & " cost file(s) have a mismatched header signature." & vbCrLf & vbCrLf & _
+                     "Yes  = INCLUDE them anyway, aligned by column position" & vbCrLf & _
+                     "No   = SKIP the mismatched files" & vbCrLf & _
+                     "Cancel = ABORT step 1", vbYesNoCancel + vbQuestion, "Cost header mismatch")
+        Select Case ans
+            Case vbCancel
+                pl_LogAdd log, "Step 1: aborted at header-mismatch prompt."
+                Exit Function
+            Case vbYes
+                For i = 1 To fileCount
+                    If (Not recs(i).IsValid) And _
+                       InStr(1, recs(i).Message, "Header signature mismatch", vbTextCompare) > 0 Then
+                        recs(i).IsValid = True: recs(i).Status = "Imported"
+                        recs(i).Outcome = "Contributed"
+                        recs(i).Message = "Included despite header mismatch (aligned by column)"
+                    End If
+                Next i
+        End Select
+    End If
+
+    Dim firstValid As Long: firstValid = 0
+    For i = 1 To fileCount
+        If recs(i).IsValid Then
+            firstValid = i
+            Exit For
+        End If
+    Next i
+    If firstValid = 0 Then
+        pl_LogAdd log, "Step 1: no files remain."
+        Exit Function
+    End If
+
+    phase = "create Cost Data"
+    Set wsCost = pl_FreshSheet(PL_SH_COST)
+    If wsCost Is Nothing Then
+        pl_LogAdd log, "Step 1: could not create the Cost Data sheet."
+        Exit Function
+    End If
+
+    Dim headerCols As Long: headerCols = recs(firstValid).UsedCols
+    wsCost.Cells(1, 1).Value = PL_HDR_NAME
+    wsCost.Cells(1, 2).Value = PL_HDR_VOLT
+    wsCost.Cells(1, 3).Value = "Source File"
+    wsCost.Cells(1, 4).Value = "Source Sheet"
+    phase = "copy headers"
+    pl_CopyCostHeaders wsCost, recs(firstValid)
+
+    Dim nextRow As Long, totalRows As Long, hitLimit As Boolean
+    nextRow = 2
+    phase = "append"
+    For i = 1 To fileCount
+        curFile = i
+        If recs(i).IsValid Then
+            pl_Status "Stage 1: consolidating " & i & " of " & fileCount & " -- " & pl_FileName(recs(i).FilePath)
+            If pl_AppendCostFile(wsCost, recs(i), headerCols, nextRow) Then
+                If recs(i).RowsImported > 0 Then
+                    processed = processed + 1: totalRows = totalRows + recs(i).RowsImported
+                Else
+                    pl_AppendSkipRec "1 Cost", recs(i)   ' valid but 0 rows / failed on reopen
+                End If
+            Else
+                hitLimit = True: Exit For
+            End If
+            DoEvents
+        ElseIf recs(i).Status <> "Failed" Then
+            recs(i).Status = "Skipped"
+        End If
+    Next i
+
+    wsCost.Rows(1).Font.Bold = True
+    wsCost.Columns.AutoFit
+
+    ' ---- account for EVERY selected file (rewrites _Skipped Files with the
+    '      classified rows, replacing the incremental ones). ----
+    phase = "reconcile"
+    Dim contributed As Long, skipped As Long, lost As Long, redundant As Long, unknown As Long
+    pl_AccountCostFiles recs, fileCount, log, contributed, skipped, lost, redundant, unknown
+    If hitLimit Then pl_LogAdd log, "  Worksheet row limit reached; import truncated (later files unprocessed)."
+
+    pl_RecordSelected "Cost Files Selected", selectedCount
+
+    Dim accounted As Long: accounted = contributed + skipped
+    pl_LogAdd log, "STAGE 1 -- Cost Data (" & wsCost.Name & "): " & selectedCount & " selected = " & _
+                   contributed & " contributed + " & skipped & " not contributed" & _
+                   "  (" & totalRows & " data rows)."
+    pl_LogAdd log, "  Of the " & skipped & " not contributed: " & lost & " LOST (unique substation missing), " & _
+                   redundant & " redundant (substation covered elsewhere), " & unknown & " unreadable/unknown."
+    If accounted <> selectedCount Then
+        pl_LogAdd log, "  *** UNACCOUNTED: " & (selectedCount - accounted) & " selected file(s) neither " & _
+                       "contributed nor recorded as skipped -- investigate. ***"
+    End If
+    Debug.Assert accounted = selectedCount
+
+    pl_ConsolidateCost = (totalRows > 0)
+    Exit Function
+
+ErrHandler:
+    ' Pinpoint where Stage 1 failed: phase, file index, how far it got.
+    pl_LogAdd log, "STAGE 1 FAILED in phase '" & phase & "' at file " & curFile & " of " & fileCount & _
+                   " (contributed " & processed & "): #" & Err.Number & " '" & Err.Description & _
+                   "' src='" & Err.Source & "'."
+    ' A run always reaches its log + skipped-files record, even on abort.
+    On Error Resume Next
+    pl_WriteLog log
+    On Error GoTo 0
+    pl_ConsolidateCost = False
+End Function
+
+' Accounts for every selected cost file. Builds the set of substations actually
+' covered (any file that contributed >=1 row), then for each file:
+'   * contributed (rows > 0)          -> counted, no skip row
+'   * skipped, intended sub missing   -> LOST (only source for that substation)
+'   * skipped, intended sub covered   -> redundant (another file supplied it)
+'   * skipped, substation unreadable  -> unknown
+' Writes one _Pipeline Log line per file (outcome + reason) and one _Skipped
+' Files row per non-contributor. Counts are returned by ref for the headline
+' reconciliation. Pure over recs()/sheets -- the self-test drives it directly.
+Private Sub pl_AccountCostFiles(ByRef recs() As PL_TCostFile, ByVal fileCount As Long, _
+                                ByRef log As PL_TLog, ByRef contributed As Long, _
+                                ByRef skipped As Long, ByRef lost As Long, _
+                                ByRef redundant As Long, ByRef unknown As Long)
+    contributed = 0: skipped = 0: lost = 0: redundant = 0: unknown = 0
+
+    ' Rewrite _Skipped Files with the authoritative CLASSIFIED rows, replacing the
+    ' incremental (crash-safety) rows written during the loop. In REPROCESS mode
+    ' the sheet is the source list (shared with Stage 2), so it is left intact.
+    If Not REPROCESS_SKIPPED Then pl_ResetSkips
+
+    ' 1) substations actually covered (from every contributing file)
+    Dim dCov As Object: Set dCov = CreateObject("Scripting.Dictionary")
+    Dim i As Long, ck As String
+    For i = 1 To fileCount
+        If recs(i).RowsImported > 0 Then
+            ck = pl_CostKey(recs(i).Substation, recs(i).Voltage, recs(i).VoltParsed)
+            If Not dCov.Exists(ck) Then dCov.Add ck, True
+        End If
+    Next i
+
+    ' 2) classify + record every file
+    Dim intended As String, oc As String, k2 As String
+    For i = 1 To fileCount
+        If recs(i).RowsImported > 0 Then
+            contributed = contributed + 1
+            recs(i).Loss = ""
+        Else
+            skipped = skipped + 1
+            intended = Trim$(recs(i).Substation)
+            If Len(intended) = 0 Then
+                recs(i).Loss = "unknown (substation unreadable)"
+                unknown = unknown + 1
+            Else
+                k2 = pl_CostKey(intended, recs(i).Voltage, recs(i).VoltParsed)
+                If dCov.Exists(k2) Then
+                    recs(i).Loss = "redundant skip (substation covered)"
+                    redundant = redundant + 1
+                Else
+                    recs(i).Loss = "LOST -- only source for this substation"
+                    lost = lost + 1
+                End If
+            End If
+            oc = recs(i).Outcome
+            If Len(oc) = 0 Then oc = "Skipped: no rows imported"
+            Dim rsn As String: rsn = recs(i).Message
+            If recs(i).ErrNum <> 0 Then rsn = rsn & " [Err #" & recs(i).ErrNum & " " & recs(i).ErrDesc & "]"
+            pl_AppendSkip "1 Cost", pl_FileName(recs(i).FilePath), recs(i).SheetName, _
+                          oc, intended, recs(i).Loss, rsn, recs(i).FilePath
+        End If
+
+        ' one log line per file, contributors and non-contributors alike
+        pl_LogAdd log, "  [" & IIf(recs(i).RowsImported > 0, "Contributed", _
+                       IIf(Len(recs(i).Outcome) > 0, recs(i).Outcome, "Skipped")) & "] " & _
+                       pl_FileName(recs(i).FilePath) & " | sub='" & recs(i).Substation & "'" & _
+                       " rows=" & recs(i).RowsImported & _
+                       IIf(recs(i).RowsImported = 0 And Len(recs(i).Loss) > 0, " | " & recs(i).Loss, "") & _
+                       IIf(Len(recs(i).Message) > 0, " -- " & recs(i).Message, "")
+    Next i
+End Sub
+
+Private Sub pl_ValidateCostFile(ByRef rec As PL_TCostFile)
+    Dim wb As Workbook, ws As Worksheet
+    rec.IsValid = False: rec.Status = "Failed": rec.Outcome = ""
+
+    On Error GoTo OpenFail
+    Set wb = Application.Workbooks.Open(Filename:=rec.FilePath, UpdateLinks:=0, _
+                                        ReadOnly:=True, AddToMru:=False)
+    On Error GoTo CloseFail
+    If wb Is Nothing Then
+        rec.Outcome = "Failed: open error"
+        rec.Message = "Workbooks.Open returned Nothing"
+        Exit Sub
+    End If
+
+    ' Locate the data sheet by CONTENT -- the worksheet whose leading rows carry
+    ' the known cost headers -- instead of assuming a fixed tab index. This
+    ' recovers files where the data sheet is not the 3rd tab. When no sheet
+    ' matches, pl_LocateCostSheet sets the precise outcome (sheet not found /
+    ' header not found, with the headers actually seen).
+    Set ws = pl_LocateCostSheet(wb, rec)
+    If ws Is Nothing Then GoTo CloseAndExit    ' Outcome + Message already set
+
+    rec.SheetName = ws.Name
+    If Not pl_MeasureSheet(ws, rec) Then
+        ' the sheet had headers (that's why it was chosen) but nothing below them
+        rec.Outcome = "Skipped: no data rows"
+        GoTo CloseAndExit
+    End If
+
+    rec.HeaderSig = pl_HeaderSig(ws, rec.UsedCols, rec.HeaderRow)
+    pl_ParseTab rec.SheetName, rec.Substation, rec.Voltage, rec.VoltParsed
+    If Len(Trim$(rec.Substation)) = 0 Then
+        rec.Outcome = "Skipped: empty substation name"
+        rec.Message = "tab name '" & rec.SheetName & "' parsed to an empty substation"
+        GoTo CloseAndExit
+    End If
+    rec.IsValid = True: rec.Status = "Imported": rec.Outcome = "Contributed": rec.Message = ""
+
+CloseAndExit:
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
+    Set wb = Nothing
+    Exit Sub
+OpenFail:
+    rec.Outcome = "Failed: open error"
+    rec.Message = "Could not open: " & Err.Description
+    Exit Sub
+CloseFail:
+    rec.Outcome = "Failed: open error"
+    rec.Message = "Error inspecting workbook: " & Err.Description
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
+End Sub
+
+' Finds the worksheet that holds the cost data by CONTENT: the first worksheet
+' whose leading rows contain both known headers. Returns Nothing and sets a
+' precise skip Outcome/Message when none matches (recording the headers actually
+' seen on the best-guess sheet, so a wording mismatch is visible in the audit).
+Private Function pl_LocateCostSheet(ByVal wb As Workbook, ByRef rec As PL_TCostFile) As Worksheet
+    Dim ws As Worksheet, ur As Range
+    Dim fr As Long, lc As Long, lr As Long, hr As Long
+    Dim wsCount As Long: wsCount = 0
+    Dim firstWs As Worksheet
+    For Each ws In wb.Worksheets
+        wsCount = wsCount + 1
+        If firstWs Is Nothing Then Set firstWs = ws
+        Set ur = ws.UsedRange
+        If Not ur Is Nothing Then
+            fr = ur.Row
+            lc = ur.Column + ur.Columns.Count - 1
+            lr = ur.Row + ur.Rows.Count - 1
+            hr = pl_DetectHeaderRow(ws, fr, lr, lc)
+            If hr > 0 Then
+                Set pl_LocateCostSheet = ws
+                Exit Function
+            End If
+        End If
+    Next ws
+
+    ' No worksheet carried the known headers -- categorize precisely.
+    If wsCount = 0 Then
+        rec.Outcome = "Skipped: sheet not found"
+        rec.Message = "workbook contains no worksheets"
+    Else
+        rec.Outcome = "Skipped: header not found"
+        Dim probe As Worksheet
+        If wb.Worksheets.Count >= PL_COST_DATA_IDX Then
+            Set probe = wb.Worksheets(PL_COST_DATA_IDX)
+        Else
+            Set probe = firstWs
+        End If
+        rec.SheetName = probe.Name
+        rec.SeenHeaders = pl_TopRowText(probe)
+        rec.Message = "no worksheet contains '" & PL_HDR_TRIGGER & "' + '" & PL_HDR_ALLOC & _
+                      "'; headers seen on '" & probe.Name & "': " & rec.SeenHeaders
+    End If
+    Set pl_LocateCostSheet = Nothing
+End Function
+
+' Returns the most-populated of the first few rows of a sheet as a readable
+' "a | b | c" string (trimmed, empties collapsed, capped) -- used to show the
+' headers actually present when the known headers weren't found.
+Private Function pl_TopRowText(ByVal ws As Worksheet) As String
+    Dim ur As Range: Set ur = ws.UsedRange
+    If ur Is Nothing Then
+        pl_TopRowText = "(empty sheet)"
+        Exit Function
+    End If
+    Dim fr As Long: fr = ur.Row
+    Dim lc As Long: lc = ur.Column + ur.Columns.Count - 1
+    Dim lrEnd As Long: lrEnd = ur.Row + ur.Rows.Count - 1
+    Dim rEnd As Long: rEnd = fr + 4
+    If rEnd > lrEnd Then rEnd = lrEnd
+    If lc > 40 Then lc = 40                      ' cap the scan width
+    Dim best As String, bestCnt As Long
+    Dim r As Long, c As Long, cnt As Long, t As String, v As Variant
+    Dim parts() As String
+    For r = fr To rEnd
+        v = ws.Range(ws.Cells(r, 1), ws.Cells(r, lc)).Value
+        ReDim parts(1 To lc)
+        cnt = 0
+        For c = 1 To lc
+            If lc = 1 Then
+                t = Trim$(CStr(pl_NZ(v)))
+            Else
+                t = Trim$(CStr(pl_NZ(v(1, c))))
+            End If
+            parts(c) = t
+            If Len(t) > 0 Then cnt = cnt + 1
+        Next c
+        If cnt > bestCnt Then
+            bestCnt = cnt
+            best = Join(parts, " | ")
+        End If
+    Next r
+    Do While InStr(best, " |  | ") > 0
+        best = Replace(best, " |  | ", " | ")
+    Loop
+    best = Trim$(best)
+    Do While Left$(best, 2) = "| "
+        best = Trim$(Mid$(best, 3))
+    Loop
+    Do While Right$(best, 2) = " |"
+        best = Trim$(Left$(best, Len(best) - 2))
+    Loop
+    If Len(best) > 200 Then best = Left$(best, 197) & "..."
+    If Len(best) = 0 Then best = "(no header text)"
+    pl_TopRowText = best
+End Function
+
+Private Function pl_MeasureSheet(ByVal ws As Worksheet, ByRef rec As PL_TCostFile) As Boolean
+    Dim ur As Range, lastCol As Long, lastRow As Long, firstRow As Long, hdrRow As Long
+    pl_MeasureSheet = False
+    Set ur = ws.UsedRange
+    If ur Is Nothing Then
+        rec.Message = "Sheet is empty"
+        Exit Function
+    End If
+    firstRow = ur.Row
+    lastCol = ur.Column + ur.Columns.Count - 1
+    lastRow = ur.Row + ur.Rows.Count - 1
+
+    ' Detect the HEADER row -- the row that carries the field names -- rather
+    ' than assuming row 1. Source sheets have a "band" row above the header
+    ' (e.g. Monitored Element / Worst Case Contingency / Cost Allocation), so a
+    ' fixed row-1 header would grab that band and push the real header into the
+    ' data. The header is the first row (of the leading scan window) that
+    ' contains both known field names, normalized.
+    hdrRow = pl_DetectHeaderRow(ws, firstRow, lastRow, lastCol)
+    If hdrRow = 0 Then
+        rec.Message = "Could not find a header row containing '" & PL_HDR_TRIGGER & "' and '" & _
+                      PL_HDR_ALLOC & "' in the first rows"
+        Exit Function
+    End If
+    If lastRow <= hdrRow Then
+        rec.Message = "No data rows below the detected header (row " & hdrRow & ")"
+        Exit Function
+    End If
+
+    rec.HeaderRow = hdrRow
+    rec.UsedCols = lastCol
+    rec.FirstDataRow = hdrRow + 1
+    rec.LastDataRow = lastRow
+    pl_MeasureSheet = True
+End Function
+
+' Scans a leading window of rows and returns the first that CONTAINS both known
+' field names (normalized match); 0 if none. This is the header, data begins on
+' the next row -- never a hardcoded row number.
+Private Function pl_DetectHeaderRow(ByVal ws As Worksheet, ByVal firstRow As Long, _
+                                    ByVal lastRow As Long, ByVal lastCol As Long) As Long
+    Const SCAN_ROWS As Long = 20
+    Dim rEnd As Long: rEnd = firstRow + SCAN_ROWS - 1
+    If rEnd > lastRow Then rEnd = lastRow
+    Dim r As Long
+    For r = firstRow To rEnd
+        If pl_RowHasCostHeaders(ws, r, lastCol) Then
+            pl_DetectHeaderRow = r
+            Exit Function
+        End If
+    Next r
+    pl_DetectHeaderRow = 0
+End Function
+
+' True when row r contains BOTH the trigger and allocation field names
+' (whitespace/case-normalized), i.e. it is the real field-name header.
+Private Function pl_RowHasCostHeaders(ByVal ws As Worksheet, ByVal r As Long, ByVal lastCol As Long) As Boolean
+    Dim v As Variant, c As Long, t As String
+    Dim foundTrig As Boolean, foundAlloc As Boolean
+    Dim wantTrig As String, wantAlloc As String
+    wantTrig = pl_NormHdr(PL_HDR_TRIGGER)
+    wantAlloc = pl_NormHdr(PL_HDR_ALLOC)
+    v = ws.Range(ws.Cells(r, 1), ws.Cells(r, lastCol)).Value
+    For c = 1 To lastCol
+        If lastCol = 1 Then
+            t = pl_NormHdr(CStr(pl_NZ(v)))
+        Else
+            t = pl_NormHdr(CStr(pl_NZ(v(1, c))))
+        End If
+        If t = wantTrig Then foundTrig = True
+        If t = wantAlloc Then foundAlloc = True
+    Next c
+    pl_RowHasCostHeaders = foundTrig And foundAlloc
+End Function
+
+' Normalizes a header cell for matching: strip non-breaking spaces, line breaks
+' and tabs to spaces, collapse runs of whitespace, trim, lower-case.
+Private Function pl_NormHdr(ByVal s As String) As String
+    Dim t As String
+    t = s
+    t = Replace(t, Chr$(160), " ")     ' non-breaking space
+    t = Replace(t, vbCr, " ")
+    t = Replace(t, vbLf, " ")
+    t = Replace(t, vbTab, " ")
+    Do While InStr(t, "  ") > 0
+        t = Replace(t, "  ", " ")
+    Loop
+    pl_NormHdr = LCase$(Trim$(t))
+End Function
+
+Private Function pl_HeaderSig(ByVal ws As Worksheet, ByVal usedCols As Long, ByVal headerRow As Long) As String
+    Dim c As Long, parts() As String
+    ReDim parts(1 To usedCols)
+    Dim hv As Variant
+    hv = ws.Range(ws.Cells(headerRow, 1), ws.Cells(headerRow, usedCols)).Value
+    For c = 1 To usedCols
+        If usedCols = 1 Then
+            parts(c) = Trim$(CStr(pl_NZ(hv)))
+        Else
+            parts(c) = Trim$(CStr(pl_NZ(hv(1, c))))
+        End If
+    Next c
+    pl_HeaderSig = Join(parts, "|")
+End Function
+
+' Returns the worksheet a per-file reopen should use: the VALIDATED sheet by
+' NAME first (pl_LocateCostSheet chose it by content, so a fixed index would grab
+' the wrong tab or a missing one and throw error 9/91), falling back to the index
+' only when the name is absent. Every lookup is guarded; returns Nothing (never
+' raises) so callers can log-and-skip. wb Is Nothing is tolerated.
+Private Function pl_WorksheetByNameOrIdx(ByVal wb As Workbook, ByVal nm As String, _
+                                         ByVal idx As Long) As Worksheet
+    Dim ws As Worksheet
+    If wb Is Nothing Then
+        Set pl_WorksheetByNameOrIdx = Nothing
+        Exit Function
+    End If
+    If Len(nm) > 0 Then
+        On Error Resume Next
+        Set ws = wb.Worksheets(nm)
+        On Error GoTo 0
+    End If
+    If ws Is Nothing And idx >= 1 Then
+        On Error Resume Next
+        If wb.Worksheets.Count >= idx Then Set ws = wb.Worksheets(idx)
+        On Error GoTo 0
+    End If
+    Set pl_WorksheetByNameOrIdx = ws
+End Function
+
+Private Sub pl_CopyCostHeaders(ByVal wsCost As Worksheet, ByRef rec As PL_TCostFile)
+    Dim wb As Workbook, ws As Worksheet, c As Long, hv As Variant
+    On Error GoTo Done
+    Set wb = Application.Workbooks.Open(Filename:=rec.FilePath, UpdateLinks:=0, _
+                                        ReadOnly:=True, AddToMru:=False)
+    If wb Is Nothing Then GoTo Done
+    ' Use the VALIDATED sheet by name, not a fixed index (which read the wrong
+    ' sheet / threw error 91 when the data was not on the 3rd tab).
+    Set ws = pl_WorksheetByNameOrIdx(wb, rec.SheetName, PL_COST_DATA_IDX)
+    If ws Is Nothing Then GoTo Done
+    hv = ws.Range(ws.Cells(rec.HeaderRow, 1), ws.Cells(rec.HeaderRow, rec.UsedCols)).Value
+    Dim outHdr() As Variant: ReDim outHdr(1 To 1, 1 To rec.UsedCols)
+    For c = 1 To rec.UsedCols
+        If rec.UsedCols = 1 Then
+            outHdr(1, c) = hv
+        Else
+            outHdr(1, c) = hv(1, c)
+        End If
+    Next c
+    wsCost.Range(wsCost.Cells(1, 5), wsCost.Cells(1, 4 + rec.UsedCols)).Value = outHdr
+Done:
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
+End Sub
+
+Private Function pl_AppendCostFile(ByVal wsCost As Worksheet, ByRef rec As PL_TCostFile, _
+                                   ByVal headerCols As Long, ByRef nextRow As Long) As Boolean
+    Dim wb As Workbook, ws As Worksheet
+    Dim srcVals As Variant, outBlock() As Variant
+    Dim srcRows As Long, srcCols As Long, writeCols As Long
+    Dim r As Long, c As Long, outR As Long
+
+    pl_AppendCostFile = True: rec.RowsImported = 0
+    On Error GoTo Fail
+    Set wb = Application.Workbooks.Open(Filename:=rec.FilePath, UpdateLinks:=0, _
+                                        ReadOnly:=True, AddToMru:=False)
+    If wb Is Nothing Then
+        rec.Status = "Failed": rec.Outcome = "Failed: open error"
+        rec.Message = "Workbooks.Open returned Nothing"
+        Exit Function
+    End If
+    ' Use the VALIDATED sheet by name, not a fixed index (error-91 root cause).
+    Set ws = pl_WorksheetByNameOrIdx(wb, rec.SheetName, PL_COST_DATA_IDX)
+    If ws Is Nothing Then
+        rec.Status = "Failed": rec.Outcome = "Failed: sheet not found on reopen"
+        rec.Message = "validated sheet '" & rec.SheetName & "' not found when re-opening to append"
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    srcVals = pl_BlockRead(ws, rec.FirstDataRow, rec.LastDataRow, rec.UsedCols)
+    If IsEmpty(srcVals) Then
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    srcRows = UBound(srcVals, 1) - LBound(srcVals, 1) + 1
+    srcCols = UBound(srcVals, 2) - LBound(srcVals, 2) + 1
+    writeCols = headerCols
+    If srcCols < writeCols Then writeCols = srcCols
+
+    If nextRow + srcRows - 1 > PL_EXCEL_MAX_ROWS Then
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        pl_AppendCostFile = False: Exit Function
+    End If
+
+    ReDim outBlock(1 To srcRows, 1 To 4 + writeCols)
+    outR = 0
+    Dim hdrSkipped As Long: hdrSkipped = 0
+    For r = 1 To srcRows
+        ' Data rows only: skip blanks and any row that re-states the source
+        ' header (guards against a header re-detected mid-data, which would
+        ' otherwise pollute every downstream MINIFS/SUMIFS/grouping scan).
+        If pl_RowBlank(srcVals, r, srcCols) Then
+            ' blank -> skip
+        ElseIf StrComp(pl_RowSig(srcVals, r, srcCols), rec.HeaderSig, vbTextCompare) = 0 Then
+            hdrSkipped = hdrSkipped + 1
+        Else
+            outR = outR + 1
+            outBlock(outR, 1) = rec.Substation
+            If rec.VoltParsed Then
+                outBlock(outR, 2) = rec.Voltage
+            Else
+                outBlock(outR, 2) = ""
+            End If
+            outBlock(outR, 3) = rec.FilePath
+            outBlock(outR, 4) = rec.SheetName
+            For c = 1 To writeCols
+                outBlock(outR, 4 + c) = srcVals(r, c)
+            Next c
+        End If
+    Next r
+    If hdrSkipped > 0 Then rec.Message = "Skipped " & hdrSkipped & " stray header row(s)"
+
+    If outR > 0 Then
+        wsCost.Range(wsCost.Cells(nextRow, 1), _
+                     wsCost.Cells(nextRow + outR - 1, 4 + writeCols)).Value = _
+            pl_TrimRows(outBlock, outR, 4 + writeCols)
+        nextRow = nextRow + outR
+        rec.RowsImported = outR
+    End If
+
+    On Error Resume Next
+    wb.Close SaveChanges:=False
+    On Error GoTo 0
+    Exit Function
+Fail:
+    rec.ErrNum = Err.Number: rec.ErrDesc = Err.Description
+    rec.Status = "Failed": rec.Outcome = "Failed: append error"
+    rec.Message = "Import error #" & rec.ErrNum & ": " & rec.ErrDesc: rec.RowsImported = 0
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
+    pl_AppendCostFile = True     ' one file's failure never aborts the run
+End Function
+
+' ==========================================================================
+'  STAGE 2 -- CONSOLIDATE SITE FILES -> Site Data  (dictionary dedupe, O(N))
+' ==========================================================================
+
+Private Function pl_ConsolidateSite(ByRef log As PL_TLog, ByRef wsSite As Worksheet, _
+                                    ByRef distinctCount As Long) As Boolean
+    Dim phase As String: phase = "init"
+    Dim curFile As Long: curFile = 0
+    Dim fileCount As Long: fileCount = 0
+    On Error GoTo ErrHandler
+    pl_ConsolidateSite = False
+
+    ' ---- file source: reprocess the site troublemakers, or the picker ----
+    Dim files() As String
+    phase = "select files"
+    If REPROCESS_SKIPPED Then
+        If Not pl_ReadSkippedPaths("2", files, fileCount) Then
+            pl_LogAdd log, "Step 2: REPROCESS_SKIPPED is on but '" & PL_SH_SKIPPED & "' holds no site-file paths."
+            MsgBox "REPROCESS_SKIPPED is on, but no site-file paths were found on '" & PL_SH_SKIPPED & "'.", _
+                   vbExclamation, "Interconnect Pipeline"
+            Exit Function
+        End If
+        pl_LogAdd log, "Step 2: REPROCESS_SKIPPED -- reprocessing " & fileCount & " site file(s)."
+    Else
+        If Not pl_PickFiles("Select the SITE / dedupe workbooks to consolidate", files, fileCount) Then
+            pl_LogAdd log, "Step 2: no site files selected."
+            Exit Function
+        End If
+    End If
+
+    If TEST_MAX_FILES > 0 And fileCount > TEST_MAX_FILES Then
+        fileCount = TEST_MAX_FILES
+        pl_LogAdd log, "TEST MODE: limited to " & fileCount & " files."
+    End If
+
+    Dim rawName() As String, rawState() As String, rawVolt() As Double
+    Dim rawVoltP() As Boolean, rawFile() As String, rawRow() As Long, rawN As Long
+    Dim rawLat() As Double, rawLng() As Double, rawGeo() As Boolean
+    rawN = 0
+    ReDim rawName(1 To 16): ReDim rawState(1 To 16): ReDim rawVolt(1 To 16)
+    ReDim rawVoltP(1 To 16): ReDim rawFile(1 To 16): ReDim rawRow(1 To 16)
+    ReDim rawLat(1 To 16): ReDim rawLng(1 To 16): ReDim rawGeo(1 To 16)
+
+    Dim i As Long
+    phase = "read"
+    For i = 1 To fileCount
+        curFile = i
+        pl_Status "Stage 2: reading " & i & " of " & fileCount & " -- " & pl_FileName(files(i))
+        pl_ReadSiteFile files(i), log, rawName, rawState, rawVolt, rawVoltP, _
+                        rawFile, rawRow, rawLat, rawLng, rawGeo, rawN
+        DoEvents
+    Next i
+
+    If rawN = 0 Then
+        pl_LogAdd log, "Step 2: no site rows found."
+        MsgBox "No usable rows found on the Summary tabs.", vbExclamation, "Interconnect Pipeline"
+        Exit Function
+    End If
+
+    phase = "dedupe"
+    Dim dt() As PL_TSiteTriple, dropped As Long
+    distinctCount = pl_DedupTriples(rawName, rawVolt, rawVoltP, rawState, rawN, _
+                                    rawFile, rawRow, rawLat, rawLng, rawGeo, dt, log, dropped)
+
+    Set wsSite = pl_FreshSheet(PL_SH_SITE)
+    If wsSite Is Nothing Then
+        pl_LogAdd log, "Step 2: could not create the Site Data sheet."
+        Exit Function
+    End If
+
+    ' Site Data: A=name B=state C=voltage D=Lat E=Long (lat/long are metadata).
+    Dim block() As Variant: ReDim block(1 To distinctCount + 1, 1 To 5)
+    block(1, 1) = PL_HDR_NAME: block(1, 2) = "State": block(1, 3) = PL_HDR_VOLT
+    block(1, 4) = "Lat": block(1, 5) = "Long"
+    For i = 1 To distinctCount
+        block(i + 1, 1) = dt(i).Name
+        block(i + 1, 2) = dt(i).State
+        If dt(i).VoltParsed Then
+            block(i + 1, 3) = dt(i).Voltage
+        Else
+            block(i + 1, 3) = ""
+        End If
+        If dt(i).HasGeo Then
+            block(i + 1, 4) = dt(i).Lat
+            block(i + 1, 5) = dt(i).Lng
+        Else
+            block(i + 1, 4) = ""
+            block(i + 1, 5) = ""
+        End If
+    Next i
+    wsSite.Range(wsSite.Cells(1, 1), wsSite.Cells(distinctCount + 1, 5)).Value = block
+    wsSite.Rows(1).Font.Bold = True
+    wsSite.Columns.AutoFit
+
+    pl_LogAdd log, "STAGE 2 -- Site Data (" & wsSite.Name & "): " & rawN & " raw row(s), " & _
+                   dropped & " duplicate(s) dropped, " & distinctCount & " distinct triple(s)."
+    pl_ConsolidateSite = True
+    Exit Function
+
+ErrHandler:
+    pl_LogAdd log, "STAGE 2 FAILED in phase '" & phase & "' at file " & curFile & " of " & fileCount & _
+                   ": #" & Err.Number & " '" & Err.Description & "' src='" & Err.Source & "'."
+    On Error Resume Next
+    pl_WriteLog log
+    On Error GoTo 0
+    pl_ConsolidateSite = False
+End Function
+
+Private Sub pl_ReadSiteFile(ByVal path As String, ByRef log As PL_TLog, _
+                            ByRef rawName() As String, ByRef rawState() As String, _
+                            ByRef rawVolt() As Double, ByRef rawVoltP() As Boolean, _
+                            ByRef rawFile() As String, ByRef rawRow() As Long, _
+                            ByRef rawLat() As Double, ByRef rawLng() As Double, _
+                            ByRef rawGeo() As Boolean, ByRef rawN As Long)
+    Dim wb As Workbook, ws As Worksheet, ur As Range, lastRow As Long, r As Long, vals As Variant
+    On Error GoTo Fail
+    Set wb = Application.Workbooks.Open(Filename:=path, UpdateLinks:=0, ReadOnly:=True, AddToMru:=False)
+    If wb Is Nothing Then
+        pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- open returned Nothing"
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Failed: open error", "", "", "Workbooks.Open returned Nothing", path
+        Exit Sub
+    End If
+
+    On Error Resume Next
+    Set ws = wb.Worksheets(PL_SITE_TAB)
+    On Error GoTo Fail
+    If ws Is Nothing Then
+        pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- no '" & PL_SITE_TAB & "' tab"
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped: sheet not found", "", "", "no '" & PL_SITE_TAB & "' tab", path
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    Set ur = ws.UsedRange
+    lastRow = ur.Row + ur.Rows.Count - 1
+    If lastRow <= PL_HDR_ROW Then
+        pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- Summary has no data rows"
+        pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Skipped: no data rows", "", "", "Summary has no data rows", path
+        On Error Resume Next
+        wb.Close SaveChanges:=False
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    ' One bulk read of columns A..G (name=A, state=C, lat=D, long=E, voltage=G).
+    vals = ws.Range(ws.Cells(PL_HDR_ROW + 1, 1), ws.Cells(lastRow, PL_SITE_VOLT_COL)).Value
+    ' Summary header (row 1) values, to guard against a header re-detected in
+    ' the data -- data rows only.
+    Dim hName As String, hState As String, hVolt As String
+    hName = Trim$(CStr(pl_NZ(ws.Cells(PL_HDR_ROW, PL_SITE_NAME_COL).Value)))
+    hState = Trim$(CStr(pl_NZ(ws.Cells(PL_HDR_ROW, PL_SITE_STATE_COL).Value)))
+    hVolt = Trim$(CStr(pl_NZ(ws.Cells(PL_HDR_ROW, PL_SITE_VOLT_COL).Value)))
+    Dim added As Long: added = 0
+    Dim rows As Long
+    If IsArray(vals) Then
+        rows = UBound(vals, 1)
+    Else
+        rows = 1
+    End If
+
+    For r = 1 To rows
+        Dim nm As String, stt As String, vv As Variant, vStr As String, latV As Variant, lonV As Variant
+        If IsArray(vals) Then
+            nm = Trim$(CStr(pl_NZ(vals(r, PL_SITE_NAME_COL))))
+            stt = Trim$(CStr(pl_NZ(vals(r, PL_SITE_STATE_COL))))
+            vv = vals(r, PL_SITE_VOLT_COL)
+            latV = vals(r, PL_SITE_LAT_COL)
+            lonV = vals(r, PL_SITE_LON_COL)
+        Else
+            nm = Trim$(CStr(pl_NZ(vals)))     ' single-cell degenerate
+            stt = "": vv = "": latV = "": lonV = ""
+        End If
+        vStr = Trim$(CStr(pl_NZ(vv)))
+        Dim isHdr As Boolean
+        isHdr = (StrComp(nm, hName, vbTextCompare) = 0) And _
+                (StrComp(stt, hState, vbTextCompare) = 0) And _
+                (StrComp(vStr, hVolt, vbTextCompare) = 0)
+        If Len(nm) > 0 And Not isHdr Then
+            rawN = rawN + 1
+            If rawN > UBound(rawName) Then _
+                pl_GrowRaw rawName, rawState, rawVolt, rawVoltP, rawFile, rawRow, rawLat, rawLng, rawGeo
+            rawName(rawN) = nm
+            rawState(rawN) = stt
+            If IsNumeric(vv) And Len(Trim$(CStr(pl_NZ(vv)))) > 0 Then
+                rawVolt(rawN) = CDbl(vv): rawVoltP(rawN) = True
+            Else
+                rawVolt(rawN) = 0: rawVoltP(rawN) = False
+            End If
+            If IsNumeric(latV) And IsNumeric(lonV) And _
+               Len(Trim$(CStr(pl_NZ(latV)))) > 0 And Len(Trim$(CStr(pl_NZ(lonV)))) > 0 Then
+                rawLat(rawN) = CDbl(latV): rawLng(rawN) = CDbl(lonV): rawGeo(rawN) = True
+            Else
+                rawLat(rawN) = 0: rawLng(rawN) = 0: rawGeo(rawN) = False
+            End If
+            rawFile(rawN) = pl_FileName(path)
+            rawRow(rawN) = PL_HDR_ROW + r
+            added = added + 1
+        End If
+    Next r
+
+    pl_LogAdd log, "  [Read] " & pl_FileName(path) & " -- " & added & " Summary row(s)"
+    On Error Resume Next
+    wb.Close SaveChanges:=False
+    On Error GoTo 0
+    Exit Sub
+Fail:
+    pl_LogAdd log, "  [Skipped] " & pl_FileName(path) & " -- read error: " & Err.Description
+    pl_AppendSkip "2 Site", pl_FileName(path), PL_SITE_TAB, "Failed: open error", "", "", "read error: " & Err.Description, path
+    On Error Resume Next
+    If Not wb Is Nothing Then wb.Close SaveChanges:=False
+    On Error GoTo 0
+End Sub
+
+'--------------------------------------------------------------------------
+' pl_DedupTriples
+'   O(N) dedupe via a Scripting.Dictionary keyed on the normalised
+'   "name|voltage|state" triple. First occurrence kept; later matches logged as
+'   dropped. Two rows collapse only when name AND voltage AND state all match.
+'--------------------------------------------------------------------------
+Private Function pl_DedupTriples(ByRef rawName() As String, ByRef rawVolt() As Double, _
+                                 ByRef rawVoltP() As Boolean, ByRef rawState() As String, _
+                                 ByVal rawN As Long, ByRef rawFile() As String, _
+                                 ByRef rawRow() As Long, ByRef rawLat() As Double, _
+                                 ByRef rawLng() As Double, ByRef rawGeo() As Boolean, _
+                                 ByRef dt() As PL_TSiteTriple, _
+                                 ByRef log As PL_TLog, ByRef dropped As Long) As Long
+    Dim d As Object: Set d = CreateObject("Scripting.Dictionary")
+    ReDim dt(1 To rawN)
+    Dim k As Long, i As Long, key As String
+    k = 0: dropped = 0
+    For i = 1 To rawN
+        key = pl_TripleKey(rawName(i), rawVolt(i), rawVoltP(i), rawState(i))
+        If d.Exists(key) Then
+            dropped = dropped + 1
+            pl_LogAdd log, "  [Dropped dup] " & rawFile(i) & " row " & rawRow(i) & " -- (" & _
+                           pl_TripleStr(rawName(i), rawVolt(i), rawVoltP(i), rawState(i)) & ")"
+        Else
+            d.Add key, True
+            k = k + 1
+            dt(k).Name = rawName(i): dt(k).Voltage = rawVolt(i)
+            dt(k).VoltParsed = rawVoltP(i): dt(k).State = rawState(i)
+            dt(k).Lat = rawLat(i): dt(k).Lng = rawLng(i): dt(k).HasGeo = rawGeo(i)
+        End If
+    Next i
+    If k > 0 Then ReDim Preserve dt(1 To k)
+    pl_DedupTriples = k
+End Function
+
+' ==========================================================================
+'  STAGE 3 + 4a -- MATRIX MEMBERSHIP (all Cost Data subs) + State LEFT JOIN
+' ==========================================================================
+
+'--------------------------------------------------------------------------
+' pl_BuildMatrix
+'   Loads the four cost columns once and groups records by identity in a
+'   dictionary. Matrix rows = EVERY distinct substation identity in Cost Data
+'   column A (name, + voltage where carried) -- NOT the cost/site intersection.
+'   Site Data is a LEFT JOIN used only to attach State: a substation present in
+'   Cost Data but absent from Site Data still gets a full row, with a blank
+'   State. Each row's cost-per-MW curve is the piecewise cumulative-allocation
+'   / MW -- the exact SUMIFS definition -- computed in one pass per substation.
+'   Writes the Matrix as a single block (three identity columns Substation |
+'   Voltage (kV) | State, then the MW x cost body; values, or bounded live
+'   SUMIFS under USE_LIVE_SUMIFS) and returns everything Stage 4 needs in `mtx`,
+'   so the sheet is never re-read.
+'--------------------------------------------------------------------------
+Private Function pl_BuildMatrix(ByRef log As PL_TLog, ByVal wsCost As Worksheet, _
+                                ByVal wsSite As Worksheet, ByRef wsMatrix As Worksheet, _
+                                ByRef mtx As PL_TMatrix, ByVal reuseExisting As Boolean) As Boolean
+    On Error GoTo ErrHandler
+    pl_BuildMatrix = False
+    mtx.ok = False
+    ' On a resume the Matrix is already a saved checkpoint: read its cost-per-MW
+    ' values back from the sheet instead of recomputing them. The join is still
+    ' run (cheap, from the persisted sheets) to rebuild the keys/headroom/columns
+    ' Stage 4 needs. If the sheet is missing or its shape no longer matches, fall
+    ' back to a full recompute + rewrite.
+    Dim reuseVals As Boolean
+    reuseVals = reuseExisting And (Not wsMatrix Is Nothing)
+    pl_Status "Stage 3: building matrix from all Cost Data substations (State left-joined)"
+
+    Dim colName As Long, colVolt As Long, colTrig As Long, colAlloc As Long
+    colName = pl_ResolveCol(wsCost, PL_HDR_NAME)
+    colVolt = pl_ResolveCol(wsCost, PL_HDR_VOLT)
+    colTrig = pl_ResolveCol(wsCost, PL_HDR_TRIGGER)
+    colAlloc = pl_ResolveCol(wsCost, PL_HDR_ALLOC)
+    If colName = 0 Or colTrig = 0 Or colAlloc = 0 Then
+        pl_LogAdd log, "Step 3: missing Cost Data headers (name/trigger/allocation)."
+        MsgBox "Cost Data is missing a required header:" & vbCrLf & _
+               PL_HDR_NAME & " / " & PL_HDR_TRIGGER & " / " & PL_HDR_ALLOC, _
+               vbExclamation, "Interconnect Pipeline"
+        Exit Function
+    End If
+
+    ' -- load cost data once --
+    Dim lastCostRow As Long, lastCol As Long
+    lastCostRow = wsCost.Cells(wsCost.Rows.Count, colName).End(xlUp).Row
+    lastCol = wsCost.Cells(PL_HDR_ROW, wsCost.Columns.Count).End(xlToLeft).Column
+    If lastCostRow < PL_HDR_ROW + 1 Then
+        pl_LogAdd log, "Step 3: Cost Data has no rows."
+        Exit Function
+    End If
+    Dim cv As Variant
+    cv = wsCost.Range(wsCost.Cells(1, 1), wsCost.Cells(lastCostRow, lastCol)).Value
+
+    ' -- one pass over cost rows -->
+    '    dId   : identity key (name [+voltage]) -> id. This is the set of matrix
+    '            rows: every distinct Cost Data substation, and the carrier of
+    '            each identity's exact criteria (also the key for the State join).
+    '    dName : name(lower) -> Collection of Array(trig, alloc, vpFlag, volt),
+    '            so the matrix/headroom sums apply the SAME criteria as the
+    '            SUMIFS/MINIFS -- name+voltage for a voltage-bearing tab, name
+    '            alone (across every voltage) for a bare tab.
+    Dim dId As Object: Set dId = CreateObject("Scripting.Dictionary")
+    Dim dName As Object: Set dName = CreateObject("Scripting.Dictionary")
+    Dim idName() As String, idVolt() As Double, idVP() As Boolean
+    Dim nId As Long: nId = 0
+    ReDim idName(1 To lastCostRow): ReDim idVolt(1 To lastCostRow): ReDim idVP(1 To lastCostRow)
+
+    Dim r As Long
+    For r = 2 To lastCostRow
+        Dim nm As String: nm = Trim$(CStr(pl_NZ(cv(r, colName))))
+        If Len(nm) > 0 Then
+            Dim vp As Boolean, vv As Double
+            vp = False: vv = 0
+            If colVolt > 0 Then
+                If IsNumeric(cv(r, colVolt)) And Len(Trim$(CStr(pl_NZ(cv(r, colVolt))))) > 0 Then
+                    vv = CDbl(cv(r, colVolt)): vp = True
+                End If
+            End If
+            Dim tg As Variant, al As Variant
+            tg = cv(r, colTrig): al = cv(r, colAlloc)
+            If IsNumeric(tg) And IsNumeric(al) Then
+                Dim key As String: key = pl_CostKey(nm, vv, vp)
+                If Not dId.Exists(key) Then
+                    nId = nId + 1
+                    dId.Add key, nId
+                    idName(nId) = nm: idVolt(nId) = vv: idVP(nId) = vp
+                End If
+                Dim nk As String: nk = LCase$(Trim$(nm))
+                If Not dName.Exists(nk) Then
+                    Dim col As Collection: Set col = New Collection
+                    dName.Add nk, col
+                End If
+                dName(nk).Add Array(CDbl(tg), CDbl(al), IIf(vp, 1, 0), vv)
+            End If
+        End If
+    Next r
+    If nId = 0 Then
+        pl_LogAdd log, "Step 3: no cost identities."
+        Exit Function
+    End If
+
+    ' -- site triples (bulk read): used ONLY to attach State as a LEFT JOIN.
+    '    Site data never decides which substations appear -- every distinct
+    '    Cost Data identity gets a row whether or not a site entry exists.
+    '    An empty Site Data set is not an error: the run proceeds, State blank. --
+    Dim st() As PL_TSiteTriple, stN As Long
+    stN = pl_ReadSiteTriples(wsSite, st)
+    If stN = 0 Then
+        pl_LogAdd log, "Step 3: Site Data has no rows; every Cost Data substation is " & _
+                       "still analyzed with a blank State."
+    End If
+
+    ' -- left join: cost-identity key -> State (first non-empty match wins).
+    '    Both sides key through pl_CostKey (shared pl_NormSubName name-clean +
+    '    pl_VoltFrom/pl_VoltStr integer voltage), so a site name with the voltage
+    '    embedded and a trailing counter ("Cecelia 138kV 1") normalizes to the
+    '    same "cecelia|138" key as the clean cost name ("Cecelia" @ 138) and the
+    '    genuine pair matches. Site rows with no Cost Data match are logged (raw +
+    '    normalized keys, diagnosable); they NEVER remove a Cost Data substation. --
+    ' Name-only cost lookup (normalized name -> a representative cost key) to
+    ' split an unmatched site row into a near-miss (its normalized name matches a
+    ' cost substation but the full key doesn't = LIKELY MATCH BUG) vs a genuine
+    ' NO COST STUDY. Coverage is all-RTO, so there is NO region-based dismissal.
+    Dim dCostName As Object: Set dCostName = CreateObject("Scripting.Dictionary")
+    Dim cc As Long, nn As String
+    For cc = 1 To nId
+        nn = pl_NormSubName(idName(cc))
+        If Not dCostName.Exists(nn) Then dCostName.Add nn, pl_CostKey(idName(cc), idVolt(cc), idVP(cc))
+    Next cc
+
+    Dim dState As Object: Set dState = CreateObject("Scripting.Dictionary")
+    Dim dLat As Object: Set dLat = CreateObject("Scripting.Dictionary")
+    Dim dLng As Object: Set dLng = CreateObject("Scripting.Dictionary")
+
+    ' unmatched site rows (parallel arrays) for _Site Only
+    Dim soName() As String, soVoltS() As String, soState() As String
+    Dim soLat() As String, soLng() As String, soReason() As Long, soClosest() As String
+    Dim soN As Long: soN = 0
+    If stN > 0 Then
+        ReDim soName(1 To stN): ReDim soVoltS(1 To stN): ReDim soState(1 To stN)
+        ReDim soLat(1 To stN): ReDim soLng(1 To stN)
+        ReDim soReason(1 To stN): ReDim soClosest(1 To stN)
+    End If
+
+    Dim s As Long, mk As String, nn2 As String
+    Dim siteMatched As Long, siteUnmatched As Long, nBug As Long, nGap As Long
+    For s = 1 To stN
+        mk = pl_ResolveMatchKey(st(s), dId)
+        If Len(mk) > 0 Then
+            siteMatched = siteMatched + 1
+            If Len(Trim$(st(s).State)) > 0 And Not dState.Exists(mk) Then dState.Add mk, st(s).State
+            If st(s).HasGeo Then
+                If Not dLat.Exists(mk) Then dLat.Add mk, pl_NumStr(st(s).Lat)
+                If Not dLng.Exists(mk) Then dLng.Add mk, pl_NumStr(st(s).Lng)
+            End If
+        Else
+            siteUnmatched = siteUnmatched + 1
+            soN = soN + 1
+            soName(soN) = st(s).Name
+            soVoltS(soN) = IIf(st(s).VoltParsed, pl_VoltStr(st(s).Voltage), "")
+            soState(soN) = st(s).State
+            soLat(soN) = IIf(st(s).HasGeo, pl_NumStr(st(s).Lat), "")
+            soLng(soN) = IIf(st(s).HasGeo, pl_NumStr(st(s).Lng), "")
+            nn2 = pl_NormSubName(st(s).Name)
+            If dCostName.Exists(nn2) Then
+                soReason(soN) = 1: soClosest(soN) = CStr(dCostName(nn2)): nBug = nBug + 1
+            Else
+                soReason(soN) = 2: soClosest(soN) = "": nGap = nGap + 1
+            End If
+            pl_LogAdd log, "  [Site only] raw='" & st(s).Name & "' norm-key='" & _
+                pl_CostKey(st(s).Name, st(s).Voltage, st(s).VoltParsed) & "' -> " & _
+                IIf(soReason(soN) = 1, "Likely match bug (closest cost '" & soClosest(soN) & "')", _
+                    "No cost study found")
+        End If
+    Next s
+
+    pl_LogAdd log, "STAGE 3 -- Site->Cost match: " & stN & " site triple(s), " & nId & _
+                   " cost substation(s); matched " & siteMatched & ", unmatched " & siteUnmatched & _
+                   " (" & nBug & " likely-match-bug, " & nGap & " no-cost-study-found)."
+    pl_WriteSiteOnly soName, soVoltS, soState, soLat, soLng, soReason, soClosest, soN
+
+    ' -- MW axis + allocate result. Matrix membership = ALL distinct Cost Data
+    '    substations (nId of them), NOT the cost/site intersection. --
+    Dim mw() As Double, m As Long
+    m = pl_MwAxis(mw)
+    Dim n As Long: n = nId
+    ReDim mtx.mw(1 To m)
+    Dim j As Long
+    For j = 1 To m: mtx.mw(j) = mw(j): Next j
+    ReDim mtx.names(1 To n)
+    ReDim mtx.state(1 To n)
+    ReDim mtx.lat(1 To n): ReDim mtx.lng(1 To n)
+    ReDim mtx.costM(1 To n, 1 To m)
+    ReDim mtx.headroom(1 To n)
+    ReDim mtx.keyName(1 To n): ReDim mtx.keyVolt(1 To n): ReDim mtx.keyUseVolt(1 To n)
+
+    ' -- read the Matrix values back on resume, else compute + write --
+    Dim reuseOK As Boolean: reuseOK = False
+    Dim matVals As Variant
+    ' Matrix layout: 3 identity columns (Substation | Voltage (kV) | State),
+    ' then the MW x cost body. The MW header sits at columns 4..(3+m).
+    Const IDC As Long = 3
+    If reuseVals Then
+        Dim lastMatRow As Long, lastMatCol As Long
+        lastMatRow = wsMatrix.Cells(wsMatrix.Rows.Count, 1).End(xlUp).Row
+        lastMatCol = wsMatrix.Cells(1, wsMatrix.Columns.Count).End(xlToLeft).Column
+        If lastMatRow = n + 1 And lastMatCol = m + IDC Then
+            matVals = wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + IDC)).Value
+            reuseOK = True
+            pl_Status "Stage 3: reading Matrix checkpoint (" & n & " x " & m & ")"
+        Else
+            pl_LogAdd log, "Stage 3: Matrix checkpoint shape changed (" & (lastMatRow - 1) & _
+                           "x" & (lastMatCol - IDC) & " vs " & n & "x" & m & "); recomputing."
+        End If
+    End If
+
+    Dim outBlk() As Variant
+    If Not reuseOK Then
+        pl_Status "Stage 4: computing matrix (" & n & " x " & m & ")"
+        ReDim outBlk(1 To n + 1, 1 To m + IDC)
+        outBlk(1, 1) = "Substation"
+        outBlk(1, 2) = PL_HDR_VOLT           ' "Voltage (kV)"
+        outBlk(1, 3) = "State"
+        For j = 1 To m: outBlk(1, IDC + j) = mw(j): Next j
+    End If
+
+    ' -- one row per distinct Cost Data identity (i runs over cost identities,
+    '    NOT site rows). State is attached from the left join; a substation with
+    '    no site match still gets a full row with a blank State. --
+    Dim i As Long, rec As Variant, x As Double, tSum As Double, minTrig As Double
+    Dim haveMin As Boolean, useV As Boolean, vSel As Double, inCrit As Boolean
+    Dim ckey As String, stState As String
+    For i = 1 To nId
+        useV = idVP(i): vSel = idVolt(i)
+        ckey = pl_CostKey(idName(i), idVolt(i), idVP(i))
+        If dState.Exists(ckey) Then
+            stState = dState(ckey)
+        Else
+            stState = ""                      ' no site match: State blank, row kept
+        End If
+        ' CLEAN name only -- voltage/state/lat/long are separate fields, written as
+        ' separate columns; never concatenated into the name label. Lat/long are
+        ' left-joined metadata (present when matched, blank when not), never a key.
+        mtx.names(i) = idName(i)
+        mtx.state(i) = stState
+        If dLat.Exists(ckey) Then
+            mtx.lat(i) = CStr(dLat(ckey))
+        Else
+            mtx.lat(i) = ""
+        End If
+        If dLng.Exists(ckey) Then
+            mtx.lng(i) = CStr(dLng(ckey))
+        Else
+            mtx.lng(i) = ""
+        End If
+        mtx.keyName(i) = idName(i): mtx.keyVolt(i) = vSel: mtx.keyUseVolt(i) = useV
+
+        ' headroom is always taken from the records (cheap), by this identity's
+        ' exact criteria -- identical to MINIFS.
+        Dim recCol As Collection: Set recCol = dName(LCase$(Trim$(idName(i))))
+        haveMin = False: minTrig = 0
+        For Each rec In recCol
+            inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
+            If inCrit And rec(0) > 0 Then
+                If Not haveMin Then
+                    minTrig = rec(0)
+                    haveMin = True
+                ElseIf rec(0) < minTrig Then
+                    minTrig = rec(0)
+                End If
+            End If
+        Next rec
+        mtx.headroom(i) = IIf(haveMin, minTrig, 0)
+
+        If reuseOK Then
+            For j = 1 To m
+                If IsNumeric(matVals(i + 1, IDC + j)) Then
+                    mtx.costM(i, j) = CDbl(matVals(i + 1, IDC + j))
+                Else
+                    mtx.costM(i, j) = 0
+                End If
+            Next j
+        Else
+            ' three separate identity columns -- never a concatenated label
+            outBlk(i + 1, 1) = idName(i)
+            If idVP(i) Then
+                outBlk(i + 1, 2) = idVolt(i)
+            Else
+                outBlk(i + 1, 2) = ""
+            End If
+            outBlk(i + 1, 3) = stState
+            For j = 1 To m
+                x = mw(j): tSum = 0
+                For Each rec In recCol
+                    inCrit = (Not useV) Or (rec(2) = 1 And rec(3) = vSel)
+                    If inCrit Then
+                        If rec(0) <= x Then tSum = tSum + rec(1)
+                    End If
+                Next rec
+                mtx.costM(i, j) = tSum / x
+                ' body cell content (bounded live SUMIFS by default, else value)
+                If USE_LIVE_SUMIFS Then
+                    outBlk(i + 1, IDC + j) = pl_SumifsFormula(wsCost.Name, colAlloc, colName, colTrig, colVolt, _
+                                            idName(i), useV, vSel, pl_ColLetter(IDC + j) & "$1", 2, lastCostRow)
+                Else
+                    outBlk(i + 1, IDC + j) = mtx.costM(i, j)
+                End If
+            Next j
+        End If
+    Next i
+
+    ' -- write matrix in one block (skipped when reusing the saved checkpoint) --
+    If Not reuseOK Then
+        Set wsMatrix = pl_FreshSheet(PL_SH_MATRIX)
+        If wsMatrix Is Nothing Then
+            pl_LogAdd log, "Step 3: could not create the Matrix sheet."
+            Exit Function
+        End If
+        If USE_LIVE_SUMIFS Then
+            wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + IDC)).Formula = outBlk
+        Else
+            wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(n + 1, m + IDC)).Value = outBlk
+        End If
+        wsMatrix.Rows(1).Font.Bold = True
+        wsMatrix.Range(wsMatrix.Cells(1, 1), wsMatrix.Cells(1, IDC)).Columns.AutoFit
+        wsMatrix.Range(wsMatrix.Cells(2, IDC + 1), wsMatrix.Cells(n + 1, m + IDC)).NumberFormat = "$#,##0"
+    End If
+
+    ' matchedCount is retained as the field name but now holds the count of ALL
+    ' distinct Cost Data substations (matrix membership is no longer an intersection).
+    mtx.matchedCount = n: mtx.mwCount = m
+    mtx.costName = wsCost.Name
+    mtx.colName = colName: mtx.colVolt = colVolt: mtx.colTrig = colTrig: mtx.colAlloc = colAlloc
+    mtx.costLastRow = lastCostRow
+    mtx.ok = True
+
+    pl_LogAdd log, "STAGE 3/4 -- Matrix (" & wsMatrix.Name & "): " & n & " substations x " & m & _
+                   " MW (all distinct Cost Data substations; State left-joined from Site Data); " & _
+                   "cost cols by header (name=" & pl_ColLetter(colName) & ", trigger=" & _
+                   pl_ColLetter(colTrig) & ", alloc=" & pl_ColLetter(colAlloc) & "); " & _
+                   IIf(USE_LIVE_SUMIFS, "live SUMIFS", "values") & "."
+    pl_BuildMatrix = True
+    Exit Function
+
+ErrHandler:
+    pl_LogAdd log, "Step 3 error #" & Err.Number & ": " & Err.Description
+    pl_BuildMatrix = False
+End Function
+
+' Writes the _Site Only sheet: every site row that found no Cost Data match,
+' each a REVIEW item (all-RTO coverage -> no "out of region" bucket). Reason is
+' "Likely match bug" (its normalized name matched a cost substation, so the
+' closest cost key is shown) or "No cost study found" (genuinely absent). Sorted
+' bugs first, then state, then name. Carries lat/long as metadata.
+Private Sub pl_WriteSiteOnly(ByRef soName() As String, ByRef soVoltS() As String, _
+                             ByRef soState() As String, ByRef soLat() As String, _
+                             ByRef soLng() As String, ByRef soReason() As Long, _
+                             ByRef soClosest() As String, ByVal soN As Long)
+    On Error Resume Next
+    Dim ws As Worksheet: Set ws = pl_SheetByName(PL_SH_SITEONLY)
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_SITEONLY
+    Else
+        ws.Cells.Clear
+    End If
+    ws.Range("A1:G1").Value = Array("Substation", "Voltage (kV)", "State", "Lat", "Long", _
+                                    "Reason", "Closest Cost Key")
+    ws.Rows(1).Font.Bold = True
+    If soN < 1 Then
+        ws.Cells(2, 1).Value = "(no unmatched site rows -- every site substation matched a Cost Data substation)"
+        On Error GoTo 0
+        Exit Sub
+    End If
+
+    ' order: Reason (1 = bug first, 2 = gap) then state then name
+    Dim ord() As Long: ReDim ord(1 To soN)
+    Dim i As Long
+    For i = 1 To soN: ord(i) = i: Next i
+    Dim a As Long, b As Long, ka As String, kb As String, tmp As Long
+    For a = 2 To soN
+        tmp = ord(a)
+        ka = pl_SiteOnlyKey(soReason(tmp), soState(tmp), soName(tmp))
+        b = a - 1
+        Do While b >= 1
+            kb = pl_SiteOnlyKey(soReason(ord(b)), soState(ord(b)), soName(ord(b)))
+            If kb > ka Then
+                ord(b + 1) = ord(b): b = b - 1
+            Else
+                Exit Do
+            End If
+        Loop
+        ord(b + 1) = tmp
+    Next a
+
+    Dim blk() As Variant: ReDim blk(1 To soN, 1 To 7)
+    Dim rw As Long, jx As Long
+    For rw = 1 To soN
+        jx = ord(rw)
+        blk(rw, 1) = soName(jx)
+        blk(rw, 2) = soVoltS(jx)
+        blk(rw, 3) = soState(jx)
+        blk(rw, 4) = soLat(jx)
+        blk(rw, 5) = soLng(jx)
+        blk(rw, 6) = IIf(soReason(jx) = 1, "Likely match bug", "No cost study found")
+        blk(rw, 7) = soClosest(jx)
+    Next rw
+    ws.Range(ws.Cells(2, 1), ws.Cells(1 + soN, 7)).Value = blk
+    ws.Columns.AutoFit
+    On Error GoTo 0
+End Sub
+
+' Composite sort key for _Site Only: reason level, then state, then name.
+Private Function pl_SiteOnlyKey(ByVal rsnLvl As Long, ByVal sttV As String, ByVal nmV As String) As String
+    pl_SiteOnlyKey = Format$(rsnLvl, "0") & "|" & LCase$(Trim$(sttV)) & "|" & LCase$(Trim$(nmV))
+End Function
+
+Private Function pl_ReadSiteTriples(ByVal wsSite As Worksheet, ByRef st() As PL_TSiteTriple) As Long
+    Dim lastRow As Long, r As Long, k As Long
+    lastRow = wsSite.Cells(wsSite.Rows.Count, 1).End(xlUp).Row
+    If lastRow < PL_HDR_ROW + 1 Then
+        pl_ReadSiteTriples = 0
+        Exit Function
+    End If
+    ' Site Data: A=name B=state C=voltage D=Lat E=Long.
+    Dim v As Variant
+    v = wsSite.Range(wsSite.Cells(PL_HDR_ROW + 1, 1), wsSite.Cells(lastRow, 5)).Value
+    Dim rows As Long
+    If IsArray(v) Then
+        rows = UBound(v, 1)
+    Else
+        rows = 1
+    End If
+    ReDim st(1 To rows)
+    k = 0
+    For r = 1 To rows
+        Dim nm As String, stt As String, vv As Variant, latV As Variant, lonV As Variant
+        If IsArray(v) Then
+            nm = Trim$(CStr(pl_NZ(v(r, 1)))): stt = Trim$(CStr(pl_NZ(v(r, 2)))): vv = v(r, 3)
+            latV = v(r, 4): lonV = v(r, 5)
+        Else
+            nm = Trim$(CStr(pl_NZ(v))): stt = "": vv = "": latV = "": lonV = ""
+        End If
+        If Len(nm) > 0 Then
+            k = k + 1
+            st(k).Name = nm: st(k).State = stt
+            If IsNumeric(vv) And Len(Trim$(CStr(pl_NZ(vv)))) > 0 Then
+                st(k).Voltage = CDbl(vv): st(k).VoltParsed = True
+            Else
+                st(k).Voltage = 0: st(k).VoltParsed = False
+            End If
+            If IsNumeric(latV) And IsNumeric(lonV) And _
+               Len(Trim$(CStr(pl_NZ(latV)))) > 0 And Len(Trim$(CStr(pl_NZ(lonV)))) > 0 Then
+                st(k).Lat = CDbl(latV): st(k).Lng = CDbl(lonV): st(k).HasGeo = True
+            Else
+                st(k).Lat = 0: st(k).Lng = 0: st(k).HasGeo = False
+            End If
+        End If
+    Next r
+    If k > 0 Then ReDim Preserve st(1 To k)
+    pl_ReadSiteTriples = k
+End Function
+
+'--------------------------------------------------------------------------
+' pl_ResolveMatchKey
+'   The join rule as a dictionary lookup: match a site triple to a cost
+'   identity by name+voltage when a voltage-bearing cost tab exists, else by
+'   name alone (bare cost tab). Returns the cost identity key, or "" if none.
+'--------------------------------------------------------------------------
+Private Function pl_ResolveMatchKey(ByRef tr As PL_TSiteTriple, ByVal dId As Object) As String
+    Dim vk As String, bk As String
+    If tr.VoltParsed Then
+        vk = pl_CostKey(tr.Name, tr.Voltage, True)
+        If dId.Exists(vk) Then
+            pl_ResolveMatchKey = vk
+            Exit Function
+        End If
+    End If
+    bk = pl_CostKey(tr.Name, 0, False)
+    If dId.Exists(bk) Then
+        pl_ResolveMatchKey = bk
+        Exit Function
+    End If
+    pl_ResolveMatchKey = ""
+End Function
+
+' SHARED name-clean routine for MATCHING, called identically on the cost tab
+' name and the site Summary!A name so the two sides can never drift. Steps:
+'   1. collapse nbsp/multiple spaces, trim
+'   2. remove the embedded voltage token (138kV / 230 kV / 230. kV)
+'   3. strip a trailing standalone integer that FOLLOWED the voltage (a file
+'      counter, e.g. the "1"/"2" in "Cecelia 138kV 1"/"...2") -- but NOT a unit
+'      number that preceded the voltage (the "1" in "Big Cajun 1 230kV"), which
+'      is part of the real name
+'   4. lower-case
+' Results:
+'   "Cecelia 138kV 1" / "Cecelia 138kV 2" -> "cecelia"   (counter stripped)
+'   "Big Cajun 1 230kV"                   -> "big cajun 1" (unit kept)
+'   "Big Cajun 1" (cost, already clean)   -> "big cajun 1" (no voltage -> no
+'                                            counter strip) => matches the site
+Private Function pl_NormSubName(ByVal raw As String) As String
+    Dim work As String: work = pl_NormSpaces(raw)
+    Dim vFound As Boolean, vVal As Double, vStart As Long, vEnd As Long
+    pl_ExtractVoltage work, vFound, vVal, vStart, vEnd
+    If vFound Then
+        Dim head As String, tail As String
+        head = Left$(work, vStart - 1)
+        tail = Trim$(Mid$(work, vEnd + 1))
+        If pl_IsAllDigits(tail) Then tail = ""      ' trailing counter after the voltage
+        work = pl_NormSpaces(head & " " & tail)
+    End If
+    pl_NormSubName = LCase$(pl_NormSpaces(work))
+End Function
+
+' SHARED voltage-parse routine: the integer voltage adjacent to kV in `raw`, or
+' 0 when none. Uses the same extractor as the name-clean, so both sides agree.
+Private Function pl_VoltFrom(ByVal raw As String) As Double
+    Dim vFound As Boolean, vVal As Double, vStart As Long, vEnd As Long
+    pl_ExtractVoltage pl_NormSpaces(raw), vFound, vVal, vStart, vEnd
+    If vFound Then
+        pl_VoltFrom = vVal
+    Else
+        pl_VoltFrom = 0
+    End If
+End Function
+
+' SHARED voltage-to-key string: a CLEAN integer (no trailing ".", space, or kV),
+' so keys read "...|138", never "...|138." A fractional voltage (rare) keeps its
+' decimals but never a bare trailing dot.
+Private Function pl_VoltStr(ByVal v As Double) As String
+    If v = Int(v) Then
+        pl_VoltStr = CStr(CLng(v))
+    Else
+        pl_VoltStr = pl_NumStr(v)
+    End If
+End Function
+
+' Identity key, built with the shared routines and IDENTICAL on both sides:
+' normalized name + "|" + integer voltage. The voltage in the NAME (via
+' pl_VoltFrom) wins; the passed-in value (a cost tab's parsed voltage, or a site
+' voltage column) is the fallback. So "Cecelia 138kV 1" (site) and clean
+' "Cecelia" @ 138 (cost) both key to "cecelia|138".
+Private Function pl_CostKey(ByVal nm As String, ByVal v As Double, ByVal vp As Boolean) As String
+    Dim volt As Double, haveVolt As Boolean
+    Dim nameVolt As Double: nameVolt = pl_VoltFrom(nm)
+    If nameVolt > 0 Then
+        volt = nameVolt: haveVolt = True
+    ElseIf vp Then
+        volt = v: haveVolt = True
+    Else
+        haveVolt = False
+    End If
+    pl_CostKey = pl_NormSubName(nm) & "|" & IIf(haveVolt, pl_VoltStr(volt), "")
+End Function
+
+' ==========================================================================
+'  SUMIFS / MINIFS FORMULA BUILDERS (live paths, bounded ranges)
+' ==========================================================================
+
+Private Function pl_SumifsFormula(ByVal costName As String, ByVal colAlloc As Long, _
+                                  ByVal colName As Long, ByVal colTrig As Long, _
+                                  ByVal colVolt As Long, ByVal subName As String, _
+                                  ByVal useVolt As Boolean, ByVal theVolt As Double, _
+                                  ByVal mwCell As String, ByVal r1 As Long, ByVal r2 As Long) As String
+    Dim ref As String, f As String
+    ref = pl_SheetRef(costName)
+    f = "=SUMIFS(" & ref & "!" & pl_BoundCol(colAlloc, r1, r2) & _
+        "," & ref & "!" & pl_BoundCol(colName, r1, r2) & ",""" & pl_EscQuote(subName) & """" & _
+        "," & ref & "!" & pl_BoundCol(colTrig, r1, r2) & ",""<=""&" & mwCell
+    If useVolt And colVolt > 0 Then
+        f = f & "," & ref & "!" & pl_BoundCol(colVolt, r1, r2) & "," & pl_NumStr(theVolt)
+    End If
+    f = f & ")/" & mwCell
+    pl_SumifsFormula = f
+End Function
+
+Private Function pl_MinifsFormula(ByVal costName As String, ByVal colTrig As Long, _
+                                  ByVal colName As Long, ByVal colVolt As Long, _
+                                  ByVal subName As String, ByVal useVolt As Boolean, _
+                                  ByVal theVolt As Double, ByVal r1 As Long, ByVal r2 As Long) As String
+    Dim ref As String, f As String
+    ref = pl_SheetRef(costName)
+    f = "MINIFS(" & ref & "!" & pl_BoundCol(colTrig, r1, r2) & _
+        "," & ref & "!" & pl_BoundCol(colName, r1, r2) & ",""" & pl_EscQuote(subName) & """"
+    If useVolt And colVolt > 0 Then
+        f = f & "," & ref & "!" & pl_BoundCol(colVolt, r1, r2) & "," & pl_NumStr(theVolt)
+    End If
+    f = f & ")"
+    pl_MinifsFormula = f
+End Function
+
+' ==========================================================================
+'  STAGE 4b -- ANALYSIS + RANKING + SCORING + HEADROOM
+' ==========================================================================
+
+Private Function pl_RunAnalysisAndScoring(ByVal wsMatrix As Worksheet, ByRef log As PL_TLog, _
+                                          ByRef mtx As PL_TMatrix) As Boolean
+    On Error GoTo ErrHandler
+    pl_RunAnalysisAndScoring = False
+
+    Dim mw() As Double, names() As String, costM() As Double, n As Long, m As Long
+    mw = mtx.mw: names = mtx.names: costM = mtx.costM
+    n = mtx.matchedCount: m = mtx.mwCount
+
+    ' ---- explicit Matrix-validity guard: Stage 4 must never silently no-op ----
+    Dim reason As String
+    If Not pl_Stage4MatrixValid(mtx, reason) Then
+        pl_Stage4Fail log, reason
+        Exit Function
+    End If
+
+    pl_Status "Stage 4: ranking " & n & " substations"
+    Dim thr As Variant: thr = GetThresholds()
+    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
+    Dim totalCols As Long: totalCols = 7 + 4 * nt
+
+    Dim rkCount() As Long, rkMaxMW() As Double, rkCostMax() As Double
+    Dim rkSlope() As Double, rkHasSlope() As Boolean, rankA() As Long, rankB() As Long
+    ComputeRankings mw, names, costM, n, m, rkCount, rkMaxMW, rkCostMax, rkSlope, rkHasSlope, rankA, rankB
+
+    Dim aTable() As Variant: ReDim aTable(1 To n, 1 To totalCols)
+    AnalyseAll mw, names, costM, n, m, aTable, rankA, rankB
+
+    Dim wsOut As Worksheet: Set wsOut = pl_FreshSheet(PL_SH_ANALYSIS)
+    If wsOut Is Nothing Then
+        pl_LogAdd log, "Step 4: could not create the analysis sheet."
+        Exit Function
+    End If
+
+    ' One unified analysis table: identity split into Substation | Voltage (kV) |
+    ' State, headline results (Weighted Score, percentiles, Headroom, Flattening)
+    ' next to the name, then the per-threshold ranks and the detailed blocks. No
+    ' chart (Excel caps series at 256; ~1,691 substations overflow it).
+    pl_Status "Stage 4: writing analysis"
+    Dim lastTblRow As Long
+    lastTblRow = WriteSheet(wsOut, mtx, mw, costM, n, m, aTable, rankA, rankB)
+
+    pl_Status "Stage 4: leaderboard"
+    Dim lbLast As Long
+    BuildLeaderboard wsOut, lastTblRow + 3, mtx.names, n, rkCount, rkMaxMW, rkSlope, rankA, rankB, lbLast
+
+    pl_Status "Stage 4: recalculating"
+    Application.CalculateFull
+
+    ' confirm the analysis sheet was created and populated
+    Dim outRows As Long: outRows = pl_SheetDataRows(wsOut)
+    pl_LogAdd log, "STAGE 4 -- Cost Curve Analysis (" & wsOut.Name & "): " & n & _
+                   " substation(s) analysed, sheet data rows=" & outRows & ", " & m & _
+                   " MW; weighted-score ceiling 165, $B$2=" & PL_WEIGHT_B2 & _
+                   "; " & IIf(USE_LIVE_FORMULAS, "live formulas", "values") & "."
+    If outRows < 1 Then
+        pl_Stage4Fail log, "Cost Curve Analysis sheet is empty after the write"
+        Exit Function
+    End If
+    pl_RunAnalysisAndScoring = True
+    Exit Function
+
+ErrHandler:
+    ' Any Stage-4 runtime error is made visible (log + MsgBox), never swallowed.
+    pl_Stage4Fail log, "runtime error in " & Err.Source & " #" & Err.Number & " (" & Err.Description & ")"
+    pl_RunAnalysisAndScoring = False
+End Function
+
+' Logs a Stage-4 failure reason to _Pipeline Log and shows a specific MsgBox --
+' a Stage-4 problem must be visible, not a silent no-op.
+Private Sub pl_Stage4Fail(ByRef log As PL_TLog, ByVal reason As String)
+    pl_LogAdd log, "STAGE 4 FAILED (pl_RunAnalysisAndScoring): " & reason
+    MsgBox "Stage 4 cannot run: " & reason & "." & vbCrLf & vbCrLf & _
+           "Stages 1-3 remain saved. See " & PL_SH_LOG & "; fix and re-run.", _
+           vbExclamation, "Interconnect Pipeline"
+End Sub
+
+' Pure Matrix-validity check for Stage 4 (no side effects, so it is unit
+' testable): >=1 substation row, >=3 numeric strictly-ascending MW columns, and
+' every body cell numeric and >= 0. A cost of 0 is VALID (no upgrade priced at/
+' under that size = headroom); only a NEGATIVE cost is an error. Returns False
+' with a specific reason.
+Private Function pl_Stage4MatrixValid(ByRef mtx As PL_TMatrix, ByRef reason As String) As Boolean
+    pl_Stage4MatrixValid = False
+    reason = ""
+    If Not mtx.ok Then
+        reason = "Matrix was not built (mtx.ok = False)"
+        Exit Function
+    End If
+    If mtx.matchedCount < 1 Then
+        reason = "Matrix has 0 valid substation rows"
+        Exit Function
+    End If
+    If mtx.mwCount < 3 Then
+        reason = "Matrix has fewer than 3 MW columns (" & mtx.mwCount & ")"
+        Exit Function
+    End If
+    Dim jj As Long
+    For jj = 1 To mtx.mwCount
+        If mtx.mw(jj) <= 0 Then
+            reason = "Matrix MW header value at position " & jj & " is not positive"
+            Exit Function
+        End If
+        If jj > 1 Then
+            If mtx.mw(jj) <= mtx.mw(jj - 1) Then
+                reason = "Matrix MW header is not strictly ascending at position " & jj
+                Exit Function
+            End If
+        End If
+    Next jj
+    Dim i As Long, j As Long
+    For i = 1 To mtx.matchedCount
+        For j = 1 To mtx.mwCount
+            If mtx.costM(i, j) < 0 Then
+                reason = "negative cost at '" & mtx.names(i) & "', MW " & mtx.mw(j) & _
+                         " (costs must be >= 0; a 0 cell is valid and means no upgrade priced at/under this size)"
+                Exit Function
+            End If
+        Next j
+    Next i
+    pl_Stage4MatrixValid = True
+End Function
+
+
+' ==========================================================================
+'  SCORING PRIMITIVES  (VBA mirror of the sheet formulas; parity-tested)
+' ==========================================================================
+
+Private Function pl_ScoreCeiling(ByVal nBands As Long) As Double
+    pl_ScoreCeiling = PL_MAX_PCTILE + nBands * PL_WEIGHT_B2 * (2 * PL_MAX_PCTILE)
+End Function
+
+' PERCENTRANK.EXC(pop, x) for x present in pop: (strictly-less count + 1)/(N+1),
+' matching Excel's first-occurrence positioning k/(N+1).
+Private Function pl_PercentRankExc(ByRef pop() As Double, ByVal nPop As Long, ByVal x As Double) As Double
+    Dim i As Long, lessCount As Long
+    For i = 1 To nPop
+        If pop(i) < x Then lessCount = lessCount + 1
+    Next i
+    pl_PercentRankExc = (lessCount + 1) / (nPop + 1)
+End Function
+
+Private Function pl_Ceil1(ByVal x As Double) As Long
+    pl_Ceil1 = -Int(-x)
+End Function
+
+' Single-value raw-is-better bucket: CEILING(PERCENTRANK.EXC(pop, x)*5, 1).
+Private Function pl_PctExcCeil5(ByRef pop() As Double, ByVal nPop As Long, ByVal x As Double) As Long
+    If nPop < 1 Then
+        pl_PctExcCeil5 = 0
+        Exit Function
+    End If
+    pl_PctExcCeil5 = pl_Ceil1(pl_PercentRankExc(pop, nPop, x) * PL_MAX_PCTILE)
+End Function
+
+' Raw-is-better buckets for a whole column, O(n log n) via one sort + grouped
+' walk (no per-element rescan).
+Private Function pl_RawBucketArray(ByRef vals() As Double, ByVal n As Long) As Long()
+    Dim bucket() As Long: ReDim bucket(1 To pl_Max1(n))
+    If n < 1 Then
+        pl_RawBucketArray = bucket
+        Exit Function
+    End If
+    Dim idx() As Long: idx = pl_SortIdxAscD(vals, n)
+    Dim pos As Long, groupStart As Long, s0 As Long
+    Dim val As Double
+    groupStart = 1
+    For pos = 1 To n
+        If pos > 1 Then
+            If vals(idx(pos)) <> vals(idx(pos - 1)) Then groupStart = pos
+        End If
+        s0 = groupStart - 1                         ' strictly-less count
+        val = (CDbl(s0 + 1) / CDbl(n + 1)) * PL_MAX_PCTILE
+        bucket(idx(pos)) = pl_Ceil1(val)
+    Next pos
+    pl_RawBucketArray = bucket
+End Function
+
+' Same as pl_RawBucketArray but only `part` members form the population; others
+' get 0 (they are shown blank by the caller).
+Private Function pl_RawBucketArrayMasked(ByRef vals() As Double, ByRef part() As Boolean, _
+                                         ByVal n As Long) As Long()
+    Dim bucket() As Long: ReDim bucket(1 To pl_Max1(n))
+    Dim pop() As Double, mapIdx() As Long, np As Long, i As Long
+    ReDim pop(1 To pl_Max1(n)): ReDim mapIdx(1 To pl_Max1(n))
+    np = 0
+    For i = 1 To n
+        If part(i) Then
+            np = np + 1
+            pop(np) = vals(i)
+            mapIdx(np) = i
+        End If
+    Next i
+    If np < 1 Then
+        pl_RawBucketArrayMasked = bucket
+        Exit Function
+    End If
+    Dim sub_() As Double: ReDim sub_(1 To np)
+    For i = 1 To np: sub_(i) = pop(i): Next i
+    Dim b() As Long: b = pl_RawBucketArray(sub_, np)
+    For i = 1 To np: bucket(mapIdx(i)) = b(i): Next i
+    pl_RawBucketArrayMasked = bucket
+End Function
+
+' Rank-based buckets for one threshold column: qualifiers (rank>0) form the
+' population; IFERROR(CEILING((1 - PERCENTRANK.EXC(pop, rank))*5,1),0).
+Private Function pl_RankBucketArray(ByRef rankArr() As Long, ByVal tt As Long, ByVal n As Long) As Long()
+    Dim bucket() As Long: ReDim bucket(1 To pl_Max1(n))
+    Dim pop() As Double, mapIdx() As Long, nq As Long, i As Long
+    ReDim pop(1 To pl_Max1(n)): ReDim mapIdx(1 To pl_Max1(n))
+    nq = 0
+    For i = 1 To n
+        If rankArr(i, tt) > 0 Then
+            nq = nq + 1
+            pop(nq) = CDbl(rankArr(i, tt))
+            mapIdx(nq) = i
+        End If
+    Next i
+    If nq < 1 Then
+        pl_RankBucketArray = bucket
+        Exit Function
+    End If  ' all 0 (IFERROR -> 0)
+    Dim sub_() As Double: ReDim sub_(1 To nq)
+    For i = 1 To nq: sub_(i) = pop(i): Next i
+    Dim idx() As Long: idx = pl_SortIdxAscD(sub_, nq)
+    Dim pos As Long, groupStart As Long, s0 As Long, pctExc As Double
+    groupStart = 1
+    For pos = 1 To nq
+        If pos > 1 Then
+            If sub_(idx(pos)) <> sub_(idx(pos - 1)) Then groupStart = pos
+        End If
+        s0 = groupStart - 1
+        pctExc = CDbl(s0 + 1) / CDbl(nq + 1)
+        bucket(mapIdx(idx(pos))) = pl_Ceil1((1 - pctExc) * PL_MAX_PCTILE)
+    Next pos
+    pl_RankBucketArray = bucket
+End Function
+
+' Stable bottom-up mergesort of indices of a Double array, ascending. O(n log n).
+Private Function pl_SortIdxAscD(ByRef vals() As Double, ByVal n As Long) As Long()
+    Dim ord() As Long: ReDim ord(1 To pl_Max1(n))
+    Dim i As Long
+    For i = 1 To n: ord(i) = i: Next i
+    If n < 2 Then
+        pl_SortIdxAscD = ord
+        Exit Function
+    End If
+    Dim buf() As Long: ReDim buf(1 To n)
+    Dim width As Long, s As Long
+    width = 1
+    Do While width < n
+        s = 1
+        Do While s <= n
+            Dim l1 As Long, r1 As Long, l2 As Long, r2 As Long, p As Long, q As Long, w As Long
+            l1 = s: r1 = s + width - 1
+            If r1 > n Then r1 = n
+            l2 = r1 + 1: r2 = s + 2 * width - 1
+            If r2 > n Then r2 = n
+            p = l1: q = l2: w = l1
+            Do While p <= r1 And q <= r2
+                If vals(ord(q)) < vals(ord(p)) Then
+                    buf(w) = ord(q): q = q + 1
+                Else
+                    buf(w) = ord(p): p = p + 1
+                End If
+                w = w + 1
+            Loop
+            Do While p <= r1
+                buf(w) = ord(p): p = p + 1: w = w + 1
+            Loop
+            Do While q <= r2
+                buf(w) = ord(q): q = q + 1: w = w + 1
+            Loop
+            For w = l1 To r2
+                ord(w) = buf(w)
+            Next w
+            s = s + 2 * width
+        Loop
+        width = width * 2
+    Loop
+    pl_SortIdxAscD = ord
+End Function
+
+Private Function pl_Max1(ByVal n As Long) As Long
+    If n < 1 Then
+        pl_Max1 = 1
+    Else
+        pl_Max1 = n
+    End If
+End Function
+
+' Live-formula fragments (bounded population ranges).
+Private Function pl_RawPctFormula(ByVal colLtr As String, ByVal r1 As Long, ByVal r2 As Long, _
+                                  ByVal thisCell As String) As String
+    pl_RawPctFormula = "=CEILING(PERCENTRANK.EXC($" & colLtr & "$" & r1 & ":$" & colLtr & "$" & r2 & _
+                       "," & thisCell & ")*5,1)"
+End Function
+
+Private Function pl_RankPctFormula(ByVal colLtr As String, ByVal r1 As Long, ByVal r2 As Long, _
+                                   ByVal thisCell As String) As String
+    pl_RankPctFormula = "=IFERROR(CEILING((1-PERCENTRANK.EXC($" & colLtr & "$" & r1 & ":$" & colLtr & _
+                        "$" & r2 & "," & thisCell & "))*5,1),0)"
+End Function
+
+' ==========================================================================
+'  TAB-NAME PARSING  (never fails)
+' ==========================================================================
+
+Private Sub pl_ParseTab(ByVal rawName As String, ByRef outName As String, _
+                        ByRef outVoltage As Double, ByRef outParsed As Boolean)
+    ' Parse a messy cost-sheet tab name into (clean name, voltage), precedence:
+    '   1. strip a trailing standalone integer (a duplicate-file counter):
+    '      "Cecelia 138kV 1" / "... 2" both lose the 1/2.
+    '   2. extract voltage tolerantly: a number, then optional punctuation/
+    '      spaces, then "kV" (case-insensitive): 138kV / 230 kV / 230. kV ->
+    '      the numeric value.
+    '   3. clean name = the remainder with the voltage+counter removed, nbsp
+    '      and multiple spaces collapsed to one, trimmed.
+    ' Examples: "Cecelia 138kV 1"->("Cecelia",138); "Chalkley 230. kV"->
+    ' ("Chalkley",230); "Cunningham"->("Cunningham", blank).
+    outParsed = False: outVoltage = 0: outName = ""
+
+    Dim work As String
+    work = pl_NormSpaces(rawName)
+    work = pl_StripTrailingCounter(work)
+
+    Dim vFound As Boolean, vVal As Double, vStart As Long, vEnd As Long
+    pl_ExtractVoltage work, vFound, vVal, vStart, vEnd
+    If vFound Then
+        outVoltage = vVal
+        outParsed = True
+        outName = pl_NormSpaces(Left$(work, vStart - 1) & " " & Mid$(work, vEnd + 1))
+    Else
+        outName = pl_NormSpaces(work)
+    End If
+
+    If Len(outName) = 0 Then outName = pl_NormSpaces(work)
+    If Len(outName) = 0 Then outName = Trim$(rawName)
+    If Len(outName) = 0 Then outName = "(unnamed)"
+End Sub
+
+' Collapse nbsp/tabs/whitespace runs to single spaces and trim (no case change,
+' punctuation preserved so names still match the site side).
+Private Function pl_NormSpaces(ByVal s As String) As String
+    Dim t As String
+    t = Replace(s, Chr$(160), " ")
+    t = Replace(t, vbTab, " ")
+    t = Replace(t, vbCr, " ")
+    t = Replace(t, vbLf, " ")
+    Do While InStr(t, "  ") > 0
+        t = Replace(t, "  ", " ")
+    Loop
+    pl_NormSpaces = Trim$(t)
+End Function
+
+' Remove a single trailing space-delimited all-digits token (the duplicate-file
+' counter). Never strips a number that is attached to text (e.g. 138kV).
+Private Function pl_StripTrailingCounter(ByVal work As String) As String
+    Dim p As Long
+    p = InStrRev(work, " ")
+    If p > 0 Then
+        Dim tail As String
+        tail = Mid$(work, p + 1)
+        If pl_IsAllDigits(tail) Then
+            pl_StripTrailingCounter = Trim$(Left$(work, p - 1))
+            Exit Function
+        End If
+    End If
+    pl_StripTrailingCounter = work
+End Function
+
+' Find a voltage as the 2-4 digit integer IMMEDIATELY preceding "kV" -- the
+' equivalent of the regex (\d{2,4})\s*\.?\s*kV. Only spaces/nbsp/tab and at most
+' one period may sit between the digits and "kV"; the digit run itself is pure
+' digits, so an unrelated number elsewhere in the string is never pulled in
+' ("Explorer Claremore 138kV" -> 138, never 168; "Big Cajun 1 230kV" -> 230, the
+' leading unit "1" is not adjacent to kV). Sets found/value and the
+' [startPos..endPos] span (first digit .. the "V" of kV) to remove.
+Private Sub pl_ExtractVoltage(ByVal work As String, ByRef found As Boolean, _
+                              ByRef val As Double, ByRef startPos As Long, ByRef endPos As Long)
+    found = False
+    Dim lw As String: lw = LCase$(work)
+    Dim kpos As Long: kpos = InStr(1, lw, "kv")
+    Do While kpos > 0
+        ' the char after "kV" must not be a letter (avoid kVA / names like Skvortsov)
+        Dim okBoundary As Boolean
+        okBoundary = (kpos + 2 > Len(work))
+        If Not okBoundary Then okBoundary = Not pl_IsAlpha(Mid$(work, kpos + 2, 1))
+        If okBoundary Then
+            ' walk left over spaces and at most one period (the "230. kV" case)
+            Dim j As Long: j = kpos - 1
+            Dim dotSeen As Boolean: dotSeen = False
+            Do While j >= 1
+                Dim c As String: c = Mid$(work, j, 1)
+                If c = " " Or c = Chr$(160) Or c = vbTab Then
+                    j = j - 1
+                ElseIf c = "." And Not dotSeen Then
+                    dotSeen = True: j = j - 1
+                Else
+                    Exit Do
+                End If
+            Loop
+            ' require a contiguous run of digits ending here
+            If j >= 1 Then
+                If pl_IsAllDigits(Mid$(work, j, 1)) Then
+                    Dim numEnd As Long: numEnd = j
+                    Do While j >= 1
+                        If pl_IsAllDigits(Mid$(work, j, 1)) Then
+                            j = j - 1
+                        Else
+                            Exit Do
+                        End If
+                    Loop
+                    Dim numStart As Long: numStart = j + 1
+                    Dim digits As String: digits = Mid$(work, numStart, numEnd - numStart + 1)
+                    If Len(digits) >= 2 And Len(digits) <= 4 Then
+                        Dim v As Double: v = CDbl(digits)
+                        If v > 0 And v <= 2000 Then
+                            found = True: val = v: startPos = numStart: endPos = kpos + 1
+                            Exit Sub
+                        End If
+                    End If
+                End If
+            End If
+        End If
+        kpos = InStr(kpos + 1, lw, "kv")
+    Loop
+End Sub
+
+' Clean a numeric token: drop leading/trailing dots and spaces (e.g. "230." ->
+' "230"); keeps an internal decimal point.
+Private Function pl_CleanNumber(ByVal s As String) As String
+    Dim t As String: t = Replace(s, " ", "")
+    Do While Len(t) > 0
+        If Right$(t, 1) = "." Then
+            t = Left$(t, Len(t) - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+    Do While Len(t) > 0
+        If Left$(t, 1) = "." Then
+            t = Mid$(t, 2)
+        Else
+            Exit Do
+        End If
+    Loop
+    pl_CleanNumber = t
+End Function
+
+Private Function pl_IsAllDigits(ByVal s As String) As Boolean
+    Dim i As Long
+    If Len(s) = 0 Then Exit Function
+    For i = 1 To Len(s)
+        If Mid$(s, i, 1) < "0" Or Mid$(s, i, 1) > "9" Then Exit Function
+    Next i
+    pl_IsAllDigits = True
+End Function
+
+Private Function pl_IsAlpha(ByVal ch As String) As Boolean
+    Dim u As String: u = UCase$(ch)
+    pl_IsAlpha = (u >= "A" And u <= "Z")
+End Function
+
+Private Function pl_IsDigitOrDot(ByVal ch As String) As Boolean
+    pl_IsDigitOrDot = (ch >= "0" And ch <= "9") Or (ch = ".")
+End Function
+
+' ==========================================================================
+'  TRIPLE / IDENTITY HELPERS
+' ==========================================================================
+
+Private Function pl_TripleKey(ByVal nm As String, ByVal v As Double, ByVal p As Boolean, _
+                              ByVal st As String) As String
+    pl_TripleKey = LCase$(Trim$(nm)) & "|" & IIf(p, pl_NumStr(v), "") & "|" & LCase$(Trim$(st))
+End Function
+
+Private Function pl_TripleEqual(ByVal n1 As String, ByVal v1 As Double, ByVal p1 As Boolean, ByVal s1 As String, _
+                                ByVal n2 As String, ByVal v2 As Double, ByVal p2 As Boolean, ByVal s2 As String) As Boolean
+    pl_TripleEqual = (pl_TripleKey(n1, v1, p1, s1) = pl_TripleKey(n2, v2, p2, s2))
+End Function
+
+Private Function pl_TripleStr(ByVal nm As String, ByVal v As Double, ByVal p As Boolean, ByVal st As String) As String
+    pl_TripleStr = nm & ", " & IIf(p, CStr(v) & " kV", "(no voltage)") & ", " & IIf(Len(st) > 0, st, "(no state)")
+End Function
+
+Private Function pl_IdentityLabel(ByVal nm As String, ByVal v As Double, ByVal p As Boolean, ByVal st As String) As String
+    Dim lab As String: lab = nm
+    If p Then lab = lab & " " & Format$(v, "0.###") & " kV"
+    If Len(Trim$(st)) > 0 Then lab = lab & " (" & Trim$(st) & ")"
+    pl_IdentityLabel = lab
+End Function
+
+' ==========================================================================
+'  SHARED SHEET / IO / STRING HELPERS
+' ==========================================================================
+
+Private Function pl_PickFiles(ByVal title As String, ByRef outFiles() As String, _
+                              ByRef outCount As Long) As Boolean
+    Dim fd As FileDialog, i As Long, base As String
+    base = ThisWorkbook.Path
+    If Len(base) = 0 Then base = Application.DefaultFilePath
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .Title = title
+        .AllowMultiSelect = True
+        .Filters.Clear
+        .Filters.Add "Excel Files", "*.xlsx; *.xlsm; *.xls; *.xlsb"
+        .InitialFileName = base & Application.PathSeparator
+    End With
+    If fd.Show <> -1 Then
+        outCount = 0
+        pl_PickFiles = False
+        Exit Function
+    End If
+    outCount = fd.SelectedItems.Count
+    If outCount = 0 Then
+        pl_PickFiles = False
+        Exit Function
+    End If
+    ReDim outFiles(1 To outCount)
+    For i = 1 To outCount: outFiles(i) = fd.SelectedItems(i): Next i
+    pl_PickFiles = True
+End Function
+
+Private Function pl_ResolveCol(ByVal ws As Worksheet, ByVal headerText As String) As Long
+    Dim lastCol As Long, c As Long, hv As Variant
+    lastCol = ws.Cells(PL_HDR_ROW, ws.Columns.Count).End(xlToLeft).Column
+    hv = ws.Range(ws.Cells(PL_HDR_ROW, 1), ws.Cells(PL_HDR_ROW, lastCol)).Value
+    For c = 1 To lastCol
+        Dim cellTxt As String
+        If lastCol = 1 Then
+            cellTxt = Trim$(CStr(pl_NZ(hv)))
+        Else
+            cellTxt = Trim$(CStr(pl_NZ(hv(1, c))))
+        End If
+        If StrComp(cellTxt, headerText, vbTextCompare) = 0 Then
+            pl_ResolveCol = c
+            Exit Function
+        End If
+    Next c
+    pl_ResolveCol = 0
+End Function
+
+Private Function pl_MwAxis(ByRef mw() As Double) As Long
+    Dim cnt As Long, j As Long
+    cnt = CLng((PL_MW_MAX - PL_MW_MIN) / PL_MW_STEP) + 1
+    ReDim mw(1 To cnt)
+    For j = 1 To cnt: mw(j) = PL_MW_MIN + (j - 1) * PL_MW_STEP: Next j
+    pl_MwAxis = cnt
+End Function
+
+Private Function pl_BlockRead(ByVal ws As Worksheet, ByVal firstRow As Long, _
+                              ByVal lastRow As Long, ByVal cols As Long) As Variant
+    Dim rng As Range, tmp(1 To 1, 1 To 1) As Variant
+    If lastRow < firstRow Then
+        pl_BlockRead = Empty
+        Exit Function
+    End If
+    Set rng = ws.Range(ws.Cells(firstRow, 1), ws.Cells(lastRow, cols))
+    If rng.Cells.Count = 1 Then
+        tmp(1, 1) = rng.Value: pl_BlockRead = tmp
+    Else
+        pl_BlockRead = rng.Value
+    End If
+End Function
+
+Private Function pl_RowBlank(ByRef arr As Variant, ByVal r As Long, ByVal cols As Long) As Boolean
+    Dim c As Long, v As Variant
+    For c = 1 To cols
+        v = arr(r, c)
+        If Not IsEmpty(v) Then
+            If Len(Trim$(CStr(v))) > 0 Then
+                pl_RowBlank = False
+                Exit Function
+            End If
+        End If
+    Next c
+    pl_RowBlank = True
+End Function
+
+' Signature of one row of a block array (trimmed values joined by "|"), in the
+' same shape pl_HeaderSig builds -- used to detect a row that re-states a header.
+Private Function pl_RowSig(ByRef arr As Variant, ByVal r As Long, ByVal cols As Long) As String
+    Dim c As Long, parts() As String
+    ReDim parts(1 To cols)
+    For c = 1 To cols
+        parts(c) = Trim$(CStr(pl_NZ(arr(r, c))))
+    Next c
+    pl_RowSig = Join(parts, "|")
+End Function
+
+Private Function pl_TrimRows(ByRef arr() As Variant, ByVal rows As Long, ByVal cols As Long) As Variant
+    Dim outArr() As Variant, r As Long, c As Long
+    ReDim outArr(1 To rows, 1 To cols)
+    For r = 1 To rows
+        For c = 1 To cols: outArr(r, c) = arr(r, c): Next c
+    Next r
+    pl_TrimRows = outArr
+End Function
+
+Private Sub pl_GrowRaw(ByRef a() As String, ByRef b() As String, ByRef c() As Double, _
+                       ByRef d() As Boolean, ByRef e() As String, ByRef f() As Long, _
+                       ByRef g() As Double, ByRef h() As Double, ByRef gp() As Boolean)
+    Dim newSize As Long: newSize = UBound(a) * 2
+    ReDim Preserve a(1 To newSize): ReDim Preserve b(1 To newSize)
+    ReDim Preserve c(1 To newSize): ReDim Preserve d(1 To newSize)
+    ReDim Preserve e(1 To newSize): ReDim Preserve f(1 To newSize)
+    ReDim Preserve g(1 To newSize): ReDim Preserve h(1 To newSize)
+    ReDim Preserve gp(1 To newSize)
+End Sub
+
+Private Function pl_ColLetter(ByVal col As Long) As String
+    Dim s As String, rmn As Long
+    Do While col > 0
+        rmn = (col - 1) Mod 26
+        s = Chr$(65 + rmn) & s
+        col = (col - 1) \ 26
+    Loop
+    pl_ColLetter = s
+End Function
+
+Private Function pl_FullCol(ByVal col As Long) As String
+    Dim L As String: L = pl_ColLetter(col)
+    pl_FullCol = "$" & L & ":$" & L
+End Function
+
+' Bounded column reference $L$r1:$L$r2 (never whole-column, for live formulas).
+Private Function pl_BoundCol(ByVal col As Long, ByVal r1 As Long, ByVal r2 As Long) As String
+    Dim L As String: L = pl_ColLetter(col)
+    pl_BoundCol = "$" & L & "$" & r1 & ":$" & L & "$" & r2
+End Function
+
+Private Function pl_SheetRef(ByVal nm As String) As String
+    pl_SheetRef = "'" & Replace(nm, "'", "''") & "'"
+End Function
+
+Private Function pl_EscQuote(ByVal s As String) As String
+    pl_EscQuote = Replace(s, """", """""")
+End Function
+
+Private Function pl_NumStr(ByVal v As Double) As String
+    pl_NumStr = Format$(v, "0.###############")
+    pl_NumStr = Replace(pl_NumStr, ",", ".")
+End Function
+
+Private Function pl_NZ(ByVal v As Variant) As Variant
+    If IsError(v) Then
+        pl_NZ = ""
+    ElseIf IsNull(v) Then
+        pl_NZ = ""
+    Else
+        pl_NZ = v
+    End If
+End Function
+
+Private Function pl_FileName(ByVal fullPath As String) As String
+    Dim p As Long
+    p = InStrRev(fullPath, Application.PathSeparator)
+    If p = 0 Then p = InStrRev(fullPath, "\")
+    If p = 0 Then
+        pl_FileName = fullPath
+    Else
+        pl_FileName = Mid$(fullPath, p + 1)
+    End If
+End Function
+
+Private Sub pl_Status(ByVal msg As String)
+    On Error Resume Next
+    Application.StatusBar = msg
+    On Error GoTo 0
+End Sub
+
+' ==========================================================================
+'  RUN LOG
+' ==========================================================================
+
+Private Sub pl_LogInit(ByRef log As PL_TLog)
+    ReDim log.lines(1 To 16): log.n = 0
+End Sub
+
+Private Sub pl_LogAdd(ByRef log As PL_TLog, ByVal s As String)
+    log.n = log.n + 1
+    If log.n > UBound(log.lines) Then ReDim Preserve log.lines(1 To UBound(log.lines) * 2)
+    log.lines(log.n) = s
+End Sub
+
+Private Sub pl_WriteLog(ByRef log As PL_TLog)
+    Dim ws As Worksheet, i As Long, blk() As Variant
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(PL_SH_LOG)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        ws.Name = PL_SH_LOG
+    Else
+        ws.Cells.Clear
+    End If
+    ws.Cells(1, 1).Value = "Interconnect Pipeline -- Run Log"
+    ws.Cells(1, 1).Font.Bold = True
+    If log.n > 0 Then
+        ReDim blk(1 To log.n, 1 To 1)
+        For i = 1 To log.n: blk(i, 1) = log.lines(i): Next i
+        ws.Range(ws.Cells(2, 1), ws.Cells(1 + log.n, 1)).Value = blk
+    End If
+    ws.Columns(1).ColumnWidth = 120
+
+    If WRITE_LOG_TO_FILE Then pl_WriteLogFile log
+End Sub
+
+' Fix 4: optional external copy of the run log, beside the saved workbook, so the
+' transcript survives independent of the _Pipeline Log tab. Best-effort only.
+Private Sub pl_WriteLogFile(ByRef log As PL_TLog)
+    On Error Resume Next
+    If Len(ThisWorkbook.Path) = 0 Then Exit Sub      ' nowhere to write until saved
+    Dim base As String: base = ThisWorkbook.Name
+    Dim dot As Long: dot = InStrRev(base, ".")
+    If dot > 1 Then base = Left$(base, dot - 1)
+    Dim path As String
+    path = ThisWorkbook.Path & Application.PathSeparator & base & "_PipelineLog.txt"
+    Dim ff As Integer: ff = FreeFile
+    Open path For Output As #ff
+    Print #ff, "Interconnect Pipeline -- Run Log (" & Format$(Now, "yyyy-mm-dd hh:nn:ss") & ")"
+    Dim i As Long
+    For i = 1 To log.n
+        Print #ff, log.lines(i)
+    Next i
+    Close #ff
+    On Error GoTo 0
+End Sub
+
+' ==========================================================================
+'  FRONT-HALF + SCALE + PARITY SELF-TESTS  (called from SelfTest)
+' ==========================================================================
+
+Private Sub pl_FrontHalfSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    Debug.Print "--- front-half / scaling tests ---"
+
+    ' 1) Tab-name parsing (strip trailing counter; tolerant kV; clean name)
+    Dim nm As String, v As Double, p As Boolean
+    pl_ParseTab "Cecelia 138kV 1", nm, v, p
+    Assert ((nm = "Cecelia") And p And (v = 138)), _
+           "Tab parse: 'Cecelia 138kV 1' -> ('Cecelia', 138)", passCount, failCount
+    pl_ParseTab "Cecelia 138kV 2", nm, v, p
+    Assert ((nm = "Cecelia") And p And (v = 138)), _
+           "Tab parse: 'Cecelia 138kV 2' -> ('Cecelia', 138)", passCount, failCount
+    pl_ParseTab "Chalkley 230. kV", nm, v, p
+    Assert ((nm = "Chalkley") And p And (v = 230)), _
+           "Tab parse: 'Chalkley 230. kV' -> ('Chalkley', 230)", passCount, failCount
+    pl_ParseTab "Cunningham", nm, v, p
+    Assert ((nm = "Cunningham") And (Not p)), _
+           "Tab parse: 'Cunningham' -> ('Cunningham', blank)", passCount, failCount
+
+    ' Two Cecelia tabs differing only by counter share one cost identity key.
+    Dim n1 As String, v1 As Double, p1 As Boolean, n2 As String, v2 As Double, p2 As Boolean
+    pl_ParseTab "Cecelia 138kV 1", n1, v1, p1
+    pl_ParseTab "Cecelia 138kV 2", n2, v2, p2
+    Assert (pl_CostKey(n1, v1, p1) = pl_CostKey(n2, v2, p2)), _
+           "Dedupe: the two Cecelia tabs collapse to one cost identity key", passCount, failCount
+
+    ' 2) Triple dedupe (dictionary)
+    Dim rn() As String, rst() As String, rv() As Double, rp() As Boolean, rf() As String, rr() As Long
+    ReDim rn(1 To 5): ReDim rst(1 To 5): ReDim rv(1 To 5)
+    ReDim rp(1 To 5): ReDim rf(1 To 5): ReDim rr(1 To 5)
+    pl_FillSite rn, rv, rp, rst, rf, rr, 1, "Alpha", 345, True, "NM"
+    pl_FillSite rn, rv, rp, rst, rf, rr, 2, "Alpha", 345, True, "NM"
+    pl_FillSite rn, rv, rp, rst, rf, rr, 3, "Alpha", 230, True, "NM"
+    pl_FillSite rn, rv, rp, rst, rf, rr, 4, "Alpha", 345, True, "TX"
+    pl_FillSite rn, rv, rp, rst, rf, rr, 5, "Alpha", 345, True, "NM"
+    Dim dt() As PL_TSiteTriple, dropped As Long, dlog As PL_TLog: pl_LogInit dlog
+    Dim dc As Long: dc = pl_DedupTriples(rn, rv, rp, rst, 5, rf, rr, dt, dlog, dropped)
+    Assert (dc = 3), "Triple dedupe: 5 rows -> 3 distinct (dictionary)", passCount, failCount
+    Assert (dropped = 2), "Triple dedupe: 2 duplicates dropped and logged", passCount, failCount
+    Assert (pl_HasTriple(dt, dc, "Alpha", 230, True, "NM")), _
+           "Triple dedupe: voltage-differ kept separate", passCount, failCount
+    Assert (pl_HasTriple(dt, dc, "Alpha", 345, True, "TX")), _
+           "Triple dedupe: state-differ kept separate", passCount, failCount
+
+    ' 3) Join intersection (dictionary keys)
+    Dim dId As Object: Set dId = CreateObject("Scripting.Dictionary")
+    dId.Add pl_CostKey("Alpha", 345, True), 1
+    dId.Add pl_CostKey("Delta", 0, False), 2
+    dId.Add pl_CostKey("Gamma", 0, False), 3      ' no site -> cost w/o site
+    Dim tA As PL_TSiteTriple, tB As PL_TSiteTriple, tD As PL_TSiteTriple
+    tA.Name = "Alpha": tA.Voltage = 345: tA.VoltParsed = True: tA.State = "NM"
+    tB.Name = "Beta": tB.VoltParsed = False: tB.State = "OK"      ' no cost
+    tD.Name = "Delta": tD.VoltParsed = False: tD.State = "TX"     ' bare match
+    Assert (pl_ResolveMatchKey(tA, dId) = pl_CostKey("Alpha", 345, True)), _
+           "Join: Alpha 345 -> name+voltage match", passCount, failCount
+    Assert (pl_ResolveMatchKey(tD, dId) = pl_CostKey("Delta", 0, False)), _
+           "Join: Delta -> bare name match", passCount, failCount
+    Assert (pl_ResolveMatchKey(tB, dId) = ""), "Join: Beta -> no cost (alignment error)", passCount, failCount
+
+    ' 4) Matrix shape + values (piecewise T/MW == SUMIFS definition)
+    Dim mwx() As Double, mc As Long: mc = pl_MwAxis(mwx)
+    Assert ((mc = 21) And (mwx(1) = 100) And (mwx(mc) = 300)), _
+           "Matrix axis: 100..300 step 10 = 21 points", passCount, failCount
+    ' one substation, tiers T=100 at 100+, T=200 at 200+  => cost(100)=1.0MM etc.
+    ' cumulative alloc: trig 100 alloc 100; trig 200 alloc 100.
+    Assert (pl_PiecewiseCost(100, 100) = 1), "Matrix value: cost at 100 = T/MW", passCount, failCount
+    ' body defaults to live SUMIFS formulas, resolved by header name + MW cell
+    Assert (USE_LIVE_SUMIFS = True), "Matrix: USE_LIVE_SUMIFS defaults to True (formulas)", passCount, failCount
+    Dim fSum As String
+    fSum = pl_SumifsFormula("Cost Data", 8, 5, 6, 7, "Cecelia", True, 138, "D$1", 2, 100)
+    Assert ((Left$(fSum, 8) = "=SUMIFS(") And (InStr(fSum, "D$1") > 0) And (InStr(fSum, "138") > 0)), _
+           "Matrix: body cell is a bounded SUMIFS formula keyed to the MW cell", passCount, failCount
+
+    ' 4b) Stage-4 Matrix-validity guard is explicit, never a silent no-op
+    Dim gm As PL_TMatrix, rsn As String, gi As Long, gj As Long
+    gm.ok = True: gm.matchedCount = 2: gm.mwCount = 3
+    ReDim gm.mw(1 To 3): gm.mw(1) = 100: gm.mw(2) = 110: gm.mw(3) = 120
+    ReDim gm.names(1 To 2): gm.names(1) = "A": gm.names(2) = "B"
+    ReDim gm.costM(1 To 2, 1 To 3)
+    For gi = 1 To 2
+        For gj = 1 To 3
+            gm.costM(gi, gj) = 1000
+        Next gj
+    Next gi
+    Assert (pl_Stage4MatrixValid(gm, rsn)), "Stage 4 guard: a valid matrix passes", passCount, failCount
+    Dim em As PL_TMatrix
+    em.ok = True: em.matchedCount = 0: em.mwCount = 3
+    ReDim em.mw(1 To 3): em.mw(1) = 100: em.mw(2) = 110: em.mw(3) = 120
+    Assert ((Not pl_Stage4MatrixValid(em, rsn)) And (InStr(rsn, "0 valid substation rows") > 0)), _
+           "Stage 4 guard: an emptied matrix stops with the explicit message", passCount, failCount
+
+    ' 4c) Zero-cost cells are VALID (headroom); only NEGATIVE costs error.
+    '     A substation whose first upgrade triggers at 130 MW has $0 at
+    '     100/110/120 -- the analysis must run to completion, segment the
+    '     leading zero region on its own, and never divide by / Log() a zero.
+    Dim zj As Long
+    Dim zmw() As Double: ReDim zmw(1 To 8)
+    zmw(1) = 100: zmw(2) = 110: zmw(3) = 120: zmw(4) = 130
+    zmw(5) = 140: zmw(6) = 150: zmw(7) = 160: zmw(8) = 170
+    Dim zm As PL_TMatrix
+    zm.ok = True: zm.matchedCount = 1: zm.mwCount = 8
+    ReDim zm.mw(1 To 8)
+    For zj = 1 To 8: zm.mw(zj) = zmw(zj): Next zj
+    ReDim zm.names(1 To 1): zm.names(1) = "Napoleon 138 kV (Indiana)"
+    ReDim zm.costM(1 To 1, 1 To 8)
+    Dim zT() As Double: ReDim zT(1 To 8)
+    Dim zc() As Double: ReDim zc(1 To 8)
+    For zj = 1 To 8
+        If zmw(zj) < 130 Then
+            zc(zj) = 0#                       ' below first trigger = headroom
+        Else
+            zc(zj) = 6500000# / zmw(zj)       ' constant $6.5MM total above trigger
+        End If
+        zm.costM(1, zj) = zc(zj)
+        zT(zj) = zc(zj) * zmw(zj)
+    Next zj
+
+    ' (a) Stage 4 accepts the matrix -- leading zeros no longer abort.
+    Dim zrsn As String
+    Assert (pl_Stage4MatrixValid(zm, zrsn)), _
+           "Stage 4 zero-cost: leading $0 cells are valid, matrix runs", passCount, failCount
+
+    ' (b) A genuinely negative cost still errors, with a clear reason.
+    Dim negM As PL_TMatrix
+    negM.ok = True: negM.matchedCount = 1: negM.mwCount = 8
+    ReDim negM.mw(1 To 8)
+    For zj = 1 To 8: negM.mw(zj) = zmw(zj): Next zj
+    ReDim negM.names(1 To 1): negM.names(1) = "Napoleon 138 kV (Indiana)"
+    ReDim negM.costM(1 To 1, 1 To 8)
+    For zj = 1 To 8: negM.costM(1, zj) = zm.costM(1, zj): Next zj
+    negM.costM(1, 2) = -5#
+    Assert ((Not pl_Stage4MatrixValid(negM, zrsn)) And (InStr(zrsn, "negative cost") > 0)), _
+           "Stage 4 zero-cost: a negative cost still errors explicitly", passCount, failCount
+
+    ' (c) Segmentize splits the leading zero region as its own T=0 segment
+    '     (0->0 same segment, 0->nonzero boundary) with no divide-by-zero.
+    Dim zsg() As TSegment: zsg = Segmentize(zmw, zT, 8)
+    Assert (UBound(zsg) = 2) And (zsg(1).FirstJ = 1) And (zsg(1).LastJ = 3) _
+           And (zsg(1).Ttotal = 0) And (zsg(2).FirstJ = 4), _
+           "Stage 4 zero-cost: leading $0 forms its own T=0 segment", passCount, failCount
+
+    ' (d) FittedString renders the leading zero region then the step, no #DIV/0!.
+    Dim zfit As String: zfit = FittedString(zmw, zT, zsg, UBound(zsg), 8, zc)
+    Assert ((InStr(zfit, "y = 0 / x") > 0) And (InStr(zfit, "100-120 MW") > 0)), _
+           "Stage 4 zero-cost: fitted function shows the leading zero region", passCount, failCount
+
+    ' (e) KneeXStar on the all-zero segment is defined (geometric mean), no 0/0.
+    Dim zknee As Double: zknee = KneeXStar(zmw, zT, zsg(1))
+    Assert (Abs(zknee - Sqr(100# * 120#)) < 0.5), _
+           "Stage 4 zero-cost: knee on the all-zero segment = Sqr(x1*x2)", passCount, failCount
+
+    ' (f) Headroom = first trigger MW = first MW whose cost is > 0.
+    Dim zHR As Double: zHR = 0
+    For zj = 1 To 8
+        If zc(zj) > 0# Then
+            zHR = zmw(zj)
+            Exit For
+        End If
+    Next zj
+    Assert (zHR = 130), "Stage 4 zero-cost: headroom = first trigger (130 MW)", passCount, failCount
+
+    ' 5) Scoring ceiling + $25MM band all-zero on the fixture
+    Assert (CLng(pl_ScoreCeiling(4)) = 165), "Scoring: weighted-score maximum is 165", passCount, failCount
+    Assert (CLng(pl_ScoreCeiling(3)) = 125), "Scoring: practical maximum (3 bands) is 125", passCount, failCount
+    Dim fmw() As Double, fnames() As String, fcost() As Double, fn As Long, fm As Long
+    LoadFixture fmw, fnames, fcost, fn, fm
+    Dim rkC() As Long, rkMx() As Double, rkCm() As Double, rkS() As Double, rkH() As Boolean
+    Dim rA() As Long, rB() As Long
+    ComputeRankings fmw, fnames, fcost, fn, fm, rkC, rkMx, rkCm, rkS, rkH, rA, rB
+    Dim b25a() As Long, b25b() As Long
+    b25a = pl_RankBucketArray(rA, 1, fn): b25b = pl_RankBucketArray(rB, 1, fn)
+    Dim allZero As Boolean: allZero = True
+    Dim i As Long
+    For i = 1 To fn
+        If b25a(i) <> 0 Or b25b(i) <> 0 Then allZero = False
+    Next i
+    Assert ((fn = 17) And allZero), "Scoring: all 17 $25MM band percentiles are 0", passCount, failCount
+
+    ' 6) Headroom
+    Dim trg() As Double: ReDim trg(1 To 3): trg(1) = 200: trg(2) = 130: trg(3) = 260
+    Assert (pl_MinHeadroom(trg, 3) = 130), "Headroom: 130/200/260 -> 130", passCount, failCount
+    Dim hv2() As Double: ReDim hv2(1 To 5)
+    hv2(1) = 50: hv2(2) = 130: hv2(3) = 200: hv2(4) = 260: hv2(5) = 300
+    Dim hb() As Long: hb = pl_RawBucketArray(hv2, 5)
+    Assert (hb(5) = 5), "Headroom pctile: largest -> 5", passCount, failCount
+    Assert (hb(1) = 1), "Headroom pctile: smallest -> 1", passCount, failCount
+
+    ' 7) Parity: VBA buckets == Excel PERCENTRANK.EXC/CEILING (round-trip)
+    pl_ParitySelfTest passCount, failCount
+
+    ' 8) Scale smoke test: 2,000 synthetic substations, no O(N^2) blow-up
+    pl_ScaleSmokeTest passCount, failCount
+
+    ' 9) Durability / resume checkpoints
+    pl_CheckpointSelfTest passCount, failCount
+
+    ' 10) Header-row guard: consolidation keeps data rows only
+    pl_HeaderGuardSelfTest passCount, failCount
+
+    ' 11) Header-row DETECTION: field-name row is chosen, not the band row
+    pl_HeaderDetectSelfTest passCount, failCount
+
+    ' 12) Matrix membership = all Cost Data subs; State is a left-join attachment
+    pl_MatrixMembershipSelfTest passCount, failCount
+
+    ' 13) RebuildAudit regenerates the log/audit from sheets (no re-run)
+    pl_RebuildAuditSelfTest passCount, failCount
+
+    ' 14) File accounting: every selected file accounted for (LOST vs redundant)
+    pl_FileAccountingSelfTest passCount, failCount
+
+    ' 15) Site<->Cost matching: shared name normalization makes genuine pairs match
+    pl_NameMatchSelfTest passCount, failCount
+
+    ' 16) Analysis layout: identity split + Weighted Score references resolve
+    pl_AnalysisLayoutSelfTest passCount, failCount
+
+    ' 17) Headroom = 0 scores percentile 0; positives rank among positives
+    pl_HeadroomZeroSelfTest passCount, failCount
+
+    ' 18) _Site Only classification: near-miss = bug, absent = gap; bugs sort first
+    pl_SiteOnlyClassifySelfTest passCount, failCount
+
+    Debug.Print "  NOTE: run Debug > Compile VBAProject to confirm zero compile" & _
+                " errors (a compile break cannot be asserted from runtime)."
+End Sub
+
+' Fix 4 (classification): an unmatched site whose SHARED-normalized name equals a
+' known cost substation's normalized name is a "Likely match bug" (voltage/counter
+' near-miss), while a name absent from the cost side is "No cost study found".
+' Mirrors the dCostName decision inside pl_BuildMatrix. Also confirms the sort key
+' lists every bug (reason 1) ahead of every gap (reason 2), regardless of state.
+Private Sub pl_SiteOnlyClassifySelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    ' Build the normalized-name -> cost-key dictionary the way pl_BuildMatrix does.
+    Dim dCostName As Object: Set dCostName = CreateObject("Scripting.Dictionary")
+    dCostName(pl_NormSubName("Cecelia 138kV 1")) = "cecelia|138"
+    dCostName(pl_NormSubName("Cunningham 345kV")) = "cunningham|345"
+
+    ' (a) a site name that normalizes onto a cost name -> reason 1 (bug), and the
+    '     closest cost key is surfaced for the reviewer.
+    Dim nnHit As String: nnHit = pl_NormSubName("Cecelia 138kV 2")
+    Assert (dCostName.Exists(nnHit)), _
+           "SiteOnly: 'Cecelia 138kV 2' normalizes onto a cost name (reason 1 = bug)", _
+           passCount, failCount
+    Assert (CStr(dCostName(nnHit)) = "cecelia|138"), _
+           "SiteOnly: closest cost key for the near-miss is surfaced", passCount, failCount
+
+    ' (b) a name absent from the cost side -> reason 2 (no cost study found)
+    Assert (Not dCostName.Exists(pl_NormSubName("Nowhere Junction 138kV"))), _
+           "SiteOnly: an absent name is reason 2 (no cost study found)", passCount, failCount
+
+    ' (c) the sort key lists every bug ahead of every gap, regardless of state/name
+    Assert (pl_SiteOnlyKey(1, "WY", "zzz") < pl_SiteOnlyKey(2, "AL", "aaa")), _
+           "SiteOnly: bugs (reason 1) sort before gaps (reason 2)", passCount, failCount
+    Assert (pl_SiteOnlyKey(1, "AL", "a") < pl_SiteOnlyKey(1, "TX", "a")), _
+           "SiteOnly: within a reason, rows sort by state", passCount, failCount
+End Sub
+
+' Fix 1: headroom = 0 (or no positive trigger) is excluded from the ranked
+' population and scores percentile 0 -- the worst case, like a non-qualifier --
+' while strictly-positive headrooms rank 1-5 among themselves only.
+Private Sub pl_HeadroomZeroSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    Dim hv() As Double: ReDim hv(1 To 5)
+    hv(1) = 50: hv(2) = 0: hv(3) = 200: hv(4) = 300: hv(5) = 0
+    Dim part() As Boolean: ReDim part(1 To 5)
+    Dim i As Long
+    For i = 1 To 5: part(i) = (hv(i) > 0): Next i
+    Dim b() As Long: b = pl_RawBucketArrayMasked(hv, part, 5)
+
+    Assert (b(2) = 0 And b(5) = 0), _
+           "Headroom 0 -> percentile 0 (masked out, not a ranked bucket)", passCount, failCount
+    Assert (b(1) >= 1 And b(3) >= 1 And b(4) >= 1), _
+           "Positive headroom scores 1-5", passCount, failCount
+    Assert (b(4) >= b(3) And b(3) >= b(1)), _
+           "Headroom ranking among positives: 300 >= 200 >= 50", passCount, failCount
+    Dim ranked As Long: ranked = 0
+    For i = 1 To 5
+        If b(i) > 0 Then ranked = ranked + 1
+    Next i
+    Assert (ranked = 3), _
+           "Only the 3 positive-headroom substations enter the ranked population", passCount, failCount
+End Sub
+
+' Fix 2: the SHARED name-clean + voltage-parse routines must make a site name
+' with the voltage embedded key-equal to the clean cost name, strip the trailing
+' file counter, key voltage as a clean integer (no trailing "."), and extract the
+' digits adjacent to kV. Checks the named bug-report cases.
+Private Sub pl_NameMatchSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    ' (a) trailing counter after the voltage is stripped; unit number before it kept
+    Assert (pl_NormSubName("Cecelia 138kV 1") = "cecelia"), _
+           "NormName: 'Cecelia 138kV 1' -> 'cecelia' (counter stripped)", passCount, failCount
+    Assert (pl_NormSubName("Cecelia 138kV 2") = "cecelia"), _
+           "NormName: 'Cecelia 138kV 2' -> 'cecelia' (counter stripped)", passCount, failCount
+    Assert (pl_NormSubName("Big Cajun 1 230kV") = "big cajun 1"), _
+           "NormName: 'Big Cajun 1 230kV' -> 'big cajun 1' (unit # kept)", passCount, failCount
+    Assert (pl_NormSubName("Big Cajun 1") = "big cajun 1"), _
+           "NormName: clean cost 'Big Cajun 1' -> 'big cajun 1' (no voltage -> unit kept)", passCount, failCount
+    Assert (pl_NormSubName("Ponderosa 500 kV") = "ponderosa"), _
+           "NormName: 'Ponderosa 500 kV' -> 'ponderosa'", passCount, failCount
+    Assert (pl_NormSubName("Grimes 138. kV") = "grimes"), _
+           "NormName: 'Grimes 138. kV' -> 'grimes'", passCount, failCount
+
+    ' (b) voltage is a clean integer, extracted from the digits adjacent to kV
+    Assert (pl_VoltFrom("Explorer Claremore 138kV") = 138), _
+           "VoltFrom: 'Explorer Claremore 138kV' -> 138 (adjacent digits, not 168)", passCount, failCount
+    Assert (pl_VoltFrom("Big Cajun 1 230kV") = 230), _
+           "VoltFrom: 'Big Cajun 1 230kV' -> 230 (not the unit 1)", passCount, failCount
+    Assert (pl_VoltStr(138#) = "138" And pl_VoltStr(345#) = "345"), _
+           "VoltStr: whole voltage -> clean integer, never '138.'", passCount, failCount
+
+    ' (c) the two Cecelia files collapse to the same key AND match the cost side
+    Assert (pl_CostKey("Cecelia 138kV 1", 0, False) = "cecelia|138"), _
+           "Key: 'Cecelia 138kV 1' -> 'cecelia|138' (no trailing dot)", passCount, failCount
+    Assert (pl_CostKey("Cecelia 138kV 1", 0, False) = pl_CostKey("Cecelia 138kV 2", 0, False)), _
+           "Key: Cecelia ...1 and ...2 collapse to one key", passCount, failCount
+    Assert (pl_CostKey("Cecelia 138kV 1", 0, False) = pl_CostKey("Cecelia", 138#, True)), _
+           "Key: site 'Cecelia 138kV 1' == cost 'Cecelia' @ 138", passCount, failCount
+
+    ' no key anywhere ends with a trailing '.'
+    Dim probe As String: probe = pl_CostKey("Grimes 138. kV", 0, False)
+    Assert (Right$(probe, 1) <> "." And probe = "grimes|138"), _
+           "Key: 'Grimes 138. kV' -> 'grimes|138' (integer voltage, no dot)", passCount, failCount
+
+    ' (d) the named bug-report pairs match: site (voltage embedded) == cost (clean)
+    Dim cases As Variant, volt As Variant, k As Long
+    cases = Array("Big Cajun 1", "Ponderosa", "Cincinnati", "Mockingbird", "Grimes")
+    volt = Array(230#, 500#, 345#, 138#, 138#)
+    For k = LBound(cases) To UBound(cases)
+        Dim site As String, cost As String
+        site = pl_CostKey(CStr(cases(k)) & " " & CStr(CLng(volt(k))) & "kV", 0, False)
+        cost = pl_CostKey(CStr(cases(k)), CDbl(volt(k)), True)
+        Assert (site = cost), _
+               "Match: site '" & CStr(cases(k)) & " " & CStr(CLng(volt(k))) & "kV' == cost '" & _
+               CStr(cases(k)) & "' @ " & CStr(CLng(volt(k))), passCount, failCount
+    Next k
+End Sub
+
+' Fix 3: trace the analysis column map for the default nt=4 layout and confirm
+' the Weighted Score's component references resolve to the NEW column positions
+' (flattening pctile + one band-score column per threshold; band score itself =
+' $B$2 * (breadth pctile + slope pctile)). Mirrors the map inside WriteSheet.
+Private Sub pl_AnalysisLayoutSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    Dim nt As Long: nt = 4
+    Dim cWS As Long: cWS = 4
+    Dim cFlatP As Long: cFlatP = 9
+    Dim cRank0 As Long: cRank0 = 10
+    Dim cDet0 As Long: cDet0 = (cRank0 + 2 * nt) + 5      ' = 23 for nt=4
+
+    ' identity is the first three columns, headline results next to the name
+    Assert (pl_ColLetter(1) = "A" And pl_ColLetter(2) = "B" And pl_ColLetter(3) = "C"), _
+           "Layout: identity = A/B/C (Substation | Voltage | State)", passCount, failCount
+    Assert (pl_ColLetter(cWS) = "D" And pl_ColLetter(5) = "E" And pl_ColLetter(6) = "F"), _
+           "Layout: Weighted Score/WS pctile/Headroom at D/E/F (next to name)", passCount, failCount
+    Assert (pl_ColLetter(cFlatP) = "I"), "Layout: Flattening pctile at I", passCount, failCount
+
+    ' Weighted Score = flattening pctile + sum of band-score columns
+    Dim expect As String, k As Long
+    expect = "=" & pl_ColLetter(cFlatP) & "4"
+    For k = 0 To nt - 1
+        expect = expect & "+" & pl_ColLetter(cDet0 + 5 * k + 4) & "4"
+    Next k
+    Assert (expect = "=I4+AA4+AF4+AK4+AP4"), _
+           "Layout: Weighted Score (row 4) = I4+AA4+AF4+AK4+AP4", passCount, failCount
+
+    ' first band score = $B$2 * (its breadth pctile + slope pctile)
+    Dim band0 As String
+    band0 = "=$B$2*(" & pl_ColLetter(cDet0 + 2) & "4+" & pl_ColLetter(cDet0 + 3) & "4)"
+    Assert (band0 = "=$B$2*(Y4+Z4)"), _
+           "Layout: $25MM band score = $B$2*(Y4+Z4)", passCount, failCount
+End Sub
+
+' The real header bug: source cost sheets have a "band" row above the field-name
+' header. Assert pl_DetectHeaderRow picks the field-name row (not the band), and
+' that the match is whitespace/case-normalized. Uses a scratch sheet.
+Private Sub pl_HeaderDetectSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets.Add
+
+    ' Row 1: band labels (must NOT be taken as the header).
+    ws.Range("A1").Value = "Monitored Element"
+    ws.Range("C1").Value = "Worst Case Contingency"
+    ws.Range("E1").Value = "Cost Allocation"
+    ' Row 2: the real field-name header.
+    ws.Range("A2").Value = "Substation"
+    ws.Range("B2").Value = PL_HDR_TRIGGER
+    ws.Range("C2").Value = "Monitoring"
+    ws.Range("D2").Value = PL_HDR_ALLOC
+    ' Rows 3-4: data.
+    ws.Range("A3").Value = "Alpha": ws.Range("B3").Value = 100: ws.Range("D3").Value = 5000000#
+    ws.Range("A4").Value = "Beta": ws.Range("B4").Value = 150: ws.Range("D4").Value = 6000000#
+
+    Dim lastCol As Long, lastRow As Long
+    lastCol = 5: lastRow = 4
+    Assert (pl_DetectHeaderRow(ws, 1, lastRow, lastCol) = 2), _
+           "Header detect: field-name row (2) chosen, not the band row (1)", passCount, failCount
+    Assert (Not pl_RowHasCostHeaders(ws, 1, lastCol)), _
+           "Header detect: band row is not mistaken for the header", passCount, failCount
+    Assert (pl_RowHasCostHeaders(ws, 2, lastCol)), _
+           "Header detect: field-name row recognised", passCount, failCount
+
+    ' Normalized match: a non-breaking space and a double space still match.
+    ws.Range("B2").Value = "Size" & Chr$(160) & "Overload  Occurs (MW)"
+    Assert (pl_RowHasCostHeaders(ws, 2, lastCol)), _
+           "Header detect: normalized match (nbsp / collapsed whitespace)", passCount, failCount
+
+    Application.DisplayAlerts = False
+    ws.Delete
+    Application.DisplayAlerts = prevAlerts
+    Exit Sub
+Fail:
+    On Error Resume Next
+    If Not ws Is Nothing Then ws.Delete
+    Application.DisplayAlerts = True
+    Assert (False), "Header-detect self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+' Matrix membership: rows = EVERY distinct Cost Data substation; State is a
+' LEFT JOIN (blank when the substation has no Site Data match); a Cost Data
+' substation absent from Site Data is NEVER dropped. Also proves the identity is
+' three separate columns and the body cells are live SUMIFS. Uses scratch sheets.
+Private Sub pl_MatrixMembershipSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+
+    ' Cost Data: Cecelia has TWO rows (both source files), Marlin has one.
+    Dim wsC As Worksheet: Set wsC = ThisWorkbook.Worksheets.Add
+    wsC.Cells(1, 1).Value = PL_HDR_NAME
+    wsC.Cells(1, 2).Value = PL_HDR_VOLT
+    wsC.Cells(1, 3).Value = PL_HDR_TRIGGER
+    wsC.Cells(1, 4).Value = PL_HDR_ALLOC
+    wsC.Cells(2, 1).Value = "Cecelia": wsC.Cells(2, 2).Value = 138: wsC.Cells(2, 3).Value = 100: wsC.Cells(2, 4).Value = 5000000#
+    wsC.Cells(3, 1).Value = "Cecelia": wsC.Cells(3, 2).Value = 138: wsC.Cells(3, 3).Value = 150: wsC.Cells(3, 4).Value = 3000000#
+    wsC.Cells(4, 1).Value = "Marlin": wsC.Cells(4, 2).Value = 230: wsC.Cells(4, 3).Value = 120: wsC.Cells(4, 4).Value = 4000000#
+
+    ' Site Data: Cecelia present (Kentucky); Marlin ABSENT (no state to attach).
+    Dim wsS As Worksheet: Set wsS = ThisWorkbook.Worksheets.Add
+    wsS.Cells(1, 1).Value = PL_HDR_NAME
+    wsS.Cells(1, 2).Value = "State"
+    wsS.Cells(1, 3).Value = PL_HDR_VOLT
+    wsS.Cells(2, 1).Value = "Cecelia": wsS.Cells(2, 2).Value = "Kentucky": wsS.Cells(2, 3).Value = 138
+
+    Dim log As PL_TLog: pl_LogInit log
+    Dim mtx As PL_TMatrix
+    Dim wsM As Worksheet: Set wsM = Nothing
+    Dim okB As Boolean
+    okB = pl_BuildMatrix(log, wsC, wsS, wsM, mtx, False)
+    Assert (okB), "Matrix membership: pl_BuildMatrix succeeds", passCount, failCount
+
+    ' Every distinct Cost Data substation appears exactly once.
+    Assert (mtx.matchedCount = 2), _
+           "Matrix membership: both distinct Cost Data subs appear (Cecelia + Marlin)", passCount, failCount
+    Dim iCec As Long, iMar As Long, cCec As Long, ii As Long
+    iCec = 0: iMar = 0: cCec = 0
+    For ii = 1 To mtx.matchedCount
+        If mtx.keyName(ii) = "Cecelia" Then
+            iCec = ii: cCec = cCec + 1
+        End If
+        If mtx.keyName(ii) = "Marlin" Then iMar = ii
+    Next ii
+    Assert ((iCec > 0) And (cCec = 1) And (iMar > 0)), _
+           "Matrix membership: Cecelia present exactly once, Marlin present", passCount, failCount
+
+    ' State is a LEFT JOIN: filled for Cecelia, blank (not dropped) for Marlin.
+    Assert (StrComp(CStr(wsM.Cells(iCec + 1, 3).Value & ""), "Kentucky", vbTextCompare) = 0), _
+           "Matrix state: Cecelia State left-joined from Site Data (Kentucky)", passCount, failCount
+    Assert (Len(Trim$(CStr(wsM.Cells(iMar + 1, 3).Value & ""))) = 0), _
+           "Matrix state: Marlin (no Site Data) still appears with a BLANK State", passCount, failCount
+
+    ' Identity is three separate columns -- never a concatenated label.
+    Assert (StrComp(CStr(wsM.Cells(1, 1).Value), "Substation", vbTextCompare) = 0) _
+           And (StrComp(CStr(wsM.Cells(1, 2).Value), PL_HDR_VOLT, vbTextCompare) = 0) _
+           And (StrComp(CStr(wsM.Cells(1, 3).Value), "State", vbTextCompare) = 0), _
+           "Matrix identity: three separate columns (name / voltage / state)", passCount, failCount
+    Assert (StrComp(CStr(wsM.Cells(iMar + 1, 1).Value), "Marlin", vbTextCompare) = 0) _
+           And (CDbl(wsM.Cells(iMar + 1, 2).Value) = 230), _
+           "Matrix identity: name and voltage are not concatenated", passCount, failCount
+
+    ' Body cells are live SUMIFS keyed to the substation.
+    Dim f As String: f = wsM.Cells(iCec + 1, 4).Formula
+    Assert ((Left$(f, 8) = "=SUMIFS(") And (InStr(f, "138") > 0)), _
+           "Matrix body: cells are live SUMIFS", passCount, failCount
+
+    ' The cost curve sums BOTH Cecelia rows above the 2nd trigger (150 MW):
+    ' 5,000,000 + 3,000,000 = 8,000,000, cost-per-MW = 8,000,000 / MW.
+    Dim jj As Long, jHi As Long: jHi = 0
+    For jj = 1 To mtx.mwCount
+        If mtx.mw(jj) >= 150 Then
+            jHi = jj
+            Exit For
+        End If
+    Next jj
+    Assert ((jHi > 0) And (Abs(mtx.costM(iCec, jHi) - 8000000# / mtx.mw(jHi)) < 0.01)), _
+           "Matrix body: Cecelia curve sums both source rows above the 2nd trigger", passCount, failCount
+
+    ' Headroom = first trigger MW per substation.
+    Assert (mtx.headroom(iCec) = 100), "Matrix headroom: Cecelia = first trigger (100)", passCount, failCount
+    Assert (mtx.headroom(iMar) = 120), "Matrix headroom: Marlin = first trigger (120)", passCount, failCount
+
+    If Not wsM Is Nothing Then wsM.Delete
+    wsS.Delete
+    wsC.Delete
+    Application.DisplayAlerts = prevAlerts
+    Exit Sub
+Fail:
+    On Error Resume Next
+    If Not wsM Is Nothing Then wsM.Delete
+    If Not wsS Is Nothing Then wsS.Delete
+    If Not wsC Is Nothing Then wsC.Delete
+    Application.DisplayAlerts = True
+    Assert (False), "Matrix-membership self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+' RebuildAudit: the audit summary regenerates from the persisted sheets alone
+' (retained Source File provenance + the durable _Skipped Files record) with no
+' consolidation re-run -- so deleting _Pipeline Log costs nothing. Uses scratch
+' sheets standing in for Cost Data and _Skipped Files.
+Private Sub pl_RebuildAuditSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+
+    ' Cost Data with per-row Source File provenance: Cecelia consolidated from TWO
+    ' files (...1 and ...2), Marlin from one.
+    Dim wsC As Worksheet: Set wsC = ThisWorkbook.Worksheets.Add
+    wsC.Cells(1, 1).Value = PL_HDR_NAME
+    wsC.Cells(1, 2).Value = PL_HDR_VOLT
+    wsC.Cells(1, 3).Value = "Source File"
+    wsC.Cells(1, 4).Value = "Source Sheet"
+    wsC.Cells(1, 5).Value = PL_HDR_TRIGGER
+    wsC.Cells(1, 6).Value = PL_HDR_ALLOC
+    wsC.Cells(2, 1).Value = "Cecelia": wsC.Cells(2, 2).Value = 138: wsC.Cells(2, 3).Value = "Cecelia 138kV 1.xlsx": wsC.Cells(2, 4).Value = "Cecelia 138kV 1": wsC.Cells(2, 5).Value = 100: wsC.Cells(2, 6).Value = 5000000#
+    wsC.Cells(3, 1).Value = "Cecelia": wsC.Cells(3, 2).Value = 138: wsC.Cells(3, 3).Value = "Cecelia 138kV 2.xlsx": wsC.Cells(3, 4).Value = "Cecelia 138kV 2": wsC.Cells(3, 5).Value = 150: wsC.Cells(3, 6).Value = 3000000#
+    wsC.Cells(4, 1).Value = "Marlin": wsC.Cells(4, 2).Value = 230: wsC.Cells(4, 3).Value = "Marlin 230kV.xlsx": wsC.Cells(4, 4).Value = "Marlin 230kV": wsC.Cells(4, 5).Value = 120: wsC.Cells(4, 6).Value = 4000000#
+
+    ' Durable skip record: one file that FAILED and left no Cost Data rows.
+    Dim wsK As Worksheet: Set wsK = ThisWorkbook.Worksheets.Add
+    wsK.Range("A1:E1").Value = Array("Stage", "File", "Sheet", "Status", "Reason")
+    wsK.Cells(2, 1).Value = "1 Cost": wsK.Cells(2, 2).Value = "Broken.xlsx": wsK.Cells(2, 4).Value = "Failed": wsK.Cells(2, 5).Value = "Import error: unreadable"
+
+    ' Rebuild the audit from sheets only (as if _Pipeline Log had been deleted).
+    Dim log As PL_TLog: pl_LogInit log
+    Dim dS As Long, fC As Long, cc As Long, sf As Long
+    Dim okA As Boolean
+    okA = pl_ComputeAudit(wsC, wsK, log, dS, fC, cc, sf)
+    Assert (okA), "RebuildAudit: computes from sheets, no consolidation re-run", passCount, failCount
+    Assert (dS = 2), "RebuildAudit: 2 distinct substations (Cecelia + Marlin)", passCount, failCount
+    Assert (fC = 3), "RebuildAudit: 3 contributing source files", passCount, failCount
+    Assert (cc = 1), "RebuildAudit: Cecelia collapsed from >1 file (1/2)", passCount, failCount
+    Assert (sf = 1), "RebuildAudit: 1 skipped/failed file from the persisted record", passCount, failCount
+    Assert ((fC + sf) = (dS + (fC - dS) + sf)), _
+           "RebuildAudit: reconciliation identity holds (4 = 2 + 1 + 1)", passCount, failCount
+
+    Dim hasRecon As Boolean: hasRecon = False
+    Dim ii As Long
+    For ii = 1 To log.n
+        If InStr(log.lines(ii), "Reconciliation: files seen (4)") > 0 Then hasRecon = True
+    Next ii
+    Assert (hasRecon), "RebuildAudit: reconciliation line written to the rebuilt log", passCount, failCount
+
+    wsK.Delete
+    wsC.Delete
+    Application.DisplayAlerts = prevAlerts
+    Exit Sub
+Fail:
+    On Error Resume Next
+    If Not wsK Is Nothing Then wsK.Delete
+    If Not wsC Is Nothing Then wsC.Delete
+    Application.DisplayAlerts = True
+    Assert (False), "Rebuild-audit self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+' File accounting: EVERY selected file is accounted for as contributed or
+' skipped; non-contributors are itemized in _Skipped Files; a skip is flagged
+' LOST only when no other file covered its substation (else redundant). Drives
+' pl_AccountCostFiles over a synthetic mixed fixture (good / missing-sheet /
+' bad-header / empty), so no external files are opened.
+Private Sub pl_FileAccountingSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+
+    Dim recs() As PL_TCostFile: ReDim recs(1 To 5)
+    ' two good contributors
+    recs(1).FilePath = "Alpha 138kV.xlsx": recs(1).SheetName = "Alpha 138kV": recs(1).Substation = "Alpha"
+    recs(1).Voltage = 138: recs(1).VoltParsed = True: recs(1).RowsImported = 5: recs(1).Outcome = "Contributed"
+    recs(2).FilePath = "Beta 230kV.xlsx": recs(2).SheetName = "Beta 230kV": recs(2).Substation = "Beta"
+    recs(2).Voltage = 230: recs(2).VoltParsed = True: recs(2).RowsImported = 4: recs(2).Outcome = "Contributed"
+    ' missing sheet -> substation unreadable -> unknown
+    recs(3).FilePath = "MissingSheet.xlsx": recs(3).SheetName = "": recs(3).Substation = ""
+    recs(3).RowsImported = 0: recs(3).Outcome = "Skipped: sheet not found"
+    recs(3).Message = "workbook contains no worksheets"
+    ' bad header, tab readable as Gamma -> Gamma nowhere else -> LOST
+    recs(4).FilePath = "Gamma 345kV.xlsx": recs(4).SheetName = "Gamma 345kV": recs(4).Substation = "Gamma"
+    recs(4).Voltage = 345: recs(4).VoltParsed = True: recs(4).RowsImported = 0
+    recs(4).Outcome = "Skipped: header not found": recs(4).Message = "headers seen: Foo | Bar"
+    ' empty file for Alpha -> Alpha already covered by recs(1) -> redundant
+    recs(5).FilePath = "Alpha 138kV (dup).xlsx": recs(5).SheetName = "Alpha 138kV": recs(5).Substation = "Alpha"
+    recs(5).Voltage = 138: recs(5).VoltParsed = True: recs(5).RowsImported = 0
+    recs(5).Outcome = "Skipped: no data rows"
+
+    pl_ResetSkips
+    Dim log As PL_TLog: pl_LogInit log
+    Dim contributed As Long, skipped As Long, lost As Long, redundant As Long, unknown As Long
+    pl_AccountCostFiles recs, 5, log, contributed, skipped, lost, redundant, unknown
+
+    Assert ((contributed + skipped) = 5), _
+           "File accounting: selected (5) = contributed + skipped, exactly", passCount, failCount
+    Assert (contributed = 2), "File accounting: 2 files contributed", passCount, failCount
+    Assert (skipped = 3), "File accounting: 3 files skipped", passCount, failCount
+    Assert (lost = 1), "File accounting: 1 LOST (Gamma, only source missing)", passCount, failCount
+    Assert (redundant = 1), "File accounting: 1 redundant (Alpha covered elsewhere)", passCount, failCount
+    Assert (unknown = 1), "File accounting: 1 unreadable/unknown (missing sheet)", passCount, failCount
+
+    Dim wsK As Worksheet: Set wsK = pl_SheetByName(PL_SH_SKIPPED)
+    Dim okSheet As Boolean: okSheet = Not (wsK Is Nothing)
+    Assert (okSheet), "File accounting: _Skipped Files sheet exists", passCount, failCount
+    If okSheet Then
+        Dim lr As Long: lr = wsK.Cells(wsK.Rows.Count, 1).End(xlUp).Row
+        Assert ((lr - 1) = 3), "File accounting: _Skipped Files itemizes all 3 non-contributors", passCount, failCount
+        Dim rr As Long, gammaLost As Boolean, alphaRed As Boolean
+        For rr = 2 To lr
+            If StrComp(CStr(wsK.Cells(rr, 5).Value & ""), "Gamma", vbTextCompare) = 0 Then
+                If InStr(CStr(wsK.Cells(rr, 6).Value & ""), "LOST") > 0 Then gammaLost = True
+            End If
+            If StrComp(CStr(wsK.Cells(rr, 5).Value & ""), "Alpha", vbTextCompare) = 0 Then
+                If InStr(CStr(wsK.Cells(rr, 6).Value & ""), "redundant") > 0 Then alphaRed = True
+            End If
+        Next rr
+        Assert (gammaLost), "File accounting: Gamma row flagged LOST in _Skipped Files", passCount, failCount
+        Assert (alphaRed), "File accounting: Alpha (empty dup) row flagged redundant", passCount, failCount
+    End If
+
+    On Error Resume Next
+    wsK.Delete
+    Application.DisplayAlerts = prevAlerts
+    On Error GoTo 0
+    Exit Sub
+Fail:
+    On Error Resume Next
+    Dim wsK2 As Worksheet: Set wsK2 = pl_SheetByName(PL_SH_SKIPPED)
+    If Not wsK2 Is Nothing Then wsK2.Delete
+    Application.DisplayAlerts = True
+    Assert (False), "File-accounting self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+' Fix 1 verification: given a file's rows-2-down block containing real data, a
+' stray header-dup row, and a blank row, the append filter keeps only the data
+' rows -- so N files yield exactly one header row on Cost Data and a data-row
+' count equal to the sum of source data rows.
+Private Sub pl_HeaderGuardSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    Dim hdrSig As String
+    hdrSig = PL_HDR_NAME & "|" & PL_HDR_VOLT & "|" & PL_HDR_TRIGGER & "|" & PL_HDR_ALLOC
+    Dim blk(1 To 4, 1 To 4) As Variant
+    ' row 1: data
+    blk(1, 1) = "Alpha": blk(1, 2) = 345: blk(1, 3) = 100: blk(1, 4) = 5000000#
+    ' row 2: a duplicated header (must be skipped)
+    blk(2, 1) = PL_HDR_NAME: blk(2, 2) = PL_HDR_VOLT: blk(2, 3) = PL_HDR_TRIGGER: blk(2, 4) = PL_HDR_ALLOC
+    ' row 3: fully blank (must be skipped)
+    blk(3, 1) = "": blk(3, 2) = "": blk(3, 3) = "": blk(3, 4) = ""
+    ' row 4: data
+    blk(4, 1) = "Beta": blk(4, 2) = 230: blk(4, 3) = 150: blk(4, 4) = 6000000#
+
+    Assert (StrComp(pl_RowSig(blk, 2, 4), hdrSig, vbTextCompare) = 0), _
+           "Header guard: a header-dup row matches the header signature", passCount, failCount
+
+    Dim kept As Long, r As Long
+    kept = 0
+    For r = 1 To 4
+        If pl_RowBlank(blk, r, 4) Then
+            ' skip
+        ElseIf StrComp(pl_RowSig(blk, r, 4), hdrSig, vbTextCompare) = 0 Then
+            ' skip stray header
+        Else
+            kept = kept + 1
+        End If
+    Next r
+    Assert (kept = 2), "Header guard: keeps 2 data rows, drops the header-dup and the blank", passCount, failCount
+End Sub
+
+' Round-trips a raw population and a rank population through real Excel formulas
+' on a scratch sheet and asserts the VBA buckets match cell-for-cell.
+Private Sub pl_ParitySelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim ws As Worksheet
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+    Set ws = ThisWorkbook.Worksheets.Add
+    Dim tmpName As String: tmpName = ws.Name
+
+    Dim n As Long: n = 12
+    Dim vals() As Double: ReDim vals(1 To n)
+    Dim ranks() As Long: ReDim ranks(1 To n, 1 To 1)
+    Dim i As Long
+    ' a raw population with a tie, and a competition-rank population with ties
+    Dim seed As Variant
+    seed = Array(50#, 130#, 130#, 200#, 260#, 300#, 90#, 175#, 220#, 45#, 310#, 130#)
+    For i = 1 To n
+        vals(i) = CDbl(seed(i - 1))
+        ws.Cells(i, 1).Value = vals(i)
+    Next i
+    Dim rseed As Variant
+    rseed = Array(1, 2, 2, 4, 5, 6, 1, 2, 0, 4, 6, 2)   ' 0 => non-qualifier
+    For i = 1 To n
+        ranks(i, 1) = CLng(rseed(i - 1))
+        If ranks(i, 1) > 0 Then
+            ws.Cells(i, 3).Value = ranks(i, 1)
+        Else
+            ws.Cells(i, 3).Value = "n/a"
+        End If
+    Next i
+
+    ' Excel formulas: raw-is-better in col B, rank-based in col D
+    For i = 1 To n
+        ws.Cells(i, 2).Formula = "=CEILING(PERCENTRANK.EXC($A$1:$A$" & n & ",A" & i & ")*5,1)"
+        ws.Cells(i, 4).Formula = "=IFERROR(CEILING((1-PERCENTRANK.EXC($C$1:$C$" & n & ",C" & i & "))*5,1),0)"
+    Next i
+    Application.CalculateFull
+
+    Dim vbaRaw() As Long: vbaRaw = pl_RawBucketArray(vals, n)
+    Dim vbaRank() As Long: vbaRank = pl_RankBucketArray(ranks, 1, n)
+
+    Dim rawOK As Boolean, rankOK As Boolean: rawOK = True: rankOK = True
+    For i = 1 To n
+        If CLng(ws.Cells(i, 2).Value) <> vbaRaw(i) Then rawOK = False
+        If CLng(ws.Cells(i, 4).Value) <> vbaRank(i) Then rankOK = False
+    Next i
+
+    Application.DisplayAlerts = False
+    ws.Delete
+    Application.DisplayAlerts = prevAlerts
+
+    Assert (rawOK), "Parity: VBA raw-is-better buckets == Excel PERCENTRANK.EXC", passCount, failCount
+    Assert (rankOK), "Parity: VBA rank-based buckets == Excel PERCENTRANK.EXC", passCount, failCount
+    Exit Sub
+Fail:
+    On Error Resume Next
+    If Not ws Is Nothing Then ws.Delete
+    Application.DisplayAlerts = True
+    Assert (False), "Parity self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+' 2,000 synthetic substations: rank + bucket every column and assert the whole
+' pass is fast (mergesort O(N log N), not the ~32M-op O(N^2) rank-by-scanning).
+Private Sub pl_ScaleSmokeTest(ByRef passCount As Long, ByRef failCount As Long)
+    Dim n As Long: n = 2000
+    Dim m As Long: m = 21
+    Dim mw() As Double, names() As String, costM() As Double
+    ReDim mw(1 To m): ReDim names(1 To n): ReDim costM(1 To n, 1 To m)
+    Dim i As Long, j As Long
+    For j = 1 To m: mw(j) = 100 + (j - 1) * 10: Next j
+    ' Distinct piecewise-constant totals so ranks are well spread.
+    For i = 1 To n
+        names(i) = "S" & Format$(i, "0000")
+        Dim base As Double: base = 40000000# + (i Mod 500) * 100000#
+        For j = 1 To m
+            Dim tot As Double: tot = base
+            If mw(j) >= 200 Then tot = base + 20000000# + (i Mod 50) * 100000#
+            costM(i, j) = tot / mw(j)
+        Next j
+    Next i
+
+    Dim t0 As Double: t0 = Timer
+    Dim rkC() As Long, rkMx() As Double, rkCm() As Double, rkS() As Double, rkH() As Boolean
+    Dim rA() As Long, rB() As Long
+    ComputeRankings mw, names, costM, n, m, rkC, rkMx, rkCm, rkS, rkH, rA, rB
+
+    Dim thr As Variant: thr = GetThresholds()
+    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
+    Dim tt As Long, dummy() As Long
+    For tt = 1 To nt
+        dummy = pl_RankBucketArray(rA, tt, n)
+        dummy = pl_RankBucketArray(rB, tt, n)
+    Next tt
+    Dim knee() As Double: ReDim knee(1 To n)
+    For i = 1 To n: knee(i) = costM(i, 1): Next i
+    dummy = pl_RawBucketArray(knee, n)
+    Dim elapsed As Double: elapsed = Timer - t0
+
+    Debug.Print "  scale: " & n & " substations ranked+bucketed in " & Format$(elapsed, "0.00") & "s"
+    Assert (UBound(rA, 1) = n), "Scale: ranking produced n rows for 2,000 substations", passCount, failCount
+    Assert (elapsed < 30), "Scale: 2,000-substation rank+percentile pass under 30s (no O(N^2))", passCount, failCount
+End Sub
+
+' Durability + resume: simulate Stage 1 completing (and a Stage-2 failure) then
+' Stage 2 completing, asserting Cost Data survives + is saved, and that a
+' resumed run starts at Stage 2 with only Cost done, Stage 3 with Cost + Site
+' done, and Stage 1 with nothing done -- never re-opening source files for a
+' checkpointed stage. Runs only on a clean workbook so it never clobbers a real
+' pipeline's sheets.
+Private Sub pl_CheckpointSelfTest(ByRef passCount As Long, ByRef failCount As Long)
+    On Error GoTo Fail
+    Dim busy As Boolean
+    busy = (Not pl_SheetByName(PL_SH_COST) Is Nothing) Or _
+           (Not pl_SheetByName(PL_SH_SITE) Is Nothing) Or _
+           (Not pl_SheetByName(PL_SH_MATRIX) Is Nothing) Or _
+           (Not pl_SheetByName(PL_SH_ANALYSIS) Is Nothing) Or _
+           (Not pl_SheetByName(PL_SH_STATE) Is Nothing)
+    If busy Then
+        Debug.Print "  checkpoint test skipped (pipeline sheets already present; not clobbering)."
+        Exit Sub
+    End If
+
+    Dim prevAlerts As Boolean: prevAlerts = Application.DisplayAlerts
+    Application.DisplayAlerts = False
+
+    ' Stage 1 completes: write Cost Data and mark the checkpoint.
+    Dim ws As Worksheet: Set ws = pl_FreshSheet(PL_SH_COST)
+    ws.Range("A1:B1").Value = Array(PL_HDR_NAME, PL_HDR_VOLT)
+    ws.Range("A2:B2").Value = Array("Alpha", 345)
+    pl_MarkStage PL_STG_COST, 1
+
+    ' A Stage-2 failure now must not touch Cost Data.
+    Assert (pl_SheetNonEmpty(PL_SH_COST)), _
+           "Durability: Cost Data present + non-empty after a Stage-2 failure", passCount, failCount
+    Assert (pl_StageDone(PL_STG_COST)), "Durability: Stage 1 checkpoint valid", passCount, failCount
+    Assert (Not pl_StageDone(PL_STG_SITE)), "Durability: Stage 2 not marked complete", passCount, failCount
+    Assert (pl_FirstIncompleteStage() = PL_STG_SITE), _
+           "Resume: first incomplete stage is 2 (Stage 1 skipped, no file re-open)", passCount, failCount
+
+    ' Saved-on-disk assertion only when the host has a path.
+    If Len(ThisWorkbook.Path) > 0 Then
+        ThisWorkbook.Save
+        Assert (ThisWorkbook.Saved), "Durability: workbook saved on disk after Stage 1", passCount, failCount
+    Else
+        Debug.Print "  (on-disk save assertion skipped: workbook has no path)"
+    End If
+
+    ' Stage 2 also completes: with Cost + Site valid, a resume begins at Stage 3.
+    Dim ws2 As Worksheet: Set ws2 = pl_FreshSheet(PL_SH_SITE)
+    ws2.Range("A1:C1").Value = Array(PL_HDR_NAME, "State", PL_HDR_VOLT)
+    ws2.Range("A2:C2").Value = Array("Alpha", "NM", 345)
+    pl_MarkStage PL_STG_SITE, 1
+    Assert (pl_FirstIncompleteStage() = PL_STG_MATRIX), _
+           "Resume: with Cost + Site valid, first incomplete stage is 3 (Join/Matrix)", passCount, failCount
+
+    ' clean up the sheets this test created (workbook was clean beforehand).
+    pl_DeleteIfExists PL_SH_COST
+    pl_DeleteIfExists PL_SH_SITE
+    pl_DeleteIfExists PL_SH_STATE
+    Assert (pl_FirstIncompleteStage() = PL_STG_COST), _
+           "Resume: with no checkpoints, first incomplete stage is 1 (start fresh)", passCount, failCount
+    Application.DisplayAlerts = prevAlerts
+    Exit Sub
+Fail:
+    On Error Resume Next
+    pl_DeleteIfExists PL_SH_COST
+    pl_DeleteIfExists PL_SH_SITE
+    pl_DeleteIfExists PL_SH_STATE
+    Application.DisplayAlerts = True
+    Assert (False), "Checkpoint self-test could not run (" & Err.Description & ")", passCount, failCount
+End Sub
+
+Private Sub pl_DeleteIfExists(ByVal nm As String)
+    Dim ws As Worksheet
+    Set ws = pl_SheetByName(nm)
+    If Not ws Is Nothing Then
+        On Error Resume Next
+        ws.Delete
+        On Error GoTo 0
+    End If
+End Sub
+
+' ---- small test helpers ----
+Private Sub pl_FillSite(ByRef rn() As String, ByRef rv() As Double, ByRef rp() As Boolean, _
+                        ByRef rst() As String, ByRef rf() As String, ByRef rr() As Long, _
+                        ByVal idx As Long, ByVal nm As String, ByVal v As Double, _
+                        ByVal p As Boolean, ByVal st As String)
+    rn(idx) = nm: rv(idx) = v: rp(idx) = p: rst(idx) = st
+    rf(idx) = "fixture.xlsx": rr(idx) = idx + 1
+End Sub
+
+Private Function pl_HasTriple(ByRef dt() As PL_TSiteTriple, ByVal k As Long, _
+                              ByVal nm As String, ByVal v As Double, ByVal p As Boolean, _
+                              ByVal st As String) As Boolean
+    Dim i As Long
+    For i = 1 To k
+        If pl_TripleEqual(dt(i).Name, dt(i).Voltage, dt(i).VoltParsed, dt(i).State, nm, v, p, st) Then
+            pl_HasTriple = True: Exit Function
+        End If
+    Next i
+    pl_HasTriple = False
+End Function
+
+Private Function pl_MinHeadroom(ByRef v() As Double, ByVal n As Long) As Double
+    Dim i As Long, mn As Double, seen As Boolean
+    seen = False
+    For i = 1 To n
+        If v(i) > 0 Then
+            If Not seen Then
+                mn = v(i): seen = True
+            ElseIf v(i) < mn Then
+                mn = v(i)
+            End If
+        End If
+    Next i
+    If seen Then
+        pl_MinHeadroom = mn
+    Else
+        pl_MinHeadroom = 0
+    End If
+End Function
+
+' Cost at one MW from two cumulative allocations (trig 100 alloc `a1`, trig 200
+' alloc `a2`); returns cost-per-MW at MW=100 for the single-tier example.
+Private Function pl_PiecewiseCost(ByVal a1 As Double, ByVal a2 As Double) As Double
+    ' at MW=100 only the trig<=100 tier applies -> T=a1 ; cost=a1/100.
+    pl_PiecewiseCost = a1 / 100
+End Function
+
+' ============================================================
+'  THRESHOLDS
+'  Single source of truth. The threshold column block, the chart
+'  threshold series and the chart legend all read from this one
+'  function, so adding or removing a threshold requires no other
+'  code change.
+' ============================================================
+
+Private Function GetThresholds() As Variant
+    GetThresholds = Array(25000000#, 50000000#, 75000000#, 100000000#)
+End Function
+
+' ============================================================
+'  INPUT CAPTURE + VALIDATION
+' ============================================================
+
+' Force any range value to a 1-based 2-D array (single cells arrive scalar)
+Private Function RangeTo2D(r As Range) As Variant
+    Dim v As Variant
+    v = r.Value
+    If IsArray(v) Then
+        RangeTo2D = v
+    Else
+        Dim a(1 To 1, 1 To 1) As Variant
+        a(1, 1) = v
+        RangeTo2D = a
+    End If
+End Function
+
+Private Function IsUsableNumber(ByVal v As Variant) As Boolean
+    IsUsableNumber = False
+    If IsError(v) Then Exit Function
+    If IsEmpty(v) Then Exit Function
+    If IsNull(v) Then Exit Function
+    If Not IsNumeric(v) Then Exit Function
+    If CDbl(v) <= 0 Then Exit Function
+    IsUsableNumber = True
+End Function
+
+' ============================================================
+'  ANALYSIS DRIVER
+'  Fills aTable(1..n, 1..totalCols) with the Block A row content.
+' ============================================================
+
+Private Sub AnalyseAll(ByRef mw() As Double, ByRef names() As String, _
+                       ByRef costM() As Double, ByVal n As Long, ByVal m As Long, _
+                       ByRef aTable() As Variant, _
+                       ByRef rankA() As Long, ByRef rankB() As Long)
+    Dim thr As Variant: thr = GetThresholds()
+    Dim i As Long, j As Long, tt As Long
+
+    Dim c() As Double: ReDim c(1 To m)
+    Dim T() As Double: ReDim T(1 To m)
+
+    For i = 1 To n
+        For j = 1 To m
+            c(j) = costM(i, j)
+            T(j) = c(j) * mw(j)
+        Next j
+
+        Dim segs() As TSegment
+        segs = Segmentize(mw, T, m)
+        Dim nseg As Long: nseg = UBound(segs)
+
+        ' Column A..G
+        aTable(i, 1) = names(i)
+        aTable(i, 2) = FittedString(mw, T, segs, nseg, m, c)
+        aTable(i, 3) = nseg
+        aTable(i, 4) = StepChangeStr(mw, segs, nseg)
+
+        Dim li As Long: li = LongestSegIdx(mw, segs, nseg)
+        Dim x1 As Double, x2 As Double, Tlong As Double
+        x1 = mw(segs(li).FirstJ): x2 = mw(segs(li).LastJ): Tlong = segs(li).Ttotal
+
+        Dim xstar As Double: xstar = KneeXStar(mw, T, segs(li))
+        aTable(i, 5) = Round(xstar, 1)
+        aTable(i, 6) = -Tlong / (xstar * xstar)          ' slope at knee, -T / x*^2
+        aTable(i, 7) = SlowdownPoint(Tlong, x1, x2)
+
+        ' Four columns per threshold, ascending order, starting at column H:
+        '   +0 range   +1 slope   +2 Rank by MW breadth   +3 Rank by slope
+        For tt = 0 To UBound(thr) - LBound(thr)
+            Dim baseCol As Long: baseCol = N_FIXED_COLS + 1 + 4 * tt
+            Dim L As Double: L = CDbl(thr(LBound(thr) + tt))
+            aTable(i, baseCol) = ThresholdRangeStr(T, mw, m, L)
+            aTable(i, baseCol + 1) = ThresholdSlope(c, mw, T, m, L)
+            ' Rank 0 means "not ranked" (no qualifying points, or a single
+            ' point for slope). Write n/a rather than a last-place rank.
+            aTable(i, baseCol + 2) = IIf(rankA(i, tt + 1) = 0, "n/a", CLng(rankA(i, tt + 1)))
+            aTable(i, baseCol + 3) = IIf(rankB(i, tt + 1) = 0, "n/a", CLng(rankB(i, tt + 1)))
+        Next tt
+    Next i
+End Sub
+
+' ============================================================
+'  RANKINGS
+'  Two independent ranks per substation per threshold band, never
+'  blended and never computed across thresholds:
+'    Rank A  by MW breadth   (more qualifying MW is better)
+'    Rank B  by slope        (direction set by SLOPE_RANK_MODE)
+'
+'  Both use COMPETITION ranking on the metric key only: equal metrics
+'  share the lower rank and the next distinct value skips ahead
+'  (1, 2, 2, 4 - not dense 1, 2, 2, 3). The alphabetical backstop is a
+'  deterministic DISPLAY order within a metric tie, not a rank
+'  differentiator, so genuinely equal metrics stay tied.
+'
+'  Rank A tiebreak chain (metric key): higher qualifying count, then
+'  higher maximum qualifying MW, then LOWER cost per MW at that maximum
+'  qualifying MW. Tiebreak 3 is load bearing - e.g. many substations
+'  qualify at every MW point and share the same max MW, and cost at the
+'  largest affordable size is what separates them.
+'
+'  Rank B tiebreak: equal slope to $0.1, then higher qualifying count.
+'  Substations with zero qualifying points (Rank A) or fewer than two
+'  (Rank B, slope undefined) are excluded from the population entirely
+'  and get rank 0 (written as n/a), so ranks run 1..k over the rankable
+'  set, not 1..n.
+' ============================================================
+
+Private Sub ComputeRankings(ByRef mw() As Double, ByRef names() As String, _
+                            ByRef costM() As Double, ByVal n As Long, ByVal m As Long, _
+                            ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                            ByRef rkCostMax() As Double, ByRef rkSlope() As Double, _
+                            ByRef rkHasSlope() As Boolean, _
+                            ByRef rankA() As Long, ByRef rankB() As Long)
+    Dim thr As Variant: thr = GetThresholds()
+    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
+
+    ReDim rkCount(1 To n, 1 To nt)
+    ReDim rkMaxMW(1 To n, 1 To nt)
+    ReDim rkCostMax(1 To n, 1 To nt)
+    ReDim rkSlope(1 To n, 1 To nt)
+    ReDim rkHasSlope(1 To n, 1 To nt)
+    ReDim rankA(1 To n, 1 To nt)
+    ReDim rankB(1 To n, 1 To nt)
+
+    ' ---- Per-substation, per-threshold metrics ---------------
+    Dim i As Long, j As Long, tt As Long
+    Dim c() As Double: ReDim c(1 To m)
+    Dim T() As Double: ReDim T(1 To m)
+    For i = 1 To n
+        For j = 1 To m: c(j) = costM(i, j): T(j) = c(j) * mw(j): Next j
+        For tt = 1 To nt
+            Dim L As Double: L = CDbl(thr(LBound(thr) + tt - 1))
+            Dim cnt As Long: cnt = 0
+            Dim lastJ As Long: lastJ = 0
+            Dim sx As Double, sy As Double, sxx As Double, sxy As Double
+            sx = 0: sy = 0: sxx = 0: sxy = 0
+            For j = 1 To m
+                If T(j) <= L Then
+                    cnt = cnt + 1: lastJ = j
+                    sx = sx + mw(j): sy = sy + c(j)
+                    sxx = sxx + mw(j) * mw(j): sxy = sxy + mw(j) * c(j)
+                End If
+            Next j
+            rkCount(i, tt) = cnt
+            If cnt >= 1 Then
+                rkMaxMW(i, tt) = mw(lastJ)
+                rkCostMax(i, tt) = c(lastJ)
+            End If
+            If cnt >= 2 Then
+                rkHasSlope(i, tt) = True
+                rkSlope(i, tt) = (cnt * sxy - sx * sy) / (cnt * sxx - sx * sx)
+            End If
+        Next tt
+    Next i
+
+    ' ---- Competition ranking within each threshold -----------
+    Dim ord() As Long: ReDim ord(1 To n)
+    Dim popN As Long, p As Long
+    For tt = 1 To nt
+        ' Rank A population: substations with >=1 qualifying point.
+        popN = 0
+        For i = 1 To n
+            If rkCount(i, tt) >= 1 Then
+                popN = popN + 1
+                ord(popN) = i
+            End If
+        Next i
+        If popN > 0 Then
+            SortIdx ord, popN, tt, True, rkCount, rkMaxMW, rkCostMax, rkSlope, names
+            For p = 1 To popN
+                If p = 1 Then
+                    rankA(ord(p), tt) = 1
+                ElseIf EqRankA(ord(p), ord(p - 1), tt, rkCount, rkMaxMW, rkCostMax) Then
+                    rankA(ord(p), tt) = rankA(ord(p - 1), tt)
+                Else
+                    rankA(ord(p), tt) = p
+                End If
+            Next p
+        End If
+
+        ' Rank B population: substations with a defined slope (>=2 points).
+        popN = 0
+        For i = 1 To n
+            If rkHasSlope(i, tt) Then
+                popN = popN + 1
+                ord(popN) = i
+            End If
+        Next i
+        If popN > 0 Then
+            SortIdx ord, popN, tt, False, rkCount, rkMaxMW, rkCostMax, rkSlope, names
+            For p = 1 To popN
+                If p = 1 Then
+                    rankB(ord(p), tt) = 1
+                ElseIf EqRankB(ord(p), ord(p - 1), tt, rkCount, rkSlope) Then
+                    rankB(ord(p), tt) = rankB(ord(p - 1), tt)
+                Else
+                    rankB(ord(p), tt) = p
+                End If
+            Next p
+        End If
+    Next tt
+End Sub
+
+' Insertion sort of the index array ord(1..popN) for one threshold.
+' isRankA selects the ordering; the alphabetical name comparison is the
+' final DISPLAY tiebreak so the order is deterministic without making
+' otherwise-equal metrics count as distinct for ranking.
+' Stable bottom-up MERGESORT of the index array ord(1..popN), O(popN log popN).
+' The comparator (LessThan) and its total order are unchanged from the original
+' insertion sort, and the merge takes the left run on ties, so the produced
+' order -- and therefore every competition rank -- is byte-for-byte identical
+' to the pre-optimization insertion sort. This is the fix for the Stage-5
+' O(N^2) rank-by-scanning blow-up at ~2,000 substations.
+Private Sub SortIdx(ByRef ord() As Long, ByVal popN As Long, ByVal tt As Long, _
+                    ByVal isRankA As Boolean, _
+                    ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                    ByRef rkCostMax() As Double, ByRef rkSlope() As Double, _
+                    ByRef names() As String)
+    If popN < 2 Then Exit Sub
+    Dim buf() As Long: ReDim buf(1 To popN)
+    Dim width As Long, i As Long
+    width = 1
+    Do While width < popN
+        i = 1
+        Do While i <= popN
+            Dim l1 As Long, r1 As Long, l2 As Long, r2 As Long
+            Dim p As Long, q As Long, k As Long
+            l1 = i: r1 = i + width - 1
+            If r1 > popN Then r1 = popN
+            l2 = r1 + 1: r2 = i + 2 * width - 1
+            If r2 > popN Then r2 = popN
+            p = l1: q = l2: k = l1
+            Do While p <= r1 And q <= r2
+                ' take the LEFT run unless the right element sorts strictly
+                ' before it -> stable.
+                If LessThan(ord(q), ord(p), tt, isRankA, rkCount, rkMaxMW, rkCostMax, rkSlope, names) Then
+                    buf(k) = ord(q): q = q + 1
+                Else
+                    buf(k) = ord(p): p = p + 1
+                End If
+                k = k + 1
+            Loop
+            Do While p <= r1
+                buf(k) = ord(p): p = p + 1: k = k + 1
+            Loop
+            Do While q <= r2
+                buf(k) = ord(q): q = q + 1: k = k + 1
+            Loop
+            For k = l1 To r2
+                ord(k) = buf(k)
+            Next k
+            i = i + 2 * width
+        Loop
+        width = width * 2
+    Loop
+End Sub
+
+' True when substation i1 sorts before i2 for the given rank type.
+Private Function LessThan(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Long, _
+                          ByVal isRankA As Boolean, _
+                          ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                          ByRef rkCostMax() As Double, ByRef rkSlope() As Double, _
+                          ByRef names() As String) As Boolean
+    If isRankA Then
+        If rkCount(i1, tt) <> rkCount(i2, tt) Then
+            LessThan = rkCount(i1, tt) > rkCount(i2, tt): Exit Function      ' more MW is better
+        End If
+        If rkMaxMW(i1, tt) <> rkMaxMW(i2, tt) Then
+            LessThan = rkMaxMW(i1, tt) > rkMaxMW(i2, tt): Exit Function       ' higher max MW
+        End If
+        If Round(rkCostMax(i1, tt), 2) <> Round(rkCostMax(i2, tt), 2) Then
+            LessThan = rkCostMax(i1, tt) < rkCostMax(i2, tt): Exit Function    ' lower cost at max MW
+        End If
+    Else
+        Dim s1 As Double, s2 As Double
+        s1 = Round(rkSlope(i1, tt), 1): s2 = Round(rkSlope(i2, tt), 1)
+        If s1 <> s2 Then
+            If SLOPE_RANK_MODE = 2 Then
+                LessThan = Abs(s1) < Abs(s2)                                  ' flattest first
+            Else
+                LessThan = Abs(s1) > Abs(s2)                                  ' steepest first
+            End If
+            Exit Function
+        End If
+        If rkCount(i1, tt) <> rkCount(i2, tt) Then
+            LessThan = rkCount(i1, tt) > rkCount(i2, tt): Exit Function
+        End If
+    End If
+    LessThan = (StrComp(names(i1), names(i2), vbTextCompare) < 0)             ' display backstop
+End Function
+
+Private Function EqRankA(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Long, _
+                         ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                         ByRef rkCostMax() As Double) As Boolean
+    EqRankA = (rkCount(i1, tt) = rkCount(i2, tt)) And _
+              (rkMaxMW(i1, tt) = rkMaxMW(i2, tt)) And _
+              (Round(rkCostMax(i1, tt), 2) = Round(rkCostMax(i2, tt), 2))
+End Function
+
+Private Function EqRankB(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Long, _
+                         ByRef rkCount() As Long, ByRef rkSlope() As Double) As Boolean
+    EqRankB = (Round(rkSlope(i1, tt), 1) = Round(rkSlope(i2, tt), 1)) And _
+              (rkCount(i1, tt) = rkCount(i2, tt))
+End Function
+
+Private Function SlopeRankHeader() As String
+    If SLOPE_RANK_MODE = 2 Then
+        SlopeRankHeader = "Rank by Slope (flattest first)"
+    Else
+        SlopeRankHeader = "Rank by Slope (steepest first)"
+    End If
+End Function
+
+' ============================================================
+'  SEGMENTATION
+'  Walk j from 1..m. Points j-1 and j share a segment when
+'      |T(j) - T(j-1)| / T(j-1) <= SEG_TOL.
+'  SEG_TOL (0.5%) absorbs cent-level rounding in the source data,
+'  where a genuine tier step is orders of magnitude larger. Each
+'  segment's representative total is the mean of its T values,
+'  rounded to the nearest $1,000.
+'  A leading run of zero-cost cells (T = 0 = headroom, no upgrade
+'  priced under that size) forms its own segment: when T(j-1) = 0
+'  the relative-change test would divide by zero, so 0->0 is treated
+'  as the same segment and 0->nonzero (or nonzero->0) as a boundary.
+' ============================================================
+
+Private Function Segmentize(ByRef mw() As Double, ByRef T() As Double, _
+                            ByVal m As Long) As TSegment()
+    Dim segs() As TSegment
+    ReDim segs(1 To m)                   ' at most m segments
+
+    Dim nseg As Long: nseg = 0
+    Dim segStart As Long: segStart = 1
+    Dim j As Long
+    Dim isBoundary As Boolean
+    For j = 2 To m
+        If T(j - 1) = 0# Then
+            isBoundary = (T(j) <> 0#)     ' 0->0 same segment; 0->nonzero splits
+        Else
+            isBoundary = (Abs(T(j) - T(j - 1)) / T(j - 1) > SEG_TOL)
+        End If
+        If isBoundary Then
+            nseg = nseg + 1
+            segs(nseg).FirstJ = segStart
+            segs(nseg).LastJ = j - 1
+            segStart = j
+        End If
+    Next j
+    nseg = nseg + 1
+    segs(nseg).FirstJ = segStart
+    segs(nseg).LastJ = m
+
+    ReDim Preserve segs(1 To nseg)
+
+    Dim k As Long, jj As Long
+    Dim s As Double, cnt As Long
+    For k = 1 To nseg
+        s = 0: cnt = 0
+        For jj = segs(k).FirstJ To segs(k).LastJ
+            s = s + T(jj): cnt = cnt + 1
+        Next jj
+        segs(k).Ttotal = Round((s / cnt) / 1000#, 0) * 1000#
+    Next k
+
+    Segmentize = segs
+End Function
+
+' ============================================================
+'  FITTED FUNCTION STRING (column B)
+'  One string per substation, segments joined by " | ".
+'  Falls back to a global power-law fit only when segmentation
+'  yields more than MAX_SEGMENTS segments.
+' ============================================================
+
+Private Function FittedString(ByRef mw() As Double, ByRef T() As Double, _
+                              ByRef segs() As TSegment, ByVal nseg As Long, _
+                              ByVal m As Long, ByRef c() As Double) As String
+    If nseg > MAX_SEGMENTS Then
+        FittedString = PowerFitString(mw, c, m)
+        Exit Function
+    End If
+
+    ' StringBuilder pattern: accumulate parts, Join once (no quadratic
+    ' concatenation even for large n).
+    Dim parts() As String
+    ReDim parts(1 To nseg)
+    Dim k As Long
+    For k = 1 To nseg
+        Dim rngTxt As String
+        If segs(k).FirstJ = segs(k).LastJ Then
+            rngTxt = Format(mw(segs(k).FirstJ), FMT_MW) & " MW"
+        Else
+            rngTxt = Format(mw(segs(k).FirstJ), FMT_MW) & "-" & _
+                     Format(mw(segs(k).LastJ), FMT_MW) & " MW"
+        End If
+        parts(k) = "y = " & Format(segs(k).Ttotal, "#,##0") & " / x  [" & rngTxt & "]"
+    Next k
+
+    FittedString = Join(parts, " | ")
+End Function
+
+' Global power-law y = a * x^b, least squares on ln(y) vs ln(x).
+' R^2 computed on the log-transformed values. Fallback path only.
+' Log(cost) is undefined at cost = 0, so zero-cost (headroom) points are
+' skipped from the fit; if fewer than 2 positive-cost points remain the
+' power law is undefined and a safe descriptive string is returned instead.
+Private Function PowerFitString(ByRef mw() As Double, ByRef c() As Double, _
+                                ByVal m As Long) As String
+    Dim j As Long
+    Dim sx As Double, sy As Double, sxx As Double, sxy As Double
+    Dim lx As Double, ly As Double
+    Dim nfit As Long: nfit = 0
+    For j = 1 To m
+        If c(j) > 0# Then
+            lx = Log(mw(j)): ly = Log(c(j))
+            sx = sx + lx: sy = sy + ly
+            sxx = sxx + lx * lx: sxy = sxy + lx * ly
+            nfit = nfit + 1
+        End If
+    Next j
+    Dim denom As Double: denom = nfit * sxx - sx * sx
+    If nfit < 2 Or denom = 0# Then
+        PowerFitString = "y = piecewise (insufficient positive-cost points for power fit)"
+        Exit Function
+    End If
+    Dim b As Double, lnA As Double
+    b = (nfit * sxy - sx * sy) / denom
+    lnA = (sy - b * sx) / nfit
+    Dim a As Double: a = Exp(lnA)
+
+    ' R^2 on ln(y), over the same positive-cost points
+    Dim meanLy As Double: meanLy = sy / nfit
+    Dim ssTot As Double, ssRes As Double, resid As Double
+    For j = 1 To m
+        If c(j) > 0# Then
+            ly = Log(c(j))
+            ssTot = ssTot + (ly - meanLy) ^ 2
+            resid = ly - (lnA + b * Log(mw(j)))
+            ssRes = ssRes + resid * resid
+        End If
+    Next j
+    Dim r2 As Double
+    If ssTot > 0 Then
+        r2 = 1 - ssRes / ssTot
+    Else
+        r2 = 1
+    End If
+
+    PowerFitString = "y = " & Format(a, "0.00E+00") & " * x^" & Format(b, "0.000") & _
+                     "  (power fit, R" & ChrW(178) & " = " & Format(r2, "0.000") & ")"
+End Function
+
+' ============================================================
+'  STEP-CHANGE POINTS (column D)
+'  MW values where T steps up = the first MW of each segment after
+'  the first. "None" for a single-segment substation.
+' ============================================================
+
+Private Function StepChangeStr(ByRef mw() As Double, ByRef segs() As TSegment, _
+                               ByVal nseg As Long) As String
+    If nseg <= 1 Then
+        StepChangeStr = "None"
+        Exit Function
+    End If
+    Dim parts() As String
+    ReDim parts(1 To nseg - 1)
+    Dim k As Long
+    For k = 2 To nseg
+        parts(k - 1) = Format(mw(segs(k).FirstJ), FMT_MW)
+    Next k
+    StepChangeStr = Join(parts, ", ")
+End Function
+
+' ============================================================
+'  LONGEST SEGMENT (by MW span)
+' ============================================================
+
+Private Function LongestSegIdx(ByRef mw() As Double, ByRef segs() As TSegment, _
+                               ByVal nseg As Long) As Long
+    Dim k As Long, best As Long, bestSpan As Double, span As Double
+    best = 1: bestSpan = -1
+    For k = 1 To nseg
+        span = mw(segs(k).LastJ) - mw(segs(k).FirstJ)
+        If span > bestSpan Then
+            bestSpan = span
+            best = k
+        End If
+    Next k
+    LongestSegIdx = best
+End Function
+
+' ============================================================
+'  KNEE POINT (column E)  -  Kneedle max-vertical-distance method
+'  applied to the longest segment.
+'
+'  For a pure hyperbola y = T/x on [x1,x2] the knee has the closed
+'  form  x* = Sqr(x1 * x2)  (geometric mean of the endpoints).
+'  Because Kneedle normalises both axes to [0,1] with an AFFINE map,
+'  and an affine reparametrisation does not move an argmax, the
+'  discrete search and the closed form agree. So we:
+'    - run the discrete Kneedle search over the actual data points,
+'    - Debug.Assert the discrete winner sits within one MW step of
+'      Sqr(x1*x2)  (this is the primary unit test of the segmentation
+'      walk), and
+'    - report the continuous x* = Sqr(x1*x2).
+'
+'  Note: x* depends only on the segment endpoints, NOT on T. This
+'  column therefore separates substations by WHERE their segments
+'  break, not by cost level. Column G is the one that reflects cost
+'  magnitude.
+' ============================================================
+
+Private Function KneeXStar(ByRef mw() As Double, ByRef T() As Double, _
+                           ByRef seg As TSegment) As Double
+    Dim x1 As Double, x2 As Double
+    x1 = mw(seg.FirstJ): x2 = mw(seg.LastJ)
+
+    Dim geo As Double: geo = Sqr(x1 * x2)
+
+    If x1 = x2 Then                       ' degenerate single-point segment
+        KneeXStar = x1: Exit Function
+    End If
+
+    Dim nPts As Long: nPts = seg.LastJ - seg.FirstJ + 1
+    Dim yLo As Double, yHi As Double
+    yHi = T(seg.FirstJ) / mw(seg.FirstJ)   ' cost is highest at x1
+    yLo = T(seg.LastJ) / mw(seg.LastJ)      ' cost is lowest  at x2
+    ' A flat segment (yHi = yLo) has no knee to normalise against: a
+    ' leading zero-cost (headroom) segment is all-zero cost-per-MW, so
+    ' the [0,1] normalisation would be 0/0. Skip the discrete search and
+    ' report the closed-form geometric mean, which is still well defined.
+    If nPts >= 3 And yHi <> yLo Then
+        ' Discrete Kneedle: normalise x and y across the segment to
+        ' [0,1]; y falls as x rises, so the chord runs from (0,1) to
+        ' (1,0), chord(xn) = 1 - xn. Vertical distance below the chord
+        ' is (1 - xn) - yn. Take the argmax over data points.
+        Dim j As Long, xn As Double, yn As Double, dist As Double
+        Dim bestDist As Double, bestMW As Double, maxGap As Double, prevX As Double
+        bestDist = -1E+308
+        prevX = mw(seg.FirstJ): maxGap = 0
+        For j = seg.FirstJ To seg.LastJ
+            xn = (mw(j) - x1) / (x2 - x1)
+            yn = ((T(j) / mw(j)) - yLo) / (yHi - yLo)
+            dist = (1 - xn) - yn
+            If dist > bestDist Then
+                bestDist = dist
+                bestMW = mw(j)
+            End If
+            If mw(j) - prevX > maxGap Then maxGap = mw(j) - prevX
+            prevX = mw(j)
+        Next j
+
+        ' Primary unit test: the discrete knee must land within one MW
+        ' step of the closed-form geometric mean.
+        Debug.Assert Abs(bestMW - geo) <= maxGap + 0.000001
+    End If
+
+    KneeXStar = geo
+End Function
+
+' ============================================================
+'  MARGINAL SLOWDOWN POINT (column G)
+'  First MW at which |discrete slope| drops below SLOWDOWN_TOL,
+'  evaluated over the longest segment. The analytic slope magnitude
+'  is T / x^2, so T / x^2 = SLOWDOWN_TOL gives the continuous
+'      x = Sqr(T / SLOWDOWN_TOL).
+'  Report the continuous value clamped to the segment range; write
+'  "Beyond range" when the condition is never met inside the segment.
+'  This column DOES reflect cost magnitude (through T).
+' ============================================================
+
+Private Function SlowdownPoint(ByVal Tlong As Double, ByVal x1 As Double, _
+                               ByVal x2 As Double) As Variant
+    Dim xc As Double: xc = Sqr(Tlong / SLOWDOWN_TOL)
+    If xc > x2 Then
+        SlowdownPoint = "Beyond range"          ' slope never falls below tol within segment
+    ElseIf xc < x1 Then
+        SlowdownPoint = Round(x1, 1)            ' already below tol at the segment start
+    Else
+        SlowdownPoint = Round(xc, 1)
+    End If
+End Function
+
+' ============================================================
+'  THRESHOLD RANGE (columns H, J, L, N ...)
+'  Collect every MW point where T(j) <= L. Per the piecewise-constant
+'  structure this is always a whole number of segments; consecutive
+'  qualifying points collapse into ranges.
+' ============================================================
+
+Private Function ThresholdRangeStr(ByRef T() As Double, ByRef mw() As Double, _
+                                   ByVal m As Long, ByVal L As Double) As String
+    Dim j As Long, cntQ As Long
+    Dim qual() As Boolean: ReDim qual(1 To m)
+    For j = 1 To m
+        qual(j) = (T(j) <= L)
+        If qual(j) Then cntQ = cntQ + 1
+    Next j
+
+    If cntQ = 0 Then
+        ThresholdRangeStr = "None"
+        Exit Function
+    End If
+    If cntQ = m Then
+        ThresholdRangeStr = "All (" & Format(mw(1), FMT_MW) & "-" & _
+                            Format(mw(m), FMT_MW) & " MW)"
+        Exit Function
+    End If
+
+    ' Collapse consecutive (by index) qualifying points into runs.
+    Dim parts As String: parts = ""
+    Dim runStart As Long: runStart = 0
+    For j = 1 To m
+        If qual(j) And runStart = 0 Then
+            runStart = j
+        ElseIf (Not qual(j)) And runStart > 0 Then
+            parts = AppendRun(parts, mw, runStart, j - 1)
+            runStart = 0
+        End If
+    Next j
+    If runStart > 0 Then parts = AppendRun(parts, mw, runStart, m)
+
+    ThresholdRangeStr = parts & " MW"
+End Function
+
+Private Function AppendRun(ByVal acc As String, ByRef mw() As Double, _
+                           ByVal a As Long, ByVal b As Long) As String
+    Dim piece As String
+    If a = b Then
+        piece = Format(mw(a), FMT_MW)
+    Else
+        piece = Format(mw(a), FMT_MW) & "-" & Format(mw(b), FMT_MW)
+    End If
+    If Len(acc) = 0 Then
+        AppendRun = piece
+    Else
+        AppendRun = acc & ", " & piece
+    End If
+End Function
+
+' ============================================================
+'  THRESHOLD SLOPE (columns I, K, M, O ...)
+'  Ordinary least-squares slope of cost vs MW over the qualifying
+'  points only (equivalent to WorksheetFunction.Slope).
+'
+'  NOTE: this is a secant-style AVERAGE across the qualifying window.
+'  Because the underlying curve is convex, it understates the
+'  steepness at the low-MW end and overstates it at the high-MW end.
+' ============================================================
+
+Private Function ThresholdSlope(ByRef c() As Double, ByRef mw() As Double, _
+                                ByRef T() As Double, ByVal m As Long, _
+                                ByVal L As Double) As Variant
+    Dim j As Long, cnt As Long
+    Dim xs() As Double, ys() As Double
+    ReDim xs(1 To m): ReDim ys(1 To m)
+    For j = 1 To m
+        If T(j) <= L Then
+            cnt = cnt + 1
+            xs(cnt) = mw(j): ys(cnt) = c(j)
+        End If
+    Next j
+
+    If cnt = 0 Then
+        ThresholdSlope = "n/a"
+        Exit Function
+    End If
+    If cnt = 1 Then
+        ThresholdSlope = "n/a (single point)"
+        Exit Function
+    End If
+    ThresholdSlope = OLSSlope(xs, ys, cnt)
+End Function
+
+Private Function OLSSlope(ByRef x() As Double, ByRef y() As Double, _
+                          ByVal cnt As Long) As Double
+    Dim k As Long, sx As Double, sy As Double
+    For k = 1 To cnt: sx = sx + x(k): sy = sy + y(k): Next k
+    Dim mx As Double: mx = sx / cnt
+    Dim my As Double: my = sy / cnt
+    Dim num As Double, den As Double
+    For k = 1 To cnt
+        num = num + (x(k) - mx) * (y(k) - my)
+        den = den + (x(k) - mx) ^ 2
+    Next k
+    OLSSlope = num / den
+End Function
+
+' ============================================================
+'  OUTPUT SHEET CREATION  (never overwrites, inserts after source)
+' ============================================================
+
+Private Function UniqueSheetName(ByVal wb As Workbook, ByVal baseName As String) As String
+    If Not SheetExists(wb, baseName) Then
+        UniqueSheetName = baseName
+        Exit Function
+    End If
+    Dim k As Long: k = 2
+    Do While SheetExists(wb, baseName & " (" & k & ")")
+        k = k + 1
+    Loop
+    UniqueSheetName = baseName & " (" & k & ")"
+End Function
+
+Private Function SheetExists(ByVal wb As Workbook, ByVal nm As String) As Boolean
+    Dim ws As Worksheet
+    For Each ws In wb.Worksheets
+        If StrComp(ws.Name, nm, vbTextCompare) = 0 Then
+            SheetExists = True
+            Exit Function
+        End If
+    Next ws
+End Function
+
+' ============================================================
+'  UNIFIED ANALYSIS TABLE WRITER
+'  One contiguous table on Cost Curve Analysis. Identity is split into
+'  three columns (Substation | Voltage (kV) | State) -- never concatenated.
+'  Headline results sit next to the name, then the per-threshold rank
+'  columns, then the detailed metric + threshold blocks. Every live-formula
+'  reference is derived from the same column-index map below, so the
+'  references always point at the columns' real positions. Returns the last
+'  used row (the max-165 note), so the leaderboard can be placed under it.
+'
+'  Column map (1-based), computed from nt:
+'    1 Substation | 2 Voltage (kV) | 3 State
+'    4 Weighted Score | 5 WS Pctile | 6 Headroom | 7 Headroom Pctile
+'    8 Flattening Point | 9 Flattening Pctile
+'    10.. per threshold: Rank by Breadth, Rank by Slope   (2*nt cols)
+'    then Fitted, Segments, Step-Change, Slope at Knee, Slowdown   (5 cols)
+'    then per threshold: MW Range, Slope over Range, Breadth (0-5),
+'                        Slope (0-5), Band Score   (5*nt cols)
+' ============================================================
+
+Private Function WriteSheet(ByVal ws As Worksheet, ByRef mtx As PL_TMatrix, _
+                            ByRef mw() As Double, ByRef costM() As Double, _
+                            ByVal n As Long, ByVal m As Long, ByRef aTable() As Variant, _
+                            ByRef rankA() As Long, ByRef rankB() As Long) As Long
+    Dim thr As Variant: thr = GetThresholds()
+    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
+    Dim i As Long, t As Long
+    Dim EMPTY_LIT As String: EMPTY_LIT = Chr$(34) & Chr$(34)
+
+    ' ---- column-index map ----
+    Const cSub As Long = 1, cVolt As Long = 2, cState As Long = 3
+    Const cWS As Long = 4, cWSP As Long = 5, cHR As Long = 6, cHRP As Long = 7
+    Const cFlat As Long = 8, cFlatP As Long = 9, cRank0 As Long = 10
+    Dim cMet0 As Long: cMet0 = cRank0 + 2 * nt
+    Dim cFitted As Long: cFitted = cMet0
+    Dim cSeg As Long: cSeg = cMet0 + 1
+    Dim cStep As Long: cStep = cMet0 + 2
+    Dim cSlopeKnee As Long: cSlopeKnee = cMet0 + 3
+    Dim cSlowdown As Long: cSlowdown = cMet0 + 4
+    Dim cDet0 As Long: cDet0 = cMet0 + 5
+    ' Lat/Long appended at the far right: left-joined metadata for downstream
+    ' geospatial use, present when the substation matched a site row, else blank.
+    ' Placed last so they never shift the headline / formula columns.
+    Dim cLatOut As Long: cLatOut = cDet0 + 5 * nt
+    Dim cLngOut As Long: cLngOut = cLatOut + 1
+    Dim totalNew As Long: totalNew = cLngOut
+
+    Dim hdrRow As Long: hdrRow = TABLE_HDR_ROW
+    Dim dataTop As Long: dataTop = hdrRow + 1
+    Dim dataBot As Long: dataBot = hdrRow + n
+
+    ' ---- VBA metric arrays (values path; parity self-test proves == formulas) --
+    Dim knee() As Double: ReDim knee(1 To n)
+    For i = 1 To n: knee(i) = CDbl(aTable(i, 5)): Next i
+    Dim flatPct() As Long: flatPct = pl_RawBucketArray(knee, n)
+
+    Dim breadthPct() As Long, slopePct() As Long
+    ReDim breadthPct(1 To n, 1 To nt): ReDim slopePct(1 To n, 1 To nt)
+    Dim col1() As Long, tt As Long
+    For tt = 1 To nt
+        col1 = pl_RankBucketArray(rankA, tt, n)
+        For i = 1 To n: breadthPct(i, tt) = col1(i): Next i
+        col1 = pl_RankBucketArray(rankB, tt, n)
+        For i = 1 To n: slopePct(i, tt) = col1(i): Next i
+    Next tt
+
+    Dim bandScore() As Double: ReDim bandScore(1 To n, 1 To nt)
+    Dim weighted() As Double: ReDim weighted(1 To n)
+    For i = 1 To n
+        weighted(i) = flatPct(i)
+        For tt = 1 To nt
+            bandScore(i, tt) = PL_WEIGHT_B2 * (breadthPct(i, tt) + slopePct(i, tt))
+            weighted(i) = weighted(i) + bandScore(i, tt)
+        Next tt
+    Next i
+    Dim wsPct() As Long: wsPct = pl_RawBucketArray(weighted, n)
+
+    Dim headroom() As Double: ReDim headroom(1 To n)
+    Dim part() As Boolean: ReDim part(1 To n)
+    For i = 1 To n
+        headroom(i) = mtx.headroom(i)
+        part(i) = (headroom(i) > 0)
+    Next i
+    Dim hrPct() As Long: hrPct = pl_RawBucketArrayMasked(headroom, part, n)
+
+    ' ---- title + live weight cell ----
+    ws.Cells(TITLE_ROW, 1).Value = "Interconnection Cost Curve Analysis"
+    ws.Cells(TITLE_ROW, 1).Font.Bold = True
+    ws.Cells(TITLE_ROW, 1).Font.Size = 14
+    ws.Cells(2, 1).Value = "Threshold weight (applies to every band):"
+    ws.Cells(2, 2).Value = PL_WEIGHT_B2
+    ws.Cells(2, 1).Font.Italic = True
+    ws.Cells(2, 2).Font.Bold = True
+
+    ' ---- header row ----
+    Dim hdr() As Variant: ReDim hdr(1 To 1, 1 To totalNew)
+    hdr(1, cSub) = "Substation"
+    hdr(1, cVolt) = "Voltage (kV)"
+    hdr(1, cState) = "State"
+    hdr(1, cWS) = "Weighted Score (max 165)"
+    hdr(1, cWSP) = "Weighted Score Pctile (1-5)"
+    hdr(1, cHR) = "Headroom (MW)"
+    hdr(1, cHRP) = "Headroom Pctile (1-5)"
+    hdr(1, cFlat) = "Flattening Point (MW)"
+    hdr(1, cFlatP) = "Flattening Pctile (1-5)"
+    For t = 0 To nt - 1
+        Dim lbl As String: lbl = ThreshLabel(CDbl(thr(LBound(thr) + t)))
+        hdr(1, cRank0 + 2 * t) = "Rank by MW Breadth " & lbl
+        hdr(1, cRank0 + 2 * t + 1) = SlopeRankHeader() & " " & lbl
+    Next t
+    hdr(1, cFitted) = "Fitted Function"
+    hdr(1, cSeg) = "Segments"
+    hdr(1, cStep) = "Step-Change Points (MW)"
+    hdr(1, cSlopeKnee) = "Slope at Knee ($/MW per MW)"
+    hdr(1, cSlowdown) = "Marginal Slowdown Point (MW)"
+    For t = 0 To nt - 1
+        Dim lbl2 As String: lbl2 = ThreshLabel(CDbl(thr(LBound(thr) + t)))
+        hdr(1, cDet0 + 5 * t) = "MW Range <= " & lbl2
+        hdr(1, cDet0 + 5 * t + 1) = "Slope over Range ($/MW per MW)"
+        hdr(1, cDet0 + 5 * t + 2) = lbl2 & " Breadth (0-5)"
+        hdr(1, cDet0 + 5 * t + 3) = lbl2 & " Slope (0-5)"
+        hdr(1, cDet0 + 5 * t + 4) = lbl2 & " Band Score"
+    Next t
+    hdr(1, cLatOut) = "Lat"
+    hdr(1, cLngOut) = "Long"
+    ws.Cells(hdrRow, 1).Resize(1, totalNew).Value = hdr
+
+    ' ---- data block ----
+    Dim blk() As Variant: ReDim blk(1 To n, 1 To totalNew)
+    Dim rr As Long, baseA As Long
+    For i = 1 To n
+        rr = hdrRow + i
+        ' identity (always values, always split); lat/long metadata at the right
+        blk(i, cLatOut) = mtx.lat(i)
+        blk(i, cLngOut) = mtx.lng(i)
+        blk(i, cSub) = mtx.names(i)
+        If mtx.keyUseVolt(i) Then
+            blk(i, cVolt) = mtx.keyVolt(i)
+        Else
+            blk(i, cVolt) = ""
+        End If
+        blk(i, cState) = mtx.state(i)
+        ' detailed metrics + rank inputs (always values, sourced from aTable)
+        blk(i, cFlat) = knee(i)
+        blk(i, cFitted) = aTable(i, 2)
+        blk(i, cSeg) = aTable(i, 3)
+        blk(i, cStep) = aTable(i, 4)
+        blk(i, cSlopeKnee) = aTable(i, 6)
+        blk(i, cSlowdown) = aTable(i, 7)
+        For t = 0 To nt - 1
+            baseA = N_FIXED_COLS + 1 + 4 * t          ' aTable base col for threshold t
+            blk(i, cRank0 + 2 * t) = aTable(i, baseA + 2)      ' Rank by breadth
+            blk(i, cRank0 + 2 * t + 1) = aTable(i, baseA + 3)  ' Rank by slope
+            blk(i, cDet0 + 5 * t) = aTable(i, baseA)           ' MW range
+            blk(i, cDet0 + 5 * t + 1) = aTable(i, baseA + 1)   ' slope over range
+        Next t
+
+        If USE_LIVE_FORMULAS Then
+            blk(i, cFlatP) = pl_RawPctFormula(pl_ColLetter(cFlat), dataTop, dataBot, pl_ColLetter(cFlat) & rr)
+            Dim sumRefs As String: sumRefs = ""
+            For t = 0 To nt - 1
+                Dim bR As String: bR = pl_ColLetter(cRank0 + 2 * t)
+                Dim sR As String: sR = pl_ColLetter(cRank0 + 2 * t + 1)
+                blk(i, cDet0 + 5 * t + 2) = pl_RankPctFormula(bR, dataTop, dataBot, bR & rr)
+                blk(i, cDet0 + 5 * t + 3) = pl_RankPctFormula(sR, dataTop, dataBot, sR & rr)
+                blk(i, cDet0 + 5 * t + 4) = "=$B$2*(" & pl_ColLetter(cDet0 + 5 * t + 2) & rr & "+" & _
+                                            pl_ColLetter(cDet0 + 5 * t + 3) & rr & ")"
+                If Len(sumRefs) > 0 Then sumRefs = sumRefs & "+"
+                sumRefs = sumRefs & pl_ColLetter(cDet0 + 5 * t + 4) & rr
+            Next t
+            blk(i, cWS) = "=" & pl_ColLetter(cFlatP) & rr & "+" & sumRefs
+            blk(i, cWSP) = pl_RawPctFormula(pl_ColLetter(cWS), dataTop, dataBot, pl_ColLetter(cWS) & rr)
+            Dim mf As String
+            mf = pl_MinifsFormula(mtx.costName, mtx.colTrig, mtx.colName, mtx.colVolt, _
+                                  mtx.keyName(i), mtx.keyUseVolt(i), mtx.keyVolt(i), 2, mtx.costLastRow)
+            ' Headroom = 0 (or no trigger) is written blank so PERCENTRANK.EXC
+            ' excludes it from the ranked population; its percentile then falls to
+            ' 0 via IFERROR(...,0) -- the worst case, exactly like a non-qualifier.
+            blk(i, cHR) = "=IFERROR(IF(" & mf & "=0," & EMPTY_LIT & "," & mf & ")," & EMPTY_LIT & ")"
+            blk(i, cHRP) = "=IFERROR(" & _
+                Mid$(pl_RawPctFormula(pl_ColLetter(cHR), dataTop, dataBot, pl_ColLetter(cHR) & rr), 2) & _
+                ",0)"
+        Else
+            blk(i, cFlatP) = flatPct(i)
+            blk(i, cWS) = weighted(i)
+            blk(i, cWSP) = wsPct(i)
+            ' Headroom percentile is ALWAYS written: hrPct is 0 for headroom <= 0
+            ' (masked out of the ranked population by pl_RawBucketArrayMasked) and
+            ' 1-5 for the strictly-positive population -- zero headroom scores 0,
+            ' never a ranked bucket and never blank. The Headroom value stays blank
+            ' when there is no positive headroom.
+            blk(i, cHRP) = hrPct(i)
+            If part(i) Then
+                blk(i, cHR) = headroom(i)
+            Else
+                blk(i, cHR) = ""
+            End If
+            For t = 0 To nt - 1
+                blk(i, cDet0 + 5 * t + 2) = breadthPct(i, t + 1)
+                blk(i, cDet0 + 5 * t + 3) = slopePct(i, t + 1)
+                blk(i, cDet0 + 5 * t + 4) = bandScore(i, t + 1)
+            Next t
+        End If
+    Next i
+
+    If USE_LIVE_FORMULAS Then
+        ws.Cells(dataTop, 1).Resize(n, totalNew).Formula = blk
+    Else
+        ws.Cells(dataTop, 1).Resize(n, totalNew).Value = blk
+    End If
+
+    ' ---- number formats (whole columns once) ----
+    ws.Cells(dataTop, cFlat).Resize(n, 1).NumberFormat = FMT_MW1
+    ws.Cells(dataTop, cSlopeKnee).Resize(n, 1).NumberFormat = FMT_SLOPE
+    ws.Cells(dataTop, cSlowdown).Resize(n, 1).NumberFormat = FMT_MW1
+    ws.Cells(dataTop, cHR).Resize(n, 1).NumberFormat = "#,##0"
+    ws.Cells(dataTop, cWS).Resize(n, 1).NumberFormat = "0.0"
+    Dim cen As Variant, k As Long
+    cen = Array(cWSP, cHRP, cFlatP)
+    For k = LBound(cen) To UBound(cen)
+        With ws.Cells(dataTop, CLng(cen(k))).Resize(n, 1)
+            .NumberFormat = "0": .HorizontalAlignment = xlCenter
+        End With
+    Next k
+    For t = 0 To nt - 1
+        With ws.Cells(dataTop, cRank0 + 2 * t).Resize(n, 2)
+            .NumberFormat = "0": .HorizontalAlignment = xlCenter
+        End With
+        ws.Cells(dataTop, cDet0 + 5 * t + 1).Resize(n, 1).NumberFormat = FMT_SLOPE
+        With ws.Cells(dataTop, cDet0 + 5 * t + 2).Resize(n, 2)
+            .NumberFormat = "0": .HorizontalAlignment = xlCenter
+        End With
+    Next t
+
+    ' ---- header styling + note ----
+    StyleHeaderRow ws.Cells(hdrRow, 1).Resize(1, totalNew)
+    Dim noteRow As Long: noteRow = dataBot + 2
+    ws.Cells(noteRow, 1).Value = _
+        "Weighted Score max = 165 = flattening (5) + 4 bands x $B$2 x (breadth 5 + slope 5). " & _
+        "Practical max today = 125 ($25MM band scores 0 for all). Single $B$2 weights the " & _
+        "threshold axis as a whole. Headroom (MW) + its percentile are standalone -- NOT scored."
+    ws.Cells(noteRow, 1).Font.Italic = True
+
+    ' ---- column sizing ----
+    ws.Columns(cSub).AutoFit
+    ws.Columns(cState).AutoFit
+    ws.Columns(cFitted).ColumnWidth = COLB_WIDTH
+    ws.Columns(cFitted).WrapText = True
+
+    WriteSheet = noteRow
+End Function
+
+Private Function ThreshLabel(ByVal L As Double) As String
+    ThreshLabel = "$" & Format(L / 1000000#, "0") & "MM"
+End Function
+
+Private Sub StyleHeaderRow(ByVal rng As Range)
+    rng.Font.Bold = True
+    With rng.Borders(xlEdgeBottom)
+        .LineStyle = xlContinuous
+        .Weight = xlMedium
+    End With
+End Sub
+
+' ============================================================
+'  LEADERBOARD  (Block E, "Threshold Rankings")
+'  Two side-by-side sorted lists per threshold - by MW breadth and by
+'  slope - for reading, complementing the inline rank lookup columns.
+'  Sorted in memory (never write-then-Range.Sort). A monospace font
+'  keeps the two columns aligned. Rank-1 rows are bold; a zero-qualifier
+'  threshold collapses to a single explanatory line.
+' ============================================================
+
+' Rebuilt for scale: the whole leaderboard is composed in a Variant array and
+' written in a SINGLE Range.Value assignment (no cell-by-cell writes), and the
+' per-threshold ordering uses the O(k log k) mergesort in LeaderOrder. A few
+' section-header rows are bolded afterwards (not per substation); the block is
+' monospaced once.
+Private Sub BuildLeaderboard(ByVal ws As Worksheet, ByVal topRow As Long, _
+                             ByRef names() As String, ByVal n As Long, _
+                             ByRef rkCount() As Long, ByRef rkMaxMW() As Double, _
+                             ByRef rkSlope() As Double, _
+                             ByRef rankA() As Long, ByRef rankB() As Long, _
+                             ByRef lastRow As Long)
+    Dim thr As Variant: thr = GetThresholds()
+    Dim nt As Long: nt = UBound(thr) - LBound(thr) + 1
+
+    Dim maxRows As Long: maxRows = 3 + nt * (3 + n)
+    Dim blk() As Variant: ReDim blk(1 To maxRows, 1 To 7)
+    Dim boldOff() As Long: ReDim boldOff(1 To 3 + nt * 2)
+    Dim nBold As Long: nBold = 0
+
+    Dim rp As Long: rp = 1                       ' 1-based row offset within blk
+    blk(rp, 1) = "Threshold Rankings"
+    nBold = nBold + 1: boldOff(nBold) = rp
+    rp = rp + 2                                  ' title + blank
+
+    Dim tt As Long, i As Long
+    For tt = 1 To nt
+        Dim L As Double: L = CDbl(thr(LBound(thr) + tt - 1))
+        Dim qcnt As Long: qcnt = 0
+        For i = 1 To n
+            If rkCount(i, tt) >= 1 Then qcnt = qcnt + 1
+        Next i
+
+        blk(rp, 1) = "<= " & ThreshLabel(L) & "   (" & qcnt & " of " & n & " substations qualify)"
+        nBold = nBold + 1: boldOff(nBold) = rp
+        rp = rp + 1
+
+        If qcnt = 0 Then
+            blk(rp, 2) = "No substations qualify at this threshold"
+            rp = rp + 2
+        Else
+            blk(rp, 2) = "By MW Breadth"
+            blk(rp, 6) = "By Slope, " & IIf(SLOPE_RANK_MODE = 2, "flattest", "steepest") & " first"
+            nBold = nBold + 1: boldOff(nBold) = rp
+            rp = rp + 1
+
+            Dim ordA() As Long, kA As Long: LeaderOrder rankA, names, n, tt, ordA, kA
+            Dim ordB() As Long, kB As Long: LeaderOrder rankB, names, n, tt, ordB, kB
+            Dim rows As Long: rows = kA: If kB > rows Then rows = kB
+
+            Dim rr As Long
+            For rr = 1 To rows
+                If rr <= kA Then
+                    i = ordA(rr)
+                    blk(rp, 1) = rankA(i, tt)
+                    blk(rp, 2) = names(i)
+                    blk(rp, 3) = rkCount(i, tt) & " pts, max " & Format(rkMaxMW(i, tt), FMT_MW)
+                End If
+                If rr <= kB Then
+                    i = ordB(rr)
+                    blk(rp, 5) = rankB(i, tt)
+                    blk(rp, 6) = names(i)
+                    blk(rp, 7) = Format(rkSlope(i, tt), "#,##0.0")
+                End If
+                rp = rp + 1
+            Next rr
+            rp = rp + 1                          ' spacer between sub-blocks
+        End If
+    Next tt
+
+    Dim used As Long: used = rp - 1
+    If used < 1 Then used = 1
+    ws.Range(ws.Cells(topRow, 1), ws.Cells(topRow + used - 1, 7)).Value = blk
+    lastRow = topRow + used
+
+    Dim b As Long
+    ws.Cells(topRow, 1).Font.Size = 12
+    For b = 1 To nBold
+        ws.Cells(topRow + boldOff(b) - 1, 1).Resize(1, 7).Font.Bold = True
+    Next b
+    ws.Range(ws.Cells(topRow, 1), ws.Cells(lastRow, 7)).Font.Name = "Consolas"
+End Sub
+
+' Population indices (rank > 0) for one threshold, sorted for display by
+' (rank asc, name asc), via a stable O(k log k) bottom-up mergesort. The rank
+' already encodes the full metric order with competition ties, so sorting on it
+' reproduces the ranked order.
+Private Sub LeaderOrder(ByRef rank() As Long, ByRef names() As String, ByVal n As Long, _
+                        ByVal tt As Long, ByRef ord() As Long, ByRef k As Long)
+    ReDim ord(1 To n)
+    k = 0
+    Dim i As Long
+    For i = 1 To n
+        If rank(i, tt) > 0 Then
+            k = k + 1
+            ord(k) = i
+        End If
+    Next i
+    If k < 2 Then Exit Sub
+
+    Dim buf() As Long: ReDim buf(1 To k)
+    Dim width As Long, s As Long
+    width = 1
+    Do While width < k
+        s = 1
+        Do While s <= k
+            Dim l1 As Long, r1 As Long, l2 As Long, r2 As Long, p As Long, q As Long, w As Long
+            l1 = s: r1 = s + width - 1
+            If r1 > k Then r1 = k
+            l2 = r1 + 1: r2 = s + 2 * width - 1
+            If r2 > k Then r2 = k
+            p = l1: q = l2: w = l1
+            Do While p <= r1 And q <= r2
+                If LeaderBefore(ord(q), ord(p), tt, rank, names) Then
+                    buf(w) = ord(q): q = q + 1
+                Else
+                    buf(w) = ord(p): p = p + 1
+                End If
+                w = w + 1
+            Loop
+            Do While p <= r1
+                buf(w) = ord(p): p = p + 1: w = w + 1
+            Loop
+            Do While q <= r2
+                buf(w) = ord(q): q = q + 1: w = w + 1
+            Loop
+            For w = l1 To r2
+                ord(w) = buf(w)
+            Next w
+            s = s + 2 * width
+        Loop
+        width = width * 2
+    Loop
+End Sub
+
+Private Function LeaderBefore(ByVal i1 As Long, ByVal i2 As Long, ByVal tt As Long, _
+                              ByRef rank() As Long, ByRef names() As String) As Boolean
+    If rank(i1, tt) <> rank(i2, tt) Then
+        LeaderBefore = rank(i1, tt) < rank(i2, tt): Exit Function
+    End If
+    LeaderBefore = (StrComp(names(i1), names(i2), vbTextCompare) < 0)
+End Function
+
+
+' ============================================================
+'  SELF TEST
+'  Runs the analysis logic fully in memory (no Excel ranges, no
+'  charts) against the 17-substation x 21-MW reference fixture, and
+'  reports each assertion to the Immediate window. Reads
+'  substation_cost_per_mw.csv from the workbook folder if present;
+'  otherwise uses the hardcoded fixture.
+' ============================================================
+
+Public Sub SelfTest()
+    Dim mw() As Double, names() As String, costM() As Double
+    Dim n As Long, m As Long
+
+    LoadFixture mw, names, costM, n, m
+
+    Debug.Print "=== Cost Curve Analysis SelfTest ==="
+    Debug.Print "Fixture: " & n & " substations x " & m & " MW points"
+
+    Dim passCount As Long, failCount As Long
+    Dim i As Long, j As Long
+    Dim c() As Double: ReDim c(1 To m)
+    Dim T() As Double: ReDim T(1 To m)
+
+    Dim iCun As Long, iHob As Long, iChv As Long
+    iCun = NameIndex(names, n, "Cunningham")
+    iHob = NameIndex(names, n, "Hobbs")
+    iChv = NameIndex(names, n, "Chaves County")
+
+    ' ---- Cunningham & Hobbs (identical single-tier curves) ----
+    Dim who As Variant: who = Array(iCun, iHob)
+    Dim w As Long
+    For w = 0 To 1
+        i = who(w)
+        If i = 0 Then
+            Assert (False), "Cunningham/Hobbs row missing", passCount, failCount
+        Else
+            RowVectors costM, mw, i, m, c, T
+            Dim segs() As TSegment: segs = Segmentize(mw, T, m)
+            Assert (UBound(segs) = 1), GetName(names, i) & ": 1 segment", passCount, failCount
+            Assert (segs(1).Ttotal = 47633000#), GetName(names, i) & ": T = 47,633,000", passCount, failCount
+            Assert FittedString(mw, T, segs, UBound(segs), m, c) = _
+                   "y = 47,633,000 / x  [100-300 MW]", _
+                   GetName(names, i) & ": formula string", passCount, failCount
+            Dim li As Long: li = LongestSegIdx(mw, segs, UBound(segs))
+            Assert (Round(KneeXStar(mw, T, segs(li)), 1) = 173.2), _
+                   GetName(names, i) & ": knee 173.2 MW", passCount, failCount
+            Assert (ThresholdRangeStr(T, mw, m, 25000000#) = "None"), _
+                   GetName(names, i) & ": <=$25MM None", passCount, failCount
+            Assert (ThresholdRangeStr(T, mw, m, 50000000#) = "All (100-300 MW)"), _
+                   GetName(names, i) & ": <=$50MM All", passCount, failCount
+            Assert (ThresholdRangeStr(T, mw, m, 75000000#) = "All (100-300 MW)"), _
+                   GetName(names, i) & ": <=$75MM All", passCount, failCount
+            Assert (ThresholdRangeStr(T, mw, m, 100000000#) = "All (100-300 MW)"), _
+                   GetName(names, i) & ": <=$100MM All", passCount, failCount
+        End If
+    Next w
+
+    ' ---- Chaves County (multi-tier) ---------------------------
+    If iChv = 0 Then
+        Assert (False), "Chaves County row missing", passCount, failCount
+    Else
+        RowVectors costM, mw, iChv, m, c, T
+        Dim csg() As TSegment: csg = Segmentize(mw, T, m)
+        Assert (UBound(csg) = 5), "Chaves: 5 segments", passCount, failCount
+        Assert (csg(1).Ttotal = 49473000#), "Chaves: seg1 T", passCount, failCount
+        Assert (csg(2).Ttotal = 98003000#), "Chaves: seg2 T", passCount, failCount
+        Assert (csg(3).Ttotal = 185783000#), "Chaves: seg3 T", passCount, failCount
+        Assert (csg(4).Ttotal = 205353000#), "Chaves: seg4 T", passCount, failCount
+        Assert (csg(5).Ttotal = 207843000#), "Chaves: seg5 T", passCount, failCount
+        Assert (StepChangeStr(mw, csg, 5) = "200, 210, 240, 280"), _
+               "Chaves: step points 200, 210, 240, 280", passCount, failCount
+        Dim cli As Long: cli = LongestSegIdx(mw, csg, 5)
+        Assert (mw(csg(cli).FirstJ) = 100 And mw(csg(cli).LastJ) = 190), _
+               "Chaves: longest segment 100-190", passCount, failCount
+        Assert (Round(KneeXStar(mw, T, csg(cli)), 1) = 137.8), _
+               "Chaves: knee 137.8 MW", passCount, failCount
+        Assert (ThresholdRangeStr(T, mw, m, 25000000#) = "None"), _
+               "Chaves: <=$25MM None", passCount, failCount
+        Assert (ThresholdRangeStr(T, mw, m, 50000000#) = "100-190 MW"), _
+               "Chaves: <=$50MM 100-190 MW", passCount, failCount
+        Assert (ThresholdRangeStr(T, mw, m, 75000000#) = "100-190 MW"), _
+               "Chaves: <=$75MM 100-190 MW", passCount, failCount
+        Assert (ThresholdRangeStr(T, mw, m, 100000000#) = "100-200 MW"), _
+               "Chaves: <=$100MM 100-200 MW", passCount, failCount
+    End If
+
+    ' ---- Global checks ----------------------------------------
+    Dim gMinT As Double: gMinT = 1E+300
+    Dim allNone25 As Boolean: allNone25 = True
+    Dim segSumOK As Boolean: segSumOK = True
+    For i = 1 To n
+        RowVectors costM, mw, i, m, c, T
+        For j = 1 To m
+            If T(j) < gMinT Then gMinT = T(j)
+        Next j
+        If ThresholdRangeStr(T, mw, m, 25000000#) <> "None" Then allNone25 = False
+        Dim sg() As TSegment: sg = Segmentize(mw, T, m)
+        Dim k As Long, ptSum As Long: ptSum = 0
+        For k = 1 To UBound(sg)
+            ptSum = ptSum + (sg(k).LastJ - sg(k).FirstJ + 1)
+        Next k
+        If ptSum <> m Then segSumOK = False
+    Next i
+
+    Assert (allNone25), "Global: <=$25MM is None for all 17 rows", passCount, failCount
+    Assert (Round(gMinT, 0) = 47633000#), "Global: min implied total = 47,633,000", passCount, failCount
+    Assert (segSumOK), "Global: segment point counts sum to m for every substation", passCount, failCount
+
+    ' ---- Ranking assertions (spec section 8) ------------------
+    Dim rkCount() As Long, rkMaxMW() As Double, rkCostMax() As Double
+    Dim rkSlope() As Double, rkHasSlope() As Boolean
+    Dim rankA() As Long, rankB() As Long
+    ComputeRankings mw, names, costM, n, m, _
+                    rkCount, rkMaxMW, rkCostMax, rkSlope, rkHasSlope, rankA, rankB
+
+    Dim xCun As Long: xCun = NameIndex(names, n, "Cunningham")
+    Dim xHob As Long: xHob = NameIndex(names, n, "Hobbs")
+    Dim xCha As Long: xCha = NameIndex(names, n, "Chaves County")
+    Dim xEC As Long:  xEC = NameIndex(names, n, "Eddy County")
+    Dim xEN As Long:  xEN = NameIndex(names, n, "Eddy North")
+    Dim xKio As Long: xKio = NameIndex(names, n, "Kiowa")
+    Dim xOa As Long:  xOa = NameIndex(names, n, "Oasis")
+    Dim xPH As Long:  xPH = NameIndex(names, n, "Pleasant Hill")
+    Dim xRoo As Long: xRoo = NameIndex(names, n, "Roosevelt")
+    Dim xCD As Long:  xCD = NameIndex(names, n, "China Draw")
+    Dim xRR As Long:  xRR = NameIndex(names, n, "Roadrunner")
+
+    ' $25MM: zero qualify, all ranks n/a
+    Assert (CountRanked(rankA, n, 1) = 0 And CountRanked(rankB, n, 1) = 0), _
+           "$25MM: no substation ranked (all n/a)", passCount, failCount
+
+    ' $50MM: 8 qualify
+    Assert (CountRanked(rankA, n, 2) = 8), "$50MM: 8 qualify", passCount, failCount
+    Assert (rankA(xCun, 2) = 1 And rankA(xHob, 2) = 1), "$50MM A: Cun/Hob rank 1", passCount, failCount
+    Assert (rankA(xEC, 2) = 3), "$50MM A: Eddy County rank 3", passCount, failCount
+    Assert (rankA(xEN, 2) = 4), "$50MM A: Eddy North rank 4", passCount, failCount
+    Assert (rankA(xCha, 2) = 5), "$50MM A: Chaves rank 5", passCount, failCount
+    Assert (rankA(xOa, 2) = 6 And rankA(xPH, 2) = 6 And rankA(xRoo, 2) = 6), _
+           "$50MM A: Oasis/PH/Roosevelt tie rank 6", passCount, failCount
+    Assert (rkCount(xEC, 2) = 19 And rkCount(xEN, 2) = 18 And rkCount(xCha, 2) = 10), _
+           "$50MM: EddyC 19 / EddyN 18 / Chaves 10 pts", passCount, failCount
+    Assert (rankB(xOa, 2) = 1 And rankB(xPH, 2) = 1 And rankB(xRoo, 2) = 1), _
+           "$50MM B: Oasis/PH/Roosevelt tie rank 1", passCount, failCount
+    Assert (rankB(xCha, 2) = 4 And rankB(xEN, 2) = 5 And rankB(xEC, 2) = 6), _
+           "$50MM B: Chaves 4 / EddyN 5 / EddyC 6", passCount, failCount
+    Assert (rankB(xCun, 2) = 7 And rankB(xHob, 2) = 7), "$50MM B: Cun/Hob tie rank 7", passCount, failCount
+    Assert Round(rkSlope(xOa, 2), 1) = -2754.6 And Round(rkSlope(xCha, 2), 1) = -2531.7 _
+       And Round(rkSlope(xEN, 2), 1) = -1691# And Round(rkSlope(xEC, 2), 1) = -1559.2 _
+       And Round(rkSlope(xCun, 2), 1) = -1435.4, "$50MM B: slope values", passCount, failCount
+
+    ' $75MM: 15 qualify
+    Assert (CountRanked(rankA, n, 3) = 15), "$75MM: 15 qualify", passCount, failCount
+    Assert rkCount(xCun, 3) = 21 And rkCount(xEC, 3) = 21 And rkCount(xEN, 3) = 21 _
+       And rkCount(xHob, 3) = 21 And rkCount(xKio, 3) = 21, "$75MM: five substations at 21 pts", passCount, failCount
+    Assert (rankA(xCun, 3) = 1 And rankA(xHob, 3) = 1), "$75MM A: Cun/Hob rank 1", passCount, failCount
+    Assert (rankA(xEC, 3) = 3 And rankA(xKio, 3) = 3), "$75MM A: EddyC/Kiowa tie rank 3 (equal cost@300)", passCount, failCount
+    Assert (rankA(xEN, 3) = 5), "$75MM A: Eddy North rank 5", passCount, failCount
+    Assert (rkCount(xCD, 3) = 8 And rankA(xCD, 3) = MaxRankVal(rankA, n, 3)), _
+           "$75MM A: China Draw last on breadth at 8 pts", passCount, failCount
+    Assert (rankB(xCD, 3) = 1 And Round(rkSlope(xCD, 3), 1) = -4227.6), _
+           "$75MM B: China Draw first on slope -4227.6 (inversion)", passCount, failCount
+    Assert (rkCount(xCha, 3) = 10 And Round(rkSlope(xCha, 3), 1) = -2531.7), _
+           "$75MM: Chaves 10 pts slope -2531.7", passCount, failCount
+
+    ' $100MM: 17 qualify, 13 tie at 21 pts
+    Assert (CountRanked(rankA, n, 4) = 17), "$100MM: 17 qualify", passCount, failCount
+    Dim c21 As Long: c21 = 0
+    For i = 1 To n
+        If rkCount(i, 4) = 21 Then c21 = c21 + 1
+    Next i
+    Assert (c21 = 13), "$100MM: 13 tie at 21 qualifying points", passCount, failCount
+    Assert (rkCount(xRR, 4) = 12 And rankA(xRR, 4) = 16 And rankB(xRR, 4) = 1), _
+           "$100MM: Roadrunner 16th breadth / 1st slope (inversion)", passCount, failCount
+    Assert (Round(rkSlope(xRR, 4), 1) = -4428.9), "$100MM B: Roadrunner -4428.9", passCount, failCount
+    Assert (rkCount(xCha, 4) = 11 And rankA(xCha, 4) = 17 And rankA(xCha, 4) = MaxRankVal(rankA, n, 4)), _
+           "$100MM A: Chaves last on breadth at 11 pts", passCount, failCount
+    Assert (rankB(xCha, 4) = 14 And Round(rkSlope(xCha, 4), 1) = -1287.8), _
+           "$100MM B: Chaves 14th slope -1287.8", passCount, failCount
+    Assert Round(rkSlope(xOa, 4), 1) = -730.3 And Round(rkSlope(xPH, 4), 1) = -687.7 _
+       And Round(rkSlope(xRoo, 4), 1) = -687.7, "$100MM B: Oasis/PH/Roosevelt flattest", passCount, failCount
+
+    ' Structural: non-na Rank A count == qualifier count; max rank <= count
+    Dim tt As Long
+    For tt = 1 To 4
+        Dim qc As Long: qc = 0
+        For i = 1 To n
+            If rkCount(i, tt) >= 1 Then qc = qc + 1
+        Next i
+        Assert (CountRanked(rankA, n, tt) = qc), _
+               "Struct t" & tt & ": non-na Rank A count == qualifier count", passCount, failCount
+        Assert (MaxRankVal(rankA, n, tt) <= qc), _
+               "Struct t" & tt & ": max Rank A <= qualifier count", passCount, failCount
+    Next tt
+
+    ' ---- Front-half (pipeline steps 1-3) + scoring assertions -----
+    pl_FrontHalfSelfTest passCount, failCount
+
+    Debug.Print "=== SelfTest done: " & passCount & " passed, " & failCount & " failed ==="
+    If failCount = 0 Then
+        Debug.Print "ALL TESTS PASSED"
+    Else
+        Debug.Print "*** " & failCount & " FAILURE(S) ***"
+    End If
+End Sub
+
+Private Sub Assert(ByVal cond As Boolean, ByVal label As String, _
+                   ByRef passCount As Long, ByRef failCount As Long)
+    If cond Then
+        passCount = passCount + 1
+        Debug.Print "  PASS  " & label
+    Else
+        failCount = failCount + 1
+        Debug.Print "  FAIL  " & label
+    End If
+End Sub
+
+Private Sub RowVectors(ByRef costM() As Double, ByRef mw() As Double, ByVal i As Long, _
+                       ByVal m As Long, ByRef c() As Double, ByRef T() As Double)
+    Dim j As Long
+    For j = 1 To m
+        c(j) = costM(i, j)
+        T(j) = c(j) * mw(j)
+    Next j
+End Sub
+
+Private Function NameIndex(ByRef names() As String, ByVal n As Long, ByVal nm As String) As Long
+    Dim i As Long
+    For i = 1 To n
+        If StrComp(names(i), nm, vbTextCompare) = 0 Then
+            NameIndex = i
+            Exit Function
+        End If
+    Next i
+    NameIndex = 0
+End Function
+
+Private Function GetName(ByRef names() As String, ByVal i As Long) As String
+    If i >= LBound(names) And i <= UBound(names) Then
+        GetName = names(i)
+    Else
+        GetName = "?"
+    End If
+End Function
+
+Private Function CountRanked(ByRef rank() As Long, ByVal n As Long, ByVal tt As Long) As Long
+    Dim i As Long, c As Long
+    For i = 1 To n
+        If rank(i, tt) > 0 Then c = c + 1
+    Next i
+    CountRanked = c
+End Function
+
+Private Function MaxRankVal(ByRef rank() As Long, ByVal n As Long, ByVal tt As Long) As Long
+    Dim i As Long, mx As Long
+    For i = 1 To n
+        If rank(i, tt) > mx Then mx = rank(i, tt)
+    Next i
+    MaxRankVal = mx
+End Function
+
+' ------------------------------------------------------------
+'  Fixture loader. Tries substation_cost_per_mw.csv in the workbook
+'  folder; otherwise builds the hardcoded 17 x 21 reference matrix.
+'
+'  Each substation is a piecewise-constant total-cost profile
+'  T(MW); cost per MW = T / MW. The tier totals are chosen so the
+'  matrix reproduces every reference case in the ranking spec:
+'    * Cunningham & Hobbs and Pleasant Hill & Roosevelt are identical
+'      pairs (the only genuine ties left after the full tiebreak chain).
+'    * Chaves County is the five-tier case.
+'    * The $25MM band has no qualifier anywhere (global min = 47,633,000);
+'      8 qualify at $50MM, 15 at $75MM, all 17 at $100MM with 13 tied at
+'      21 qualifying points; China Draw and Roadrunner are the
+'      breadth-vs-slope inversions.
+'  Cielo..House are the fillers that complete those aggregate counts.
+' ------------------------------------------------------------
+
+Private Sub LoadFixture(ByRef mw() As Double, ByRef names() As String, _
+                        ByRef costM() As Double, ByRef n As Long, ByRef m As Long)
+    If TryLoadCsv(mw, names, costM, n, m) Then Exit Sub
+
+    m = 21: n = 17
+    ReDim mw(1 To m)
+    Dim j As Long
+    For j = 1 To m: mw(j) = 100 + (j - 1) * 10: Next j     ' 100..300 step 10
+
+    ReDim names(1 To n)
+    ReDim costM(1 To n, 1 To m)
+
+    ' name;  tier breakpoints (upper MW of each tier);  tier totals
+    names(1) = "Cunningham":    SetProfile costM, mw, 1, m, Array(300), Array(47633000#)
+    names(2) = "Hobbs":         SetProfile costM, mw, 2, m, Array(300), Array(47633000#)
+    names(3) = "Chaves County": SetProfile costM, mw, 3, m, _
+                    Array(190, 200, 230, 270, 300), _
+                    Array(49473000#, 98003000#, 185783000#, 205353000#, 207843000#)
+    names(4) = "Eddy County":   SetProfile costM, mw, 4, m, Array(280, 300), Array(47633000#, 64033000#)
+    names(5) = "Eddy North":    SetProfile costM, mw, 5, m, Array(270, 300), Array(49473000#, 65873000#)
+    names(6) = "Kiowa":         SetProfile costM, mw, 6, m, Array(300), Array(64033000#)
+    names(7) = "Oasis":         SetProfile costM, mw, 7, m, Array(170, 240, 300), Array(47633000#, 60000000#, 79083142#)
+    names(8) = "Pleasant Hill": SetProfile costM, mw, 8, m, Array(170, 240, 300), Array(47633000#, 60000000#, 81108681#)
+    names(9) = "Roosevelt":     SetProfile costM, mw, 9, m, Array(170, 240, 300), Array(47633000#, 60000000#, 81108681#)
+    names(10) = "China Draw":   SetProfile costM, mw, 10, m, Array(170, 230, 300), Array(73103436#, 92000000#, 150000000#)
+    names(11) = "Roadrunner":   SetProfile costM, mw, 11, m, Array(210, 300), Array(96832165#, 160000000#)
+    names(12) = "Cielo":        SetProfile costM, mw, 12, m, Array(250, 300), Array(71000000#, 86000000#)
+    names(13) = "Datil":        SetProfile costM, mw, 13, m, Array(250, 300), Array(72000000#, 89000000#)
+    names(14) = "Encino":       SetProfile costM, mw, 14, m, Array(250, 300), Array(73000000#, 91000000#)
+    names(15) = "Fence Lake":   SetProfile costM, mw, 15, m, Array(250, 300), Array(74000000#, 95000000#)
+    names(16) = "Grama":        SetProfile costM, mw, 16, m, Array(250, 300), Array(75000000#, 97000000#)
+    names(17) = "House":        SetProfile costM, mw, 17, m, Array(220, 300), Array(90000000#, 140000000#)
+End Sub
+
+' Fill row i from a piecewise-constant tier profile: for each MW point,
+' T is the total of the first tier whose upper-MW bound it falls within.
+Private Sub SetProfile(ByRef costM() As Double, ByRef mw() As Double, ByVal i As Long, _
+                       ByVal m As Long, ByVal ups As Variant, ByVal ts As Variant)
+    Dim T() As Double: ReDim T(1 To m)
+    Dim j As Long, k As Long
+    For j = 1 To m
+        For k = LBound(ups) To UBound(ups)
+            If mw(j) <= CDbl(ups(k)) Then
+                T(j) = CDbl(ts(k))
+                Exit For
+            End If
+        Next k
+    Next j
+    SetRow costM, mw, T, i, m
+End Sub
+
+Private Sub SetRow(ByRef costM() As Double, ByRef mw() As Double, ByRef T() As Double, _
+                   ByVal i As Long, ByVal m As Long)
+    Dim j As Long
+    For j = 1 To m: costM(i, j) = T(j) / mw(j): Next j
+End Sub
+
+' Attempt to read substation_cost_per_mw.csv from the workbook folder.
+' Layout: first row = header with a leading name cell then MW values;
+' each subsequent row = name then cost-per-MW values. Returns False if
+' the file is absent or unreadable (SelfTest then uses the hardcoded set).
+Private Function TryLoadCsv(ByRef mw() As Double, ByRef names() As String, _
+                            ByRef costM() As Double, ByRef n As Long, ByRef m As Long) As Boolean
+    TryLoadCsv = False
+    On Error GoTo Fail
+
+    Dim path As String
+    path = ThisWorkbook.path
+    If Len(path) = 0 Then Exit Function
+    Dim fn As String: fn = path & Application.PathSeparator & "substation_cost_per_mw.csv"
+    If Len(Dir(fn)) = 0 Then Exit Function
+
+    Dim ff As Integer: ff = FreeFile
+    Dim lines() As String, cnt As Long
+    ReDim lines(1 To 1000)
+    Open fn For Input As #ff
+    Do While Not EOF(ff)
+        Dim ln As String: Line Input #ff, ln
+        If Len(Trim(ln)) > 0 Then
+            cnt = cnt + 1
+            If cnt > UBound(lines) Then ReDim Preserve lines(1 To UBound(lines) + 1000)
+            lines(cnt) = ln
+        End If
+    Loop
+    Close #ff
+    If cnt < 2 Then Exit Function
+
+    Dim hdr() As String: hdr = Split(lines(1), ",")
+    m = UBound(hdr) - LBound(hdr)                 ' minus the leading name column
+    n = cnt - 1
+    ReDim mw(1 To m): ReDim names(1 To n): ReDim costM(1 To n, 1 To m)
+
+    Dim j As Long
+    For j = 1 To m: mw(j) = CDbl(Trim(hdr(LBound(hdr) + j))): Next j
+
+    Dim i As Long
+    For i = 1 To n
+        Dim parts() As String: parts = Split(lines(i + 1), ",")
+        names(i) = Trim(parts(LBound(parts)))
+        For j = 1 To m
+            costM(i, j) = CDbl(Trim(parts(LBound(parts) + j)))
+        Next j
+    Next i
+
+    TryLoadCsv = True
+    Exit Function
+Fail:
+    On Error Resume Next
+    Close #ff
+    TryLoadCsv = False
+End Function
