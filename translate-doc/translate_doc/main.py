@@ -525,25 +525,17 @@ def run_format_flow(input_path: Path, restart: bool) -> None:
 
 
 def _print_format_summary(input_path: Path, result: "formatter.FormatResult") -> None:
-    skipped = (
-        ", ".join(str(n) for n in result.skipped_pages)
-        if result.skipped_pages
-        else "none"
-    )
     print("\n" + "=" * 50)
     print("Done.")
-    print(f"  Input:                 {input_path.name}")
-    print(f"  Output:                {result.output_path.name}")
-    print(f"  Pages formatted:       {result.pages_formatted}")
-    print(f"  Cover pages skipped:   {skipped}")
-    print(f"  Running headers dropped: {result.headers_dropped}")
-    print(f"  CJK characters stripped: {result.cjk_stripped}")
-    print(f"  Footnotes created:     {result.footnotes_created}")
-    print(f"  Asterisk flags:        {result.asterisks}")
-    print(f"  Paragraphs produced:   {result.paragraphs_produced}")
-    print(f"  Median paragraph length: {result.median_paragraph_chars} chars")
+    print(f"  Input:                   {input_path.name}")
+    print(f"  Output:                  {result.output_path.name}")
+    print(f"  Cover pages dropped:     {result.cover_pages_dropped}")
+    print(f"  Running headers removed: {result.running_headers_removed}")
+    print(f"  Section headings:        {result.section_headings}")
+    print(f"  Paragraphs produced:     {result.paragraphs_produced}")
+    print(f"  Footnotes preserved:     {result.footnotes_preserved}")
     print(
-        "  Paragraphing: "
+        "  Paragraphing:            "
         + (
             "Claude LLM pass"
             if result.paragraphing_ran

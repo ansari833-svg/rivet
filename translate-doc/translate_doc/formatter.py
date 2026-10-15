@@ -1,105 +1,87 @@
-"""Format mode: turn a raw ``_translated.docx`` into a clean, footnoted document.
+"""Format mode: a pandoc round-trip pipeline.
 
-The Translate-mode output is legible line-for-line but reads as walls of
-shredded text: footnotes sit inline as plain text, the body is one short
-paragraph per source line, and the file is cluttered with ``[[page N]]``
-markers, ``[†see log]`` flags and OCR garbage from cover pages.
+python-docx cannot create or cleanly read real Word footnotes; pandoc does
+both. So Format mode exports the input ``.docx`` to Markdown with pandoc,
+performs every text manipulation on that Markdown (never touching ``[^N]``
+footnote refs or ``[^N]:`` definitions), then rebuilds a styled ``.docx`` with
+pandoc — the footnotes come back as genuine, auto-numbered Word footnotes.
 
-Format mode parses that structure, promotes the inline footnotes to real Word
-footnotes (via Pandoc), reflows the body into prose, and — when an API key is
-present — asks Claude to insert paragraph breaks only where the argument
-genuinely shifts. The result is ``{name}_formatted.docx``.
-
-Pandoc is a required external dependency for this mode (python-docx cannot
-create real Word footnotes).
+Pipeline:
+    1. pandoc input.docx -t markdown --wrap=none            (export)
+    2. clean + reparagraph the Markdown                     (this module)
+    3. pandoc work_clean.md -o out.docx --reference-doc=... (rebuild)
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import shutil
-import statistics
 import subprocess
 import time
-from dataclasses import dataclass, field
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Pt
+from docx.shared import Inches, Pt, RGBColor
 
 MODEL = "claude-sonnet-5"
-
-# Pages with fewer Latin letters than this are treated as un-OCR-able cover /
-# title pages and dropped.
-LATIN_LETTER_THRESHOLD = 40
-
-# Target chunk size (in words) for the intelligent-paragraphing API calls.
 WORDS_PER_CHUNK = 2500
 
-PAGE_MARKER_RE = re.compile(r"\[\[\s*page\s+(\d+)\s*\]\]", re.IGNORECASE)
-FOOTNOTE_DEF_RE = re.compile(r"^\((\d+)\)")
-SEE_LOG_RE = re.compile(r"\[\s*†?\s*see\s*log\s*\]", re.IGNORECASE)
+# ---- Markdown tokens we must recognise or preserve ------------------------
+
+# Footnote reference (no leading caret) and definition line.
+FOOTNOTE_REF_RE = re.compile(r"\[\^\d+\]")
+FOOTNOTE_DEF_RE = re.compile(r"^\[\^\d+\]:")
+# Source-page marker: superscript [N], brackets possibly escaped by pandoc.
+PAGE_MARKER_RE = re.compile(r"\^\\?\[\d+\\?\]\^")
+# The asterisk flag we emit (escaped star inside a pandoc superscript).
+ASTERISK_MD = "^\\*^"
+
+# Junk / OCR noise.
+SEE_LOG_RE = re.compile(r"\\?\[\s*(?:†|\\u2020)?\s*see\s*log\s*\\?\]", re.IGNORECASE)
 LEAKED_TAG_RE = re.compile(r"</?(?:sup|sub|u)>", re.IGNORECASE)
-TOKEN_RE = re.compile(r"(<<F\d+>>|<<P\d+>>|<<A>>)")
-QURAN_RE = re.compile(r"\{([^{}]*)\}")
-_SENTENCE_END = ".?!…:؟"
-
-# OCR misreads: CJK symbols/ideographs, kana, Hangul, and the 《》 brackets.
-# (U+3040–U+30FF and 《》 fall inside U+3000–U+9FFF but are listed for clarity.)
-CJK_RE = re.compile(r"[　-鿿぀-ヿ가-퟿《》]")
-
-# Running-header / title / journal keywords. A short body line matching one of
-# these is dropped as a running header rather than kept as content.
-HEADER_KEYWORDS = (
-    "criterion of prohibited resemblance",
-    "al-juday",
-    "al-judayʿ",
-    "academic journal",
-    "journal of",
-    "issue no",
-    "muḥarram",
-    "muharram",
-    "october 2016",
-)
-HEADER_MONTH_YEAR_RE = re.compile(
-    r"\b(january|february|march|april|may|june|july|august|september|october|"
-    r"november|december|mu[ḥh]arram|safar|rabi[ʿ'`]?|jumada|rajab|sha[ʿ'`]?ban|"
-    r"rama[ḍd]an|shawwal|dhu[ʾ'`]?l)\b.*\b\d{4}\b",
-    re.IGNORECASE,
-)
-# A line that is nothing but a page number (optionally bracketed / dashed).
-BARE_PAGE_NUM_RE = re.compile(r"^[\[\(\-–—\s]*\d{1,4}[\]\)\-–—\s]*$")
-
-# Discourse markers that should start a new paragraph.
-DISCOURSE_RE = re.compile(
-    r"^(?:as for\b|the first\b|the second\b|the third\b|then\b|accordingly\b|"
-    r"therefore\b|thus\b|in summary\b|chapter\b|section\b|question\b|"
-    r"know that\b|he said:|it was narrated\b|on the authority\b|and allah\b|"
-    r"allah(?: the exalted| the almighty| almighty)? said)",
-    re.IGNORECASE,
-)
-
-# Sentence splitting: break after .!?؟… when followed by whitespace then an
-# uppercase letter or opening quote (keeps "no. 1" and decimals intact).
-SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?؟…])\s+(?=[\"“A-Z])")
-# Sentence punctuation glued to the next word: insert a space.
 GLUED_PUNCT_RE = re.compile(r"([.!?؟])([\"“A-Z])")
 
-# Mechanical-paragraphing thresholds (the fallback when the LLM step is off).
-_PARA_MARKER_MIN_CHARS = 160   # break BEFORE a discourse marker past this
-_PARA_LEN_MIN_SENTENCES = 2    # break AFTER a boundary once this many sentences
-_PARA_LEN_MIN_CHARS = 380      # ...and this many chars have accumulated
-_PARA_MAX_CHARS = 1100         # last-resort split above this
-_PARA_SPLIT_MIN_CHARS = 600    # ...at a ; or : clause end past this
+# Cover / front-matter signals.
+FRONT_MATTER_MARKERS = (
+    "isbn",
+    "all rights reserved",
+    "http",
+    "www.",
+    "@",
+    "p.o. box",
+    "edition",
+    "<br>",
+    "xxx",
+)
+
+# Discourse markers that should begin a new paragraph (mechanical fallback).
+DISCOURSE_RE = re.compile(
+    r"^(?:as for\b|the first\b|the second\b|the third\b|then\b|accordingly\b|"
+    r"therefore\b|thus\b|in summary\b|know that\b|he said:|and allah\b|"
+    r"allah(?: the exalted| the almighty| almighty)? said|ibn\b|al-)",
+    re.IGNORECASE,
+)
+
+# Mechanical-paragraphing thresholds.
+_PARA_MARKER_MIN_CHARS = 160
+_PARA_LEN_MIN_SENTENCES = 2
+_PARA_LEN_MIN_CHARS = 380
+_PARA_MAX_CHARS = 1100
+_PARA_SPLIT_MIN_CHARS = 600
+
+_SENTENCE_END = set(".!?؟…")
 
 PARAGRAPHING_SYSTEM_PROMPT = """\
-You insert paragraph breaks into an already-translated passage. You are given \
-running text that has had its paragraphing flattened.
+You insert paragraph breaks into an already-translated passage whose \
+paragraphing has been flattened into running text.
 
 Your ONLY permitted action is to insert paragraph breaks (blank lines) between \
 sentences, and only where the argument genuinely shifts — a new point, a new \
@@ -107,274 +89,266 @@ hadith, a move from a ruling to its evidence, or the start of a new section.
 
 Absolute rules:
 1. Do NOT change, add, remove, reorder, correct, or translate any words, \
-punctuation, or characters. The text between breaks must be byte-for-byte the \
-same as the input (aside from the whitespace you convert into paragraph breaks).
-2. Preserve every placeholder token exactly and in place. Tokens look like \
-<<F12>>, <<P5>>, and <<A>>. Never alter, drop, duplicate, translate, or move \
-them relative to the surrounding words.
+punctuation, or characters. The text between breaks must be identical to the \
+input apart from the whitespace you turn into paragraph breaks.
+2. Preserve every marker exactly and in place. Footnote references look like \
+[^12]; the flag marker looks like ^\\*^. Never alter, drop, duplicate, move, or \
+translate them.
 3. Only break BETWEEN sentences, never inside one. If unsure, do not break.
-4. Return ONLY the re-paragraphed text — no commentary, no headings, no \
-markup other than the blank lines separating paragraphs.
+4. Return ONLY the re-paragraphed text — no commentary, no headings, no markup \
+beyond the blank lines separating paragraphs.
 """
 
 
 # ---------------------------------------------------------------------------
-# Data model
+# Result + availability
 # ---------------------------------------------------------------------------
 
 
 @dataclass
-class RunInfo:
-    text: str
-    superscript: bool
-    highlighted: bool
+class FormatResult:
+    output_path: Path
+    cover_pages_dropped: int
+    running_headers_removed: int
+    section_headings: int
+    paragraphs_produced: int
+    footnotes_preserved: int
+    paragraphing_ran: bool
 
 
-@dataclass
-class ParaInfo:
-    text: str
-    runs: list[RunInfo]
-
-
-@dataclass
-class Footnote:
-    page_num: int
-    local_num: int
-    text: str
-    global_id: int = 0
-
-
-@dataclass
-class Page:
-    num: int
-    raw_paras: list[ParaInfo] = field(default_factory=list)
-    body: list[ParaInfo] = field(default_factory=list)
-    footnotes: list[Footnote] = field(default_factory=list)
-    skipped: bool = False
-    reflowed: str = ""
+def pandoc_available() -> bool:
+    return shutil.which("pandoc") is not None
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — parse structure
+# Step 0 — pandoc export
 # ---------------------------------------------------------------------------
 
 
-def _para_info(paragraph) -> ParaInfo:
-    runs = [
-        RunInfo(
-            text=r.text,
-            superscript=bool(r.font.superscript),
-            highlighted=r.font.highlight_color is not None,
-        )
-        for r in paragraph.runs
-    ]
-    return ParaInfo(text=paragraph.text, runs=runs)
-
-
-def _first_nonempty_superscript(p: ParaInfo) -> bool:
-    for r in p.runs:
-        if r.text.strip():
-            return r.superscript
-    return False
-
-
-def _is_footnote_def(p: ParaInfo) -> bool:
-    if not FOOTNOTE_DEF_RE.match(p.text.strip()):
-        return False
-    # An inline superscript "(N)" marker is not a definition.
-    return not _first_nonempty_superscript(p)
-
-
-def parse_structure(path: Path) -> list[Page]:
-    document = Document(str(path))
-    pages: list[Page] = []
-    current = Page(num=1)
-
-    for paragraph in document.paragraphs:
-        stripped = paragraph.text.strip()
-        marker = PAGE_MARKER_RE.fullmatch(stripped)
-        if marker:
-            if current.raw_paras:
-                pages.append(current)
-            current = Page(num=int(marker.group(1)))
-            continue
-        current.raw_paras.append(_para_info(paragraph))
-
-    if current.raw_paras or not pages:
-        pages.append(current)
-    return pages
-
-
-def _split_body_and_footnotes(page: Page) -> None:
-    in_footnotes = False
-    current_fn: Optional[Footnote] = None
-    for p in page.raw_paras:
-        if not in_footnotes and _is_footnote_def(p):
-            in_footnotes = True
-        if not in_footnotes:
-            page.body.append(p)
-            continue
-        m = FOOTNOTE_DEF_RE.match(p.text.strip())
-        if m and not _first_nonempty_superscript(p):
-            text = FOOTNOTE_DEF_RE.sub("", p.text.strip(), count=1).strip()
-            current_fn = Footnote(page_num=page.num, local_num=int(m.group(1)), text=text)
-            page.footnotes.append(current_fn)
-        elif current_fn is not None:
-            current_fn.text = (current_fn.text + " " + p.text.strip()).strip()
-        else:
-            page.body.append(p)
-
-
-def _latin_letter_count(page: Page) -> int:
-    count = 0
-    for p in page.body:
-        count += sum(1 for ch in p.text if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
-    for fn in page.footnotes:
-        count += sum(1 for ch in fn.text if ("A" <= ch <= "Z") or ("a" <= ch <= "z"))
-    return count
-
-
-@dataclass
-class CleanStats:
-    headers_dropped: int = 0
-    cjk_stripped: int = 0
-
-
-def _strip_cjk(text: str) -> tuple[str, int]:
-    removed = len(CJK_RE.findall(text))
-    return CJK_RE.sub("", text), removed
-
-
-def _is_header_line(text: str) -> bool:
-    """A short body line that is a running header, title, journal ref, or bare
-    page number — OCR chrome to drop rather than content to keep."""
-    t = text.strip()
-    if not t:
-        return False
-    if BARE_PAGE_NUM_RE.match(t):
-        return True
-    if len(t.split()) > 14:
-        return False
-    low = t.lower()
-    if any(kw in low for kw in HEADER_KEYWORDS):
-        return True
-    return bool(HEADER_MONTH_YEAR_RE.search(t))
-
-
-def _clean_page_body(page: Page, stats: CleanStats) -> None:
-    """Strip CJK OCR garbage and drop running-header lines, in place."""
-    kept: list[ParaInfo] = []
-    for p in page.body:
-        clean_text, removed = _strip_cjk(p.text)
-        stats.cjk_stripped += removed
-        if _is_header_line(clean_text):
-            stats.headers_dropped += 1
-            continue
-        # Mirror the CJK strip onto the runs used during reflow.
-        for r in p.runs:
-            r.text, _ = _strip_cjk(r.text)
-        p.text = clean_text
-        kept.append(p)
-    page.body = kept
-    for fn in page.footnotes:
-        fn.text, removed = _strip_cjk(fn.text)
-        stats.cjk_stripped += removed
+def export_markdown(input_docx: Path) -> str:
+    result = subprocess.run(
+        ["pandoc", str(input_docx), "-t", "markdown", "--wrap=none"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return result.stdout
 
 
 # ---------------------------------------------------------------------------
-# Step 2 / 3 — footnote mapping and body reflow
+# Step 1 — set footnote definitions aside
 # ---------------------------------------------------------------------------
 
 
-def _reflow_page(page: Page, local_to_global: dict[int, int]) -> str:
-    out: list[str] = []
-    found: set[int] = set()
-
-    for p in page.body:
-        for r in p.runs:
-            txt = r.text
-            if not txt:
-                continue
-            if r.highlighted or SEE_LOG_RE.search(txt):
-                out.append(" <<A>> ")
-                continue
-            if r.superscript:
-                num_match = re.fullmatch(r"\s*\(?(\d+)\)?\s*", txt)
-                if num_match:
-                    gid = local_to_global.get(int(num_match.group(1)))
-                    if gid:
-                        out.append(f" <<F{gid}>> ")
-                        found.add(int(num_match.group(1)))
+def extract_footnote_defs(md: str) -> tuple[str, list[str]]:
+    """Pull every ``[^N]: ...`` definition (plus indented continuations) out of
+    the Markdown, returning (body, definitions). Definitions are kept verbatim.
+    """
+    lines = md.split("\n")
+    body: list[str] = []
+    defs: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        if FOOTNOTE_DEF_RE.match(lines[i]):
+            block = [lines[i]]
+            i += 1
+            # Capture multi-line / multi-paragraph continuations (indented).
+            while i < n:
+                if lines[i].strip() == "":
+                    j = i
+                    while j < n and lines[j].strip() == "":
+                        j += 1
+                    if j < n and (lines[j].startswith("    ") or lines[j].startswith("\t")):
+                        block.extend(lines[i : j + 1])
+                        i = j + 1
                         continue
-            out.append(txt)
-        out.append("\n")
-
-    text = "".join(out)
-    # Strip leaked tags and literal flag text; collapse the daggers to markers.
-    text = SEE_LOG_RE.sub(" <<A>> ", text)
-    text = LEAKED_TAG_RE.sub("", text)
-    text = text.replace("†", " <<A>> ")
-
-    # Fallback marker placement when no superscript markers were detected.
-    if page.footnotes and not found:
-        for fn in page.footnotes:
-            m = re.search(r"\(%d\)" % fn.local_num, text)
-            if m:
-                text = f"{text[:m.start()]} <<F{fn.global_id}>> {text[m.end():]}"
-
-    # Reflow: line breaks become spaces, collapse whitespace runs.
-    text = re.sub(r"[ \t]*\n[ \t]*", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    # Final cleanup: drop any residual CJK, then un-glue sentence punctuation
-    # that OCR line-joining left stuck to the next word.
-    text = CJK_RE.sub("", text)
-    text = GLUED_PUNCT_RE.sub(r"\1 \2", text)
-    text = re.sub(r"\s{2,}", " ", text).strip()
-    if text:
-        text = f"<<P{page.num}>> {text}"
-    return text
-
-
-# ---------------------------------------------------------------------------
-# Step 4 — reassemble without breaking sentences
-# ---------------------------------------------------------------------------
-
-
-def _ends_sentence(s: str) -> bool:
-    t = re.sub(r"(<<[FPA]\d*>>|\s)+$", "", s.rstrip())
-    t = t.rstrip("\"'”»)")
-    return bool(t) and t[-1] in _SENTENCE_END
-
-
-def _reassemble(pages: list[Page]) -> list[str]:
-    paragraphs: list[str] = []
-    buf = ""
-    for page in pages:
-        if not page.reflowed:
-            continue
-        if not buf:
-            buf = page.reflowed
-        elif _ends_sentence(buf):
-            paragraphs.append(buf)
-            buf = page.reflowed
+                    break
+                if lines[i].startswith("    ") or lines[i].startswith("\t"):
+                    block.append(lines[i])
+                    i += 1
+                    continue
+                break
+            defs.append("\n".join(block).rstrip())
         else:
-            buf = f"{buf} {page.reflowed}"
-    if buf:
-        paragraphs.append(buf)
-    return paragraphs
+            body.append(lines[i])
+            i += 1
+    return "\n".join(body), defs
 
 
 # ---------------------------------------------------------------------------
-# Step 5 (fallback) — mechanical sentence-based paragraphing
+# Step 2 — segmentation + cover / front-matter detection
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Segment:
+    text: str
+    has_page_number: bool
+
+
+def split_into_segments(body: str) -> list[Segment]:
+    """Split the body at page markers. Each piece is one source page-segment."""
+    pieces = PAGE_MARKER_RE.split(body)
+    segments = [Segment(text=pieces[0], has_page_number=False)]
+    for piece in pieces[1:]:
+        segments.append(Segment(text=piece, has_page_number=True))
+    return [s for s in segments if s.text.strip()]
+
+
+def _non_dictionary_ratio(text: str) -> float:
+    tokens = re.findall(r"\S+", text)
+    if not tokens:
+        return 1.0
+    bad = 0
+    for tok in tokens:
+        core = re.sub(r"[^A-Za-z]", "", tok)
+        if not core or (len(core) == 1 and core.lower() not in ("a", "i")):
+            bad += 1
+        elif any(ch.isdigit() for ch in tok):
+            bad += 1
+    return bad / len(tokens)
+
+
+def _is_front_matter(text: str) -> bool:
+    low = text.lower()
+    if any(marker in low for marker in FRONT_MATTER_MARKERS):
+        return True
+    return _non_dictionary_ratio(text) > 0.35
+
+
+def _has_basmala(text: str) -> bool:
+    return "in the name of allah" in text.lower()
+
+
+def _is_clean_prose(text: str) -> bool:
+    words = re.findall(r"[A-Za-z]+", text)
+    if len(words) < 12:
+        return False
+    if _non_dictionary_ratio(text) > 0.3:
+        return False
+    return bool(re.search(r"[.!?؟]", text))
+
+
+def find_content_start(segments: list[Segment]) -> int:
+    """Index of the first real-content segment; everything before is cover."""
+    for idx, seg in enumerate(segments):
+        if _has_basmala(seg.text):
+            return idx
+        if _is_front_matter(seg.text):
+            continue
+        if _is_clean_prose(seg.text):
+            return idx
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Step 4 / 5 — leading phrases, running headers, section titles
+# ---------------------------------------------------------------------------
+
+
+def _leading_phrase(text: str) -> str:
+    # The running header / title is the first line of the page-segment. Take that
+    # line, then truncate to the first sentence-end or the first ~10 words.
+    first_line = ""
+    for line in text.split("\n"):
+        if line.strip():
+            first_line = line.strip()
+            break
+    t = re.sub(r'^(?:\[\^\d+\]|\^\\\*\^|["“\'(]|\s)+', "", first_line).strip()
+    m = re.search(r"[.!?؟…]", t)
+    if m and m.start() <= 120:
+        phrase = t[: m.start()]
+    else:
+        phrase = " ".join(t.split()[:10])
+    return phrase.strip()
+
+
+def _normalize_phrase(phrase: str) -> str:
+    low = re.sub(r"[^a-z\s]", " ", phrase.lower())
+    return re.sub(r"\s+", " ", low).strip()
+
+
+def _is_title_like(phrase: str) -> bool:
+    if phrase.endswith("?"):
+        return True
+    words = [w for w in re.findall(r"[A-Za-z]+", phrase)]
+    if not words:
+        return False
+    capped = sum(1 for w in words if w[0].isupper())
+    return capped / len(words) >= 0.6
+
+
+def _header_removal_regex(normalized: str) -> re.Pattern:
+    words = normalized.split()
+    core = r"[\W\s]+".join(re.escape(w) for w in words)
+    # Optional trailing page number and/or asterisk flag.
+    trailer = r"(?:\s*(?:\^\\?\*\^|\d{1,4}\b))*"
+    return re.compile(r"\b" + core + r"\b" + trailer, re.IGNORECASE)
+
+
+# ---------------------------------------------------------------------------
+# Step 6 — per-segment cleanup
+# ---------------------------------------------------------------------------
+
+
+def _clean_segment_text(text: str) -> str:
+    text = PAGE_MARKER_RE.sub(" ", text)
+    text = re.sub(r"<br\s*/?>", " ", text, flags=re.IGNORECASE)
+    text = text.replace("***", " ").replace("XXX", " ")
+    text = re.sub(r"\[\]\{[^}]*\}", "", text)  # empty spans
+    text = re.sub(r"\{\.[^}]*\}", "", text)     # {.mark} / {.underline}
+    text = LEAKED_TAG_RE.sub("", text)
+    # Flag markers -> superscript asterisk.
+    text = SEE_LOG_RE.sub(f" {ASTERISK_MD} ", text)
+    text = text.replace("†", f" {ASTERISK_MD} ")
+    # Un-glue sentence punctuation stuck to the next word.
+    text = GLUED_PUNCT_RE.sub(r"\1 \2", text)
+    # Reflow to prose: newlines -> spaces, collapse whitespace.
+    text = re.sub(r"\s*\n\s*", " ", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — paragraphing (mechanical fallback)
 # ---------------------------------------------------------------------------
 
 
 def _split_sentences(text: str) -> list[str]:
-    return [s.strip() for s in SENTENCE_SPLIT_RE.split(text) if s.strip()]
+    sentences: list[str] = []
+    start, i, L = 0, 0, len(text)
+    while i < L:
+        if text[i] in _SENTENCE_END:
+            j = i + 1
+            # Consume trailing closers and markers so they stay with the sentence.
+            while j < L:
+                if text[j] in "\"”»')]":
+                    j += 1
+                elif text.startswith(ASTERISK_MD, j):
+                    j += len(ASTERISK_MD)
+                else:
+                    m = FOOTNOTE_REF_RE.match(text, j)
+                    if m:
+                        j = m.end()
+                    else:
+                        break
+            k = j
+            while k < L and text[k] in " \t":
+                k += 1
+            if k > j and k < L and (text[k].isupper() or text[k] in "\"“(["):
+                sentences.append(text[start:j].strip())
+                start = i = k
+                continue
+        i += 1
+    tail = text[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return [s for s in sentences if s]
 
 
 def _starts_discourse(sentence: str) -> bool:
-    s = TOKEN_RE.sub("", sentence).lstrip(" \"“'‘(")
+    s = FOOTNOTE_REF_RE.sub("", sentence).replace(ASTERISK_MD, "")
+    s = s.lstrip(" \"“'‘([")
     return bool(DISCOURSE_RE.match(s))
 
 
@@ -389,13 +363,37 @@ def _split_long_paragraph(para: str) -> list[str]:
     return [para]
 
 
-def _group_sentences(sentences: list[str]) -> list[str]:
+def _only_markers(text: str) -> bool:
+    stripped = FOOTNOTE_REF_RE.sub("", text).replace(ASTERISK_MD, "")
+    return not re.search(r"[A-Za-z0-9]", stripped)
+
+
+def _glue_orphans(paragraphs: list[str]) -> list[str]:
+    """Never let a paragraph start with a bare marker or be marker-only."""
+    out: list[str] = []
+    for para in paragraphs:
+        p = para.strip()
+        if not p:
+            continue
+        starts_marker = bool(FOOTNOTE_REF_RE.match(p)) or p.startswith(ASTERISK_MD)
+        if out and (starts_marker or _only_markers(p)):
+            out[-1] = f"{out[-1]} {p}".strip()
+        else:
+            out.append(p)
+    return out
+
+
+def mechanical_paragraphs(text: str) -> list[str]:
+    body = re.sub(r"\s+", " ", text).strip()
+    body = GLUED_PUNCT_RE.sub(r"\1 \2", body)
+    if not body:
+        return []
+    sentences = _split_sentences(body)
+
     paragraphs: list[str] = []
     cur: list[str] = []
     cur_len = 0
     for s in sentences:
-        # (a) Break BEFORE a discourse marker once the current paragraph has
-        # content.
         if (
             cur
             and _starts_discourse(s)
@@ -406,61 +404,25 @@ def _group_sentences(sentences: list[str]) -> list[str]:
             cur, cur_len = [], 0
         cur.append(s)
         cur_len += len(s) + 1
-        # (b) Break AFTER a boundary once the paragraph is long enough.
         if len(cur) >= _PARA_LEN_MIN_SENTENCES and cur_len >= _PARA_LEN_MIN_CHARS:
             paragraphs.append(" ".join(cur))
             cur, cur_len = [], 0
     if cur:
         paragraphs.append(" ".join(cur))
 
-    # Last resort: hard-split any paragraph still over the ceiling.
     result: list[str] = []
     for para in paragraphs:
         result.extend(_split_long_paragraph(para))
-    return result
-
-
-def mechanical_paragraphs(step4_paragraphs: list[str]) -> list[str]:
-    """Fallback paragraphing: reflow to one body, split to sentences, regroup.
-
-    Never returns one-paragraph-per-page — it ignores the page-based grouping
-    and rebuilds paragraphs from sentence boundaries and discourse markers.
-    """
-    body = " ".join(re.sub(r"\s+", " ", p).strip() for p in step4_paragraphs)
-    body = GLUED_PUNCT_RE.sub(r"\1 \2", body)
-    body = re.sub(r"\s{2,}", " ", body).strip()
-    if not body:
-        return []
-    return _group_sentences(_split_sentences(body))
+    return _glue_orphans(result)
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — intelligent paragraphing (Claude API)
+# Step 7 — LLM paragraphing (preferred when a key is present)
 # ---------------------------------------------------------------------------
-
-
-def _normalize(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _chunk_paragraphs(paragraphs: list[str], target_words: int = WORDS_PER_CHUNK):
-    chunks: list[list[str]] = []
-    current: list[str] = []
-    words = 0
-    for para in paragraphs:
-        w = len(para.split())
-        if current and words + w > target_words:
-            chunks.append(current)
-            current, words = [], 0
-        current.append(para)
-        words += w
-    if current:
-        chunks.append(current)
-    return chunks
 
 
 class FormatCheckpoint:
-    """Checkpoint for the paragraphing step: ``{name}_format_checkpoint.json``."""
+    """Checkpoint for the LLM paragraphing step."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -514,8 +476,27 @@ class FormatCheckpoint:
             pass
 
 
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _chunk_paragraphs(paragraphs: list[str], target_words: int = WORDS_PER_CHUNK):
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    words = 0
+    for para in paragraphs:
+        w = len(para.split())
+        if current and words + w > target_words:
+            chunks.append(current)
+            current, words = [], 0
+        current.append(para)
+        words += w
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def _paragraph_chunk(client, chunk_text: str) -> str:
-    """One API call; returns the model's text (caller must verify it)."""
     response = client.messages.create(
         model=MODEL,
         max_tokens=8000,
@@ -530,49 +511,12 @@ def _paragraph_chunk(client, chunk_text: str) -> str:
 def _call_with_retry(client, chunk_text: str) -> Optional[str]:
     try:
         return _paragraph_chunk(client, chunk_text)
-    except Exception:  # noqa: BLE001 - retry once
+    except Exception:  # noqa: BLE001
         time.sleep(2)
         try:
             return _paragraph_chunk(client, chunk_text)
         except Exception:  # noqa: BLE001
             return None
-
-
-def paragraph_body(
-    paragraphs: list[str],
-    client,
-    checkpoint: FormatCheckpoint,
-    progress=None,
-) -> list[str]:
-    """Return re-paragraphed text as a list of paragraphs.
-
-    The model may only insert breaks; each chunk is verified and discarded if
-    the model altered the text at all.
-    """
-    chunks = _chunk_paragraphs(paragraphs)
-    checkpoint.ensure_total(len(chunks))
-    processed: list[str] = []
-
-    for i, chunk in enumerate(chunks):
-        if progress is not None:
-            progress(i + 1, len(chunks))
-        chunk_text = "\n\n".join(chunk)
-
-        if i in checkpoint.outputs:
-            processed.append(checkpoint.outputs[i])
-            continue
-
-        returned = _call_with_retry(client, chunk_text)
-        if returned is not None and _normalize(returned) == _normalize(chunk_text):
-            result = returned.strip()
-        else:
-            # Reject: keep the chunk unbroken (its Step 4 paragraphing).
-            result = chunk_text
-        checkpoint.record(i, result)
-        processed.append(result)
-
-    combined = "\n\n".join(processed)
-    return _split_into_paragraphs(combined)
 
 
 def _split_into_paragraphs(text: str) -> list[str]:
@@ -585,68 +529,48 @@ def _split_into_paragraphs(text: str) -> list[str]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Step 6 — Markdown + Pandoc build
-# ---------------------------------------------------------------------------
+def llm_paragraph_blocks(
+    body_blocks: list[str],
+    client,
+    checkpoint: FormatCheckpoint,
+    progress=None,
+) -> list[list[str]]:
+    """Re-paragraph each body block via the API, verifying each chunk.
 
-_MD_ESCAPE_RE = re.compile(r"([\\`*_{}\[\]()<>#+.!^~|-])")
+    A chunk whose text changed (beyond whitespace) is discarded in favour of the
+    mechanical paragraphing of that chunk, so the step can only re-break text.
+    """
+    per_block_chunks = [_chunk_paragraphs(mechanical_paragraphs(b)) for b in body_blocks]
+    total = sum(len(c) for c in per_block_chunks)
+    checkpoint.ensure_total(total)
 
-
-def _escape_md(text: str) -> str:
-    return _MD_ESCAPE_RE.sub(r"\\\1", text)
-
-
-def _render_segment(seg: str) -> str:
-    """Escape a token-free text segment and italicize Qur'anic {...} spans."""
-    out: list[str] = []
+    results: list[list[str]] = []
     idx = 0
-    for m in QURAN_RE.finditer(seg):
-        out.append(_escape_md(seg[idx : m.start()]))
-        out.append("*{" + _escape_md(m.group(1)) + "}*")
-        idx = m.end()
-    out.append(_escape_md(seg[idx:]))
-    return "".join(out)
+    for chunks in per_block_chunks:
+        processed: list[str] = []
+        for chunk in chunks:
+            chunk_text = "\n\n".join(chunk)
+            if progress is not None:
+                progress(idx + 1, total)
+            if idx in checkpoint.outputs:
+                processed.append(checkpoint.outputs[idx])
+            else:
+                returned = _call_with_retry(client, chunk_text)
+                if returned is not None and _normalize(returned) == _normalize(chunk_text):
+                    out = returned.strip()
+                else:
+                    out = chunk_text
+                checkpoint.record(idx, out)
+                processed.append(out)
+            idx += 1
+        combined = "\n\n".join(processed)
+        results.append(_glue_orphans(_split_into_paragraphs(combined)))
+    return results
 
 
-def _render_paragraph(text: str) -> str:
-    parts: list[str] = []
-    for piece in TOKEN_RE.split(text):
-        if not piece:
-            continue
-        if piece.startswith("<<F"):
-            parts.append(f"[^{piece[3:-2]}]")
-        elif piece.startswith("<<P"):
-            parts.append(f"^\\[{piece[3:-2]}\\]^")
-        elif piece == "<<A>>":
-            parts.append("^\\*^")
-        else:
-            parts.append(_render_segment(piece))
-    return re.sub(r"\s{2,}", " ", "".join(parts)).strip()
-
-
-def _derive_title(input_path: Path) -> str:
-    stem = re.sub(r"_translated$", "", input_path.stem, flags=re.IGNORECASE)
-    stem = stem.replace("_", " ").replace("-", " ")
-    return re.sub(r"\s+", " ", stem).strip() or input_path.stem
-
-
-def build_markdown(
-    paragraphs: list[str],
-    footnotes: list[Footnote],
-    title: str,
-) -> str:
-    lines: list[str] = [f"# {title}", "", "*Translated from Arabic*", "", ""]
-    for para in paragraphs:
-        rendered = _render_paragraph(para)
-        if rendered:
-            lines.append(rendered)
-            lines.append("")
-    lines.append("")
-    for fn in footnotes:
-        note = _render_paragraph(fn.text) or "(no note text)"
-        lines.append(f"[^{fn.global_id}]: {note}")
-        lines.append("")
-    return "\n".join(lines)
+# ---------------------------------------------------------------------------
+# Step 8 — the styled reference document
+# ---------------------------------------------------------------------------
 
 
 def _add_page_number_field(paragraph) -> None:
@@ -663,33 +587,28 @@ def _add_page_number_field(paragraph) -> None:
     run._r.append(end)
 
 
-def _set_doc_default_font(document, name: str, size_pt: int) -> None:
-    """Force the document-default run font/size so nothing falls back to 10pt."""
+def _set_doc_default_font(document, name: str, size_pt: float) -> None:
     styles_el = document.styles.element
     path = "/".join((qn("w:docDefaults"), qn("w:rPrDefault"), qn("w:rPr")))
-    rpr_default = styles_el.find(path)
-    if rpr_default is None:
+    rpr = styles_el.find(path)
+    if rpr is None:
         return
-    rfonts = rpr_default.find(qn("w:rFonts"))
+    rfonts = rpr.find(qn("w:rFonts"))
     if rfonts is None:
         rfonts = OxmlElement("w:rFonts")
-        rpr_default.insert(0, rfonts)
+        rpr.insert(0, rfonts)
     for attr in ("w:ascii", "w:hAnsi", "w:cs"):
         rfonts.set(qn(attr), name)
     half = str(int(size_pt * 2))
     for tag in ("w:sz", "w:szCs"):
-        el = rpr_default.find(qn(tag))
+        el = rpr.find(qn(tag))
         if el is None:
             el = OxmlElement(tag)
-            rpr_default.append(el)
+            rpr.append(el)
         el.set(qn("w:val"), half)
 
 
 def build_reference_doc(ref_path: Path) -> None:
-    """Generate a Pandoc reference doc styled for a serif book/paper layout:
-    US Letter, 1in margins, 12pt Times New Roman body (justified, 1.5 spacing,
-    0.3in first-line indent, 8pt after), 10pt footnotes, centered page numbers.
-    """
     with open(ref_path, "wb") as fh:
         subprocess.run(
             ["pandoc", "--print-default-data-file", "reference.docx"],
@@ -697,11 +616,9 @@ def build_reference_doc(ref_path: Path) -> None:
             check=True,
         )
     document = Document(str(ref_path))
-
-    # Document default (guards against any 10pt fallback).
     _set_doc_default_font(document, "Times New Roman", 12)
 
-    # Body-text styles Pandoc may apply to paragraphs.
+    # Body text: 12pt TNR, justified, line 312 (1.3) auto, after 160, indent 432.
     for style_name in ("Normal", "Body Text", "First Paragraph", "Compact"):
         try:
             style = document.styles[style_name]
@@ -711,18 +628,35 @@ def build_reference_doc(ref_path: Path) -> None:
         style.font.size = Pt(12)
         pf = style.paragraph_format
         pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        pf.first_line_indent = Inches(0.3)
-        pf.line_spacing = 1.5
+        pf.line_spacing = 1.3
+        pf.line_spacing_rule = WD_LINE_SPACING.MULTIPLE
         pf.space_after = Pt(8)
+        pf.first_line_indent = Inches(0.3)
 
-    # Footnotes a touch smaller.
+    # Footnotes: ~9.5pt (sz 19), compact.
     for style_name in ("Footnote Text", "Footnote"):
         try:
             style = document.styles[style_name]
         except KeyError:
             continue
         style.font.name = "Times New Roman"
-        style.font.size = Pt(10)
+        style.font.size = Pt(9.5)
+        pf = style.paragraph_format
+        pf.space_after = Pt(0)
+        pf.line_spacing = 1.0
+
+    # Section titles: Heading 2.
+    try:
+        h2 = document.styles["Heading 2"]
+        h2.font.name = "Times New Roman"
+        h2.font.size = Pt(14)
+        h2.font.bold = True
+        h2.font.color.rgb = RGBColor(0x1F, 0x3A, 0x5F)
+        h2.paragraph_format.space_before = Pt(12)
+        h2.paragraph_format.space_after = Pt(6)
+        h2.paragraph_format.keep_with_next = True
+    except KeyError:
+        pass
 
     for section in document.sections:
         section.page_width = Inches(8.5)
@@ -760,22 +694,79 @@ def run_pandoc(md_path: Path, output_path: Path, ref_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _derive_title(input_path: Path) -> str:
+    stem = re.sub(r"_translated$", "", input_path.stem, flags=re.IGNORECASE)
+    stem = stem.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", stem).strip() or input_path.stem
+
+
 @dataclass
-class FormatResult:
-    output_path: Path
-    pages_formatted: int
-    footnotes_created: int
-    asterisks: int
-    skipped_pages: list[int]
-    paragraphing_ran: bool
-    headers_dropped: int = 0
-    cjk_stripped: int = 0
-    paragraphs_produced: int = 0
-    median_paragraph_chars: int = 0
+class _Block:
+    kind: str  # "heading" or "body"
+    text: str = ""
+    paragraphs: Optional[list[str]] = None
 
 
-def pandoc_available() -> bool:
-    return shutil.which("pandoc") is not None
+def _assemble_blocks(
+    segments: list[Segment],
+    header_norms: set[str],
+    section_norms: set[str],
+) -> tuple[list[_Block], int, int]:
+    """Turn segments into an ordered block list, promoting section titles to
+    headings and merging consecutive body prose. Returns (blocks, headers_hit,
+    headings_emitted)."""
+    blocks: list[_Block] = []
+    seen_sections: set[str] = set()
+    headers_hit = 0
+    headings_emitted = 0
+
+    for seg in segments:
+        text = seg.text
+        phrase = _leading_phrase(text)
+        norm = _normalize_phrase(phrase)
+
+        if norm and norm in header_norms:
+            # Strip the running header (and its trailing page no. / flag) at the start.
+            text = _header_removal_regex(norm).sub(" ", text, count=1)
+            headers_hit += 1
+        elif norm and norm in section_norms:
+            if norm not in seen_sections:
+                seen_sections.add(norm)
+                blocks.append(_Block(kind="heading", text=phrase.rstrip(":.")))
+                headings_emitted += 1
+                # Remove the title text from the start of the body.
+                text = _header_removal_regex(norm).sub(" ", text, count=1)
+            else:
+                text = _header_removal_regex(norm).sub(" ", text, count=1)
+
+        # Remove any remaining header occurrences anywhere in this segment.
+        for hnorm in header_norms:
+            text = _header_removal_regex(hnorm).sub(" ", text)
+
+        cleaned = _clean_segment_text(text)
+        if not cleaned:
+            continue
+        if blocks and blocks[-1].kind == "body":
+            blocks[-1].text = f"{blocks[-1].text} {cleaned}".strip()
+        else:
+            blocks.append(_Block(kind="body", text=cleaned))
+
+    return blocks, headers_hit, headings_emitted
+
+
+def _build_markdown(title: str, blocks: list[_Block], defs: list[str]) -> str:
+    parts = [f"# {title}", "", "*Translated from Arabic*", "", ""]
+    for block in blocks:
+        if block.kind == "heading":
+            parts.extend([f"## {block.text}", ""])
+        else:
+            for para in block.paragraphs or []:
+                parts.extend([para, ""])
+    parts.append("")
+    if defs:
+        parts.append("\n\n".join(defs))
+        parts.append("")
+    return "\n".join(parts)
 
 
 def format_document(
@@ -784,93 +775,86 @@ def format_document(
     restart: bool = False,
     progress=None,
 ) -> FormatResult:
-    """Full Format-mode pipeline. Returns a :class:`FormatResult`.
-
-    ``client`` is an Anthropic client or None (paragraphing skipped when None).
-    Assumes Pandoc availability was already checked by the caller.
-    """
+    """Full Format-mode pipeline (pandoc round-trip). Pandoc availability is
+    assumed to have been checked by the caller."""
     input_path = input_path.resolve()
     output_path = input_path.parent / f"{input_path.stem}_formatted.docx"
-
     if restart:
         FormatCheckpoint.path_for(input_path).unlink(missing_ok=True)
 
-    # Step 1 — parse, clean (CJK + running headers), and classify pages.
-    stats = CleanStats()
-    pages = parse_structure(input_path)
-    for page in pages:
-        _split_body_and_footnotes(page)
-        _clean_page_body(page, stats)
-        if _latin_letter_count(page) < LATIN_LETTER_THRESHOLD:
-            page.skipped = True
+    # 0/1 — export and set footnote defs aside.
+    md = export_markdown(input_path)
+    body, defs = extract_footnote_defs(md)
 
-    skipped_pages = [p.num for p in pages if p.skipped]
-    kept = [p for p in pages if not p.skipped]
+    # 2 — segment and drop cover / front matter.
+    segments = split_into_segments(body)
+    start = find_content_start(segments)
+    cover_dropped = sum(1 for s in segments[:start])
+    segments = segments[start:]
 
-    # Step 2 — assign global footnote ids across kept pages in order.
-    footnotes: list[Footnote] = []
-    next_id = 1
-    page_local_maps: dict[int, dict[int, int]] = {}
-    for page in kept:
-        local_map: dict[int, int] = {}
-        for fn in page.footnotes:
-            fn.global_id = next_id
-            next_id += 1
-            local_map[fn.local_num] = fn.global_id
-            footnotes.append(fn)
-        page_local_maps[id(page)] = local_map
+    # 4/5 — running headers (by recurrence) and section titles.
+    lead_phrases = [_leading_phrase(s.text) for s in segments]
+    norms = [_normalize_phrase(p) for p in lead_phrases]
+    freq = Counter(n for n in norms if n)
+    representative: dict[str, str] = {}
+    for phrase, norm in zip(lead_phrases, norms):
+        representative.setdefault(norm, phrase)
+    threshold = max(8, math.ceil(0.05 * len(segments))) if segments else 8
+    header_norms = {n for n, c in freq.items() if c >= threshold}
+    section_norms = {
+        n
+        for n, c in freq.items()
+        if n not in header_norms
+        and c <= 3
+        and len(n.split()) <= 10
+        and _is_title_like(representative[n])  # test the ORIGINAL-cased phrase
+    }
 
-    # Step 3 — reflow each page into tokenised prose.
-    for page in kept:
-        page.reflowed = _reflow_page(page, page_local_maps[id(page)])
+    # 3/6 — assemble blocks (strips headers, promotes titles, cleans prose).
+    blocks, headers_hit, headings_emitted = _assemble_blocks(
+        segments, header_norms, section_norms
+    )
 
-    # Step 4 — reassemble across page boundaries without breaking sentences.
-    paragraphs = _reassemble(kept)
-
-    # Step 5 — paragraphing. The Claude LLM pass is PREFERRED when a key is
-    # present (it handles long run-on sentences); the mechanical, sentence-based
-    # pass is the fallback and never produces one-paragraph-per-page.
+    # 7 — paragraphing. LLM preferred; mechanical fallback otherwise.
+    body_blocks = [b for b in blocks if b.kind == "body"]
     paragraphing_ran = False
-    if client is not None and paragraphs:
+    if client is not None and body_blocks:
         checkpoint = None if restart else FormatCheckpoint.load(input_path)
         if checkpoint is None:
             checkpoint = FormatCheckpoint.start(input_path)
-        paragraphs = paragraph_body(paragraphs, client, checkpoint, progress=progress)
+        paragraphed = llm_paragraph_blocks(
+            [b.text for b in body_blocks], client, checkpoint, progress=progress
+        )
         checkpoint.delete()
         paragraphing_ran = True
     else:
-        paragraphs = mechanical_paragraphs(paragraphs)
+        paragraphed = [mechanical_paragraphs(b.text) for b in body_blocks]
 
-    asterisks = sum(p.count("<<A>>") for p in paragraphs)
+    it = iter(paragraphed)
+    for b in blocks:
+        if b.kind == "body":
+            b.paragraphs = next(it)
 
-    # Paragraph-length stats (visible characters, tokens removed).
-    visible_lengths = [
-        len(re.sub(r"\s{2,}", " ", TOKEN_RE.sub("", p)).strip()) for p in paragraphs
-    ]
-    median_len = int(statistics.median(visible_lengths)) if visible_lengths else 0
+    total_paragraphs = sum(len(b.paragraphs or []) for b in blocks if b.kind == "body")
 
-    # Step 6 — Markdown + Pandoc.
+    # 3b/8 — rebuild with pandoc against the styled reference doc.
     title = _derive_title(input_path)
-    markdown = build_markdown(paragraphs, footnotes, title)
+    work_md = _build_markdown(title, blocks, defs)
     md_path = input_path.parent / f"{input_path.stem}_formatted.md"
-    md_path.write_text(markdown, encoding="utf-8")
+    md_path.write_text(work_md, encoding="utf-8")
     ref_path = input_path.parent / f"{input_path.stem}_reference.docx"
     build_reference_doc(ref_path)
     run_pandoc(md_path, output_path, ref_path)
 
-    # Clean up intermediates.
     md_path.unlink(missing_ok=True)
     ref_path.unlink(missing_ok=True)
 
     return FormatResult(
         output_path=output_path,
-        pages_formatted=len(kept),
-        footnotes_created=len(footnotes),
-        asterisks=asterisks,
-        skipped_pages=skipped_pages,
+        cover_pages_dropped=cover_dropped,
+        running_headers_removed=len(header_norms),
+        section_headings=headings_emitted,
+        paragraphs_produced=total_paragraphs,
+        footnotes_preserved=len(defs),
         paragraphing_ran=paragraphing_ran,
-        headers_dropped=stats.headers_dropped,
-        cjk_stripped=stats.cjk_stripped,
-        paragraphs_produced=len(paragraphs),
-        median_paragraph_chars=median_len,
     )

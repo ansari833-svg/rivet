@@ -169,70 +169,80 @@ Word (Save As → PDF).
 
 ## Format mode
 
-The Translate-mode output is faithful line-for-line, but it reads as walls of
-shredded text: footnotes sit inline as plain text, the body is broken into one
-short paragraph per source line, and the file can be cluttered with
-`[[page N]]` markers, `[†see log]` flags, and OCR garbage from cover pages.
-Format mode fixes all of that and produces **`{name}_formatted.docx`**: a clean,
-legible, properly footnoted Word document.
+A raw translated book reads as walls of shredded text: cover/front matter at the
+top, a running header repeated on every page, source-page markers and difficulty
+flags inline, and one short paragraph per OCR line. Format mode cleans all of
+that and produces **`{name}_formatted.docx`**: a clean, legible, properly
+footnoted Word document.
 
 Run it from the menu (**[F]**), or with `translate-doc --format`. It opens a
 picker for the `_translated.docx` (or takes a path argument) and writes the
 formatted file into the same folder.
 
-What it does:
+**It is a Pandoc round-trip.** python-docx cannot create or cleanly read real
+Word footnotes, so Format mode never rebuilds the document by hand:
 
-- **Parses the page structure**, splitting on `[[page N]]` markers and dropping
-  un-OCR-able cover/title pages (pages with fewer than ~40 Latin letters). The
-  skipped page numbers are reported at the end.
-- **Strips OCR garbage and chrome.** CJK / kana / Hangul characters (OCR
-  misreads, not content) are removed, and short running-header lines — the
-  book's title, author, journal/issue line, dates, and bare page numbers — are
-  dropped from the body. The counts are reported at the end.
-- **Promotes footnotes to real Word footnotes.** Inline `(N)` definitions are
-  matched to their `(N)` markers in the body (numbering restarts each page) and
-  become genuine, auto-numbered footnotes anchored at the bottom of the page.
-- **Cleans and reflows the body:** `[†see log]` flags become superscript
-  asterisks, leaked `<sup>`/`<u>`/`<sub>` tags are stripped, per-line paragraphs
-  are joined into flowing prose, a space is restored where OCR glued sentence
-  punctuation to the next word, Qur'anic quotations in `{ ... }` are italicized,
-  and the source page number is preserved as a small superscript `[N]` so you
-  can still cite by page.
-- **Reassembles across page boundaries** without breaking sentences — a page
-  that ends mid-sentence continues into the next.
-- **Paragraphing.** When `ANTHROPIC_API_KEY` is set, the **preferred** path
-  sends the reflowed text to Claude (`claude-sonnet-5`) in chunks, which inserts
-  paragraph breaks only where the argument shifts (it also handles the long
-  run-on sentences the mechanical pass can't). The model is **only** allowed to
-  add breaks: every chunk is verified against its input and discarded if a
-  single word or placeholder changed. Progress is checkpointed to
-  `{name}_format_checkpoint.json`; re-run to resume, or `--restart` to ignore
-  it. Without a key, a **mechanical fallback** splits the body into sentences and
-  groups them into paragraphs at discourse markers (*As for*, *The first*,
-  *Then*, *He said:*, *It was narrated*, …) and sentence-length thresholds — it
-  never produces one paragraph per page.
-- **Builds the `.docx` with Pandoc** against a generated reference document:
-  US Letter, one-inch margins, 12pt Times New Roman body — justified, 1.5 line
-  spacing, 0.3" first-line indent, ~8pt space after each paragraph — 10pt
-  footnotes, and centered page numbers in the footer.
+1. **Export** — `pandoc input.docx -t markdown --wrap=none`. Real Word footnotes
+   come out as `[^N]` references inline and `[^N]:` definitions.
+2. **Clean the Markdown** (below) — every footnote `[^N]` ref and `[^N]:`
+   definition is left untouched; definitions are set aside verbatim and
+   re-appended at the end.
+3. **Rebuild** — `pandoc work.md -o output.docx --reference-doc=styled.docx`.
+   The footnotes come back as genuine, auto-numbered Word footnotes anchored at
+   the bottom of the page.
+
+The cleaning pass:
+
+- **Drops cover / front matter.** It starts the body at the first real content —
+  the basmala, or the first clean-prose page — discarding everything before it
+  (segments carrying ISBN, "All Rights Reserved", a URL, "Edition", etc., or a
+  high ratio of non-dictionary tokens).
+- **Removes source-page markers** (`^[N]^` superscripts) while leaving `[^N]`
+  footnote refs alone.
+- **Strips running headers by recurrence, not keywords.** The leading phrase of
+  each page is normalized and counted; any phrase appearing on ≥ max(8, 5% of
+  pages) is a running header and is removed throughout, along with a trailing
+  printed page number and any adjacent flag.
+- **Promotes section titles to headings.** A short, title-like leading phrase
+  that occurs only a few times becomes a Markdown `## heading` at its first
+  occurrence; later repeats are stripped.
+- **Strips junk and fixes spacing:** `<br>`, `***`, `XXX`, `{.mark}` spans and
+  leaked tags are removed; each difficulty flag becomes a superscript asterisk
+  (`^\*^`); a space is restored where OCR glued sentence punctuation to the next
+  word; whitespace is collapsed.
+- **Paragraphs the body.** When `ANTHROPIC_API_KEY` is set, the **preferred**
+  path sends the text to Claude (`claude-sonnet-5`) in chunks, which inserts
+  paragraph breaks only where the argument shifts (it handles the long run-on
+  sentences the mechanical pass can't). The model is **only** allowed to add
+  breaks: every chunk is verified and discarded if a word or marker changed.
+  Progress is checkpointed to `{name}_format_checkpoint.json` (resume by
+  re-running, or `--restart` to ignore). Without a key, a **mechanical fallback**
+  splits the body into sentences and groups them at discourse markers (*As for*,
+  *The first*, *Then*, *He said:*, *Ibn …*, *Al-…*, …) and sentence-length
+  thresholds — it never produces one paragraph per page. A post-pass glues any
+  orphaned footnote ref or asterisk onto the previous paragraph.
+- **Styles with a generated reference doc:** US Letter, one-inch margins, 12pt
+  Times New Roman body — justified, 1.3 line spacing, 0.3" first-line indent,
+  ~8pt space after — ~9.5pt footnotes, section titles as Heading 2, and centered
+  page numbers in the footer.
 
 Format mode requires **Pandoc**. If it is not installed the tool prints the
 install command and stops without discarding any checkpoint.
 
-The end-of-run summary reports: pages formatted, cover pages skipped, running
-headers dropped, CJK characters stripped, footnotes created, asterisk flags,
-paragraphs produced, median paragraph length, and whether the Claude pass ran or
-the mechanical fallback was used.
+The end-of-run summary reports: cover pages dropped, running headers removed,
+section headings promoted, paragraphs produced, footnotes preserved, and whether
+the Claude pass ran or the mechanical fallback was used.
 
 ### Notes and honest limits
 
-- **Footnote matching is by number.** Markers are matched to their notes by the
-  number in `(N)`, which is reliable when there is one marker per number per
-  page (the normal case). A page that reuses the same number could misplace one.
-- **The paragraph breaks are Claude's judgment**, not the original author's. The
-  source's real paragraphing is not recoverable from the flattened text, so the
-  breaks reflect where the *argument* appears to shift — a best-effort
-  reconstruction, not the author's own layout.
+- **Running headers are found by recurrence.** The tool keys off the phrase that
+  repeats at the top of each page. A book whose pages don't share a consistent
+  header line, or whose header is OCR'd differently each time, may keep some
+  header text; a one-off line that happens to repeat could be trimmed.
+- **The paragraph breaks are Claude's judgment** (or the mechanical rules'), not
+  the original author's. The source's real paragraphing is not recoverable from
+  the flattened text, so the breaks reflect where the *argument* appears to
+  shift — a best-effort reconstruction, not the author's own layout.
 - **The asterisks are pointers, not the notes themselves.** They mark passages
   the translator flagged as difficult during Translate mode; the full text of
   those notes lives in that run's `{name}_translation_log.csv`.
@@ -250,9 +260,11 @@ Constants you may want to adjust live near the top of the source modules:
 - `translate_doc/parser.py`
   - `PARAGRAPHS_PER_PAGE` — the ratio used to estimate page count.
 - `translate_doc/formatter.py`
-  - `LATIN_LETTER_THRESHOLD` — below this many Latin letters, a page is treated
-    as an un-OCR-able cover page and dropped.
-  - `WORDS_PER_CHUNK` — chunk size for the intelligent-paragraphing calls.
+  - `WORDS_PER_CHUNK` — chunk size for the Claude paragraphing calls.
+  - `_PARA_*` thresholds — tune where the mechanical fallback starts new
+    paragraphs (discourse-marker and sentence-length limits).
+  - `FRONT_MATTER_MARKERS` / `DISCOURSE_RE` — the cover-detection signals and the
+    discourse markers that trigger a paragraph break.
 
 ---
 
