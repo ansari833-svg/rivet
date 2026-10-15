@@ -493,8 +493,9 @@ def run_format_flow(input_path: Path, restart: bool) -> None:
         client = _build_client(os.environ["ANTHROPIC_API_KEY"])
     else:
         print(
-            "ANTHROPIC_API_KEY is not set — skipping intelligent paragraphing.\n"
-            "The document will still be formatted using page-based paragraphs."
+            "ANTHROPIC_API_KEY is not set — skipping the Claude paragraphing pass.\n"
+            "The document will still be formatted using the mechanical, "
+            "sentence-based paragraphing fallback."
         )
 
     def _progress(current: int, total: int) -> None:
@@ -534,12 +535,20 @@ def _print_format_summary(input_path: Path, result: "formatter.FormatResult") ->
     print(f"  Input:                 {input_path.name}")
     print(f"  Output:                {result.output_path.name}")
     print(f"  Pages formatted:       {result.pages_formatted}")
+    print(f"  Cover pages skipped:   {skipped}")
+    print(f"  Running headers dropped: {result.headers_dropped}")
+    print(f"  CJK characters stripped: {result.cjk_stripped}")
     print(f"  Footnotes created:     {result.footnotes_created}")
     print(f"  Asterisk flags:        {result.asterisks}")
-    print(f"  Cover pages skipped:   {skipped}")
+    print(f"  Paragraphs produced:   {result.paragraphs_produced}")
+    print(f"  Median paragraph length: {result.median_paragraph_chars} chars")
     print(
-        "  Intelligent paragraphing: "
-        + ("ran" if result.paragraphing_ran else "skipped")
+        "  Paragraphing: "
+        + (
+            "Claude LLM pass"
+            if result.paragraphing_ran
+            else "mechanical fallback (no API key)"
+        )
     )
     print("=" * 50)
     print(f"✓ {result.output_path.name} — clean, footnoted Word document")

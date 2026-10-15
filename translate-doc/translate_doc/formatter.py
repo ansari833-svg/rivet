@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import statistics
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -47,6 +48,54 @@ LEAKED_TAG_RE = re.compile(r"</?(?:sup|sub|u)>", re.IGNORECASE)
 TOKEN_RE = re.compile(r"(<<F\d+>>|<<P\d+>>|<<A>>)")
 QURAN_RE = re.compile(r"\{([^{}]*)\}")
 _SENTENCE_END = ".?!…:؟"
+
+# OCR misreads: CJK symbols/ideographs, kana, Hangul, and the 《》 brackets.
+# (U+3040–U+30FF and 《》 fall inside U+3000–U+9FFF but are listed for clarity.)
+CJK_RE = re.compile(r"[　-鿿぀-ヿ가-퟿《》]")
+
+# Running-header / title / journal keywords. A short body line matching one of
+# these is dropped as a running header rather than kept as content.
+HEADER_KEYWORDS = (
+    "criterion of prohibited resemblance",
+    "al-juday",
+    "al-judayʿ",
+    "academic journal",
+    "journal of",
+    "issue no",
+    "muḥarram",
+    "muharram",
+    "october 2016",
+)
+HEADER_MONTH_YEAR_RE = re.compile(
+    r"\b(january|february|march|april|may|june|july|august|september|october|"
+    r"november|december|mu[ḥh]arram|safar|rabi[ʿ'`]?|jumada|rajab|sha[ʿ'`]?ban|"
+    r"rama[ḍd]an|shawwal|dhu[ʾ'`]?l)\b.*\b\d{4}\b",
+    re.IGNORECASE,
+)
+# A line that is nothing but a page number (optionally bracketed / dashed).
+BARE_PAGE_NUM_RE = re.compile(r"^[\[\(\-–—\s]*\d{1,4}[\]\)\-–—\s]*$")
+
+# Discourse markers that should start a new paragraph.
+DISCOURSE_RE = re.compile(
+    r"^(?:as for\b|the first\b|the second\b|the third\b|then\b|accordingly\b|"
+    r"therefore\b|thus\b|in summary\b|chapter\b|section\b|question\b|"
+    r"know that\b|he said:|it was narrated\b|on the authority\b|and allah\b|"
+    r"allah(?: the exalted| the almighty| almighty)? said)",
+    re.IGNORECASE,
+)
+
+# Sentence splitting: break after .!?؟… when followed by whitespace then an
+# uppercase letter or opening quote (keeps "no. 1" and decimals intact).
+SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?؟…])\s+(?=[\"“A-Z])")
+# Sentence punctuation glued to the next word: insert a space.
+GLUED_PUNCT_RE = re.compile(r"([.!?؟])([\"“A-Z])")
+
+# Mechanical-paragraphing thresholds (the fallback when the LLM step is off).
+_PARA_MARKER_MIN_CHARS = 160   # break BEFORE a discourse marker past this
+_PARA_LEN_MIN_SENTENCES = 2    # break AFTER a boundary once this many sentences
+_PARA_LEN_MIN_CHARS = 380      # ...and this many chars have accumulated
+_PARA_MAX_CHARS = 1100         # last-resort split above this
+_PARA_SPLIT_MIN_CHARS = 600    # ...at a ; or : clause end past this
 
 PARAGRAPHING_SYSTEM_PROMPT = """\
 You insert paragraph breaks into an already-translated passage. You are given \
@@ -185,6 +234,53 @@ def _latin_letter_count(page: Page) -> int:
     return count
 
 
+@dataclass
+class CleanStats:
+    headers_dropped: int = 0
+    cjk_stripped: int = 0
+
+
+def _strip_cjk(text: str) -> tuple[str, int]:
+    removed = len(CJK_RE.findall(text))
+    return CJK_RE.sub("", text), removed
+
+
+def _is_header_line(text: str) -> bool:
+    """A short body line that is a running header, title, journal ref, or bare
+    page number — OCR chrome to drop rather than content to keep."""
+    t = text.strip()
+    if not t:
+        return False
+    if BARE_PAGE_NUM_RE.match(t):
+        return True
+    if len(t.split()) > 14:
+        return False
+    low = t.lower()
+    if any(kw in low for kw in HEADER_KEYWORDS):
+        return True
+    return bool(HEADER_MONTH_YEAR_RE.search(t))
+
+
+def _clean_page_body(page: Page, stats: CleanStats) -> None:
+    """Strip CJK OCR garbage and drop running-header lines, in place."""
+    kept: list[ParaInfo] = []
+    for p in page.body:
+        clean_text, removed = _strip_cjk(p.text)
+        stats.cjk_stripped += removed
+        if _is_header_line(clean_text):
+            stats.headers_dropped += 1
+            continue
+        # Mirror the CJK strip onto the runs used during reflow.
+        for r in p.runs:
+            r.text, _ = _strip_cjk(r.text)
+        p.text = clean_text
+        kept.append(p)
+    page.body = kept
+    for fn in page.footnotes:
+        fn.text, removed = _strip_cjk(fn.text)
+        stats.cjk_stripped += removed
+
+
 # ---------------------------------------------------------------------------
 # Step 2 / 3 — footnote mapping and body reflow
 # ---------------------------------------------------------------------------
@@ -229,6 +325,11 @@ def _reflow_page(page: Page, local_to_global: dict[int, int]) -> str:
     # Reflow: line breaks become spaces, collapse whitespace runs.
     text = re.sub(r"[ \t]*\n[ \t]*", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
+    # Final cleanup: drop any residual CJK, then un-glue sentence punctuation
+    # that OCR line-joining left stuck to the next word.
+    text = CJK_RE.sub("", text)
+    text = GLUED_PUNCT_RE.sub(r"\1 \2", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
     if text:
         text = f"<<P{page.num}>> {text}"
     return text
@@ -261,6 +362,76 @@ def _reassemble(pages: list[Page]) -> list[str]:
     if buf:
         paragraphs.append(buf)
     return paragraphs
+
+
+# ---------------------------------------------------------------------------
+# Step 5 (fallback) — mechanical sentence-based paragraphing
+# ---------------------------------------------------------------------------
+
+
+def _split_sentences(text: str) -> list[str]:
+    return [s.strip() for s in SENTENCE_SPLIT_RE.split(text) if s.strip()]
+
+
+def _starts_discourse(sentence: str) -> bool:
+    s = TOKEN_RE.sub("", sentence).lstrip(" \"“'‘(")
+    return bool(DISCOURSE_RE.match(s))
+
+
+def _split_long_paragraph(para: str) -> list[str]:
+    if len(para) <= _PARA_MAX_CHARS:
+        return [para]
+    for m in re.finditer(r"[;:]", para):
+        if m.start() >= _PARA_SPLIT_MIN_CHARS:
+            head = para[: m.end()].strip()
+            tail = para[m.end() :].strip()
+            return [head] + _split_long_paragraph(tail) if tail else [head]
+    return [para]
+
+
+def _group_sentences(sentences: list[str]) -> list[str]:
+    paragraphs: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for s in sentences:
+        # (a) Break BEFORE a discourse marker once the current paragraph has
+        # content.
+        if (
+            cur
+            and _starts_discourse(s)
+            and len(cur) >= 1
+            and cur_len >= _PARA_MARKER_MIN_CHARS
+        ):
+            paragraphs.append(" ".join(cur))
+            cur, cur_len = [], 0
+        cur.append(s)
+        cur_len += len(s) + 1
+        # (b) Break AFTER a boundary once the paragraph is long enough.
+        if len(cur) >= _PARA_LEN_MIN_SENTENCES and cur_len >= _PARA_LEN_MIN_CHARS:
+            paragraphs.append(" ".join(cur))
+            cur, cur_len = [], 0
+    if cur:
+        paragraphs.append(" ".join(cur))
+
+    # Last resort: hard-split any paragraph still over the ceiling.
+    result: list[str] = []
+    for para in paragraphs:
+        result.extend(_split_long_paragraph(para))
+    return result
+
+
+def mechanical_paragraphs(step4_paragraphs: list[str]) -> list[str]:
+    """Fallback paragraphing: reflow to one body, split to sentences, regroup.
+
+    Never returns one-paragraph-per-page — it ignores the page-based grouping
+    and rebuilds paragraphs from sentence boundaries and discourse markers.
+    """
+    body = " ".join(re.sub(r"\s+", " ", p).strip() for p in step4_paragraphs)
+    body = GLUED_PUNCT_RE.sub(r"\1 \2", body)
+    body = re.sub(r"\s{2,}", " ", body).strip()
+    if not body:
+        return []
+    return _group_sentences(_split_sentences(body))
 
 
 # ---------------------------------------------------------------------------
@@ -492,8 +663,33 @@ def _add_page_number_field(paragraph) -> None:
     run._r.append(end)
 
 
+def _set_doc_default_font(document, name: str, size_pt: int) -> None:
+    """Force the document-default run font/size so nothing falls back to 10pt."""
+    styles_el = document.styles.element
+    path = "/".join((qn("w:docDefaults"), qn("w:rPrDefault"), qn("w:rPr")))
+    rpr_default = styles_el.find(path)
+    if rpr_default is None:
+        return
+    rfonts = rpr_default.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        rpr_default.insert(0, rfonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs"):
+        rfonts.set(qn(attr), name)
+    half = str(int(size_pt * 2))
+    for tag in ("w:sz", "w:szCs"):
+        el = rpr_default.find(qn(tag))
+        if el is None:
+            el = OxmlElement(tag)
+            rpr_default.append(el)
+        el.set(qn("w:val"), half)
+
+
 def build_reference_doc(ref_path: Path) -> None:
-    """Generate a Pandoc reference doc styled for a serif book/paper layout."""
+    """Generate a Pandoc reference doc styled for a serif book/paper layout:
+    US Letter, 1in margins, 12pt Times New Roman body (justified, 1.5 spacing,
+    0.3in first-line indent, 8pt after), 10pt footnotes, centered page numbers.
+    """
     with open(ref_path, "wb") as fh:
         subprocess.run(
             ["pandoc", "--print-default-data-file", "reference.docx"],
@@ -502,7 +698,11 @@ def build_reference_doc(ref_path: Path) -> None:
         )
     document = Document(str(ref_path))
 
-    for style_name in ("Normal", "Body Text", "First Paragraph"):
+    # Document default (guards against any 10pt fallback).
+    _set_doc_default_font(document, "Times New Roman", 12)
+
+    # Body-text styles Pandoc may apply to paragraphs.
+    for style_name in ("Normal", "Body Text", "First Paragraph", "Compact"):
         try:
             style = document.styles[style_name]
         except KeyError:
@@ -511,7 +711,18 @@ def build_reference_doc(ref_path: Path) -> None:
         style.font.size = Pt(12)
         pf = style.paragraph_format
         pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-        pf.first_line_indent = Inches(0.5)
+        pf.first_line_indent = Inches(0.3)
+        pf.line_spacing = 1.5
+        pf.space_after = Pt(8)
+
+    # Footnotes a touch smaller.
+    for style_name in ("Footnote Text", "Footnote"):
+        try:
+            style = document.styles[style_name]
+        except KeyError:
+            continue
+        style.font.name = "Times New Roman"
+        style.font.size = Pt(10)
 
     for section in document.sections:
         section.page_width = Inches(8.5)
@@ -557,6 +768,10 @@ class FormatResult:
     asterisks: int
     skipped_pages: list[int]
     paragraphing_ran: bool
+    headers_dropped: int = 0
+    cjk_stripped: int = 0
+    paragraphs_produced: int = 0
+    median_paragraph_chars: int = 0
 
 
 def pandoc_available() -> bool:
@@ -580,10 +795,12 @@ def format_document(
     if restart:
         FormatCheckpoint.path_for(input_path).unlink(missing_ok=True)
 
-    # Step 1 — parse and classify pages.
+    # Step 1 — parse, clean (CJK + running headers), and classify pages.
+    stats = CleanStats()
     pages = parse_structure(input_path)
     for page in pages:
         _split_body_and_footnotes(page)
+        _clean_page_body(page, stats)
         if _latin_letter_count(page) < LATIN_LETTER_THRESHOLD:
             page.skipped = True
 
@@ -610,7 +827,9 @@ def format_document(
     # Step 4 — reassemble across page boundaries without breaking sentences.
     paragraphs = _reassemble(kept)
 
-    # Step 5 — intelligent paragraphing (optional).
+    # Step 5 — paragraphing. The Claude LLM pass is PREFERRED when a key is
+    # present (it handles long run-on sentences); the mechanical, sentence-based
+    # pass is the fallback and never produces one-paragraph-per-page.
     paragraphing_ran = False
     if client is not None and paragraphs:
         checkpoint = None if restart else FormatCheckpoint.load(input_path)
@@ -620,10 +839,15 @@ def format_document(
         checkpoint.delete()
         paragraphing_ran = True
     else:
-        # No paragraphing: keep Step 4 paragraphs, but flatten single newlines.
-        paragraphs = [re.sub(r"\s+", " ", p).strip() for p in paragraphs]
+        paragraphs = mechanical_paragraphs(paragraphs)
 
     asterisks = sum(p.count("<<A>>") for p in paragraphs)
+
+    # Paragraph-length stats (visible characters, tokens removed).
+    visible_lengths = [
+        len(re.sub(r"\s{2,}", " ", TOKEN_RE.sub("", p)).strip()) for p in paragraphs
+    ]
+    median_len = int(statistics.median(visible_lengths)) if visible_lengths else 0
 
     # Step 6 — Markdown + Pandoc.
     title = _derive_title(input_path)
@@ -645,4 +869,8 @@ def format_document(
         asterisks=asterisks,
         skipped_pages=skipped_pages,
         paragraphing_ran=paragraphing_ran,
+        headers_dropped=stats.headers_dropped,
+        cjk_stripped=stats.cjk_stripped,
+        paragraphs_produced=len(paragraphs),
+        median_paragraph_chars=median_len,
     )

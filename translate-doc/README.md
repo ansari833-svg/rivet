@@ -185,30 +185,44 @@ What it does:
 - **Parses the page structure**, splitting on `[[page N]]` markers and dropping
   un-OCR-able cover/title pages (pages with fewer than ~40 Latin letters). The
   skipped page numbers are reported at the end.
+- **Strips OCR garbage and chrome.** CJK / kana / Hangul characters (OCR
+  misreads, not content) are removed, and short running-header lines — the
+  book's title, author, journal/issue line, dates, and bare page numbers — are
+  dropped from the body. The counts are reported at the end.
 - **Promotes footnotes to real Word footnotes.** Inline `(N)` definitions are
   matched to their `(N)` markers in the body (numbering restarts each page) and
   become genuine, auto-numbered footnotes anchored at the bottom of the page.
 - **Cleans and reflows the body:** `[†see log]` flags become superscript
   asterisks, leaked `<sup>`/`<u>`/`<sub>` tags are stripped, per-line paragraphs
-  are joined into flowing prose, Qur'anic quotations in `{ ... }` are
-  italicized, and the source page number is preserved as a small superscript
-  `[N]` so you can still cite by page.
+  are joined into flowing prose, a space is restored where OCR glued sentence
+  punctuation to the next word, Qur'anic quotations in `{ ... }` are italicized,
+  and the source page number is preserved as a small superscript `[N]` so you
+  can still cite by page.
 - **Reassembles across page boundaries** without breaking sentences — a page
   that ends mid-sentence continues into the next.
-- **Intelligent paragraphing (optional).** If `ANTHROPIC_API_KEY` is set, the
-  reflowed text is sent to Claude (`claude-sonnet-5`) in chunks, which inserts
-  paragraph breaks only where the argument shifts. The model is **only** allowed
-  to add breaks: every chunk is verified against its input and discarded if a
-  single word or placeholder changed. Without a key, this step is skipped and
-  the document is still produced with page-based paragraphs. Progress is
-  checkpointed to `{name}_format_checkpoint.json`; re-run to resume, or use
-  `--restart` to ignore it.
+- **Paragraphing.** When `ANTHROPIC_API_KEY` is set, the **preferred** path
+  sends the reflowed text to Claude (`claude-sonnet-5`) in chunks, which inserts
+  paragraph breaks only where the argument shifts (it also handles the long
+  run-on sentences the mechanical pass can't). The model is **only** allowed to
+  add breaks: every chunk is verified against its input and discarded if a
+  single word or placeholder changed. Progress is checkpointed to
+  `{name}_format_checkpoint.json`; re-run to resume, or `--restart` to ignore
+  it. Without a key, a **mechanical fallback** splits the body into sentences and
+  groups them into paragraphs at discourse markers (*As for*, *The first*,
+  *Then*, *He said:*, *It was narrated*, …) and sentence-length thresholds — it
+  never produces one paragraph per page.
 - **Builds the `.docx` with Pandoc** against a generated reference document:
-  US Letter, one-inch margins, Times New Roman 12pt, justified with a first-line
-  indent, and centered page numbers in the footer.
+  US Letter, one-inch margins, 12pt Times New Roman body — justified, 1.5 line
+  spacing, 0.3" first-line indent, ~8pt space after each paragraph — 10pt
+  footnotes, and centered page numbers in the footer.
 
 Format mode requires **Pandoc**. If it is not installed the tool prints the
 install command and stops without discarding any checkpoint.
+
+The end-of-run summary reports: pages formatted, cover pages skipped, running
+headers dropped, CJK characters stripped, footnotes created, asterisk flags,
+paragraphs produced, median paragraph length, and whether the Claude pass ran or
+the mechanical fallback was used.
 
 ### Notes and honest limits
 
