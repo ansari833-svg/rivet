@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import time
 from collections import Counter
+from importlib import resources
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -114,10 +115,50 @@ class FormatResult:
     paragraphs_produced: int
     footnotes_preserved: int
     paragraphing_ran: bool
+    reference_doc: str = ""
 
 
 def pandoc_available() -> bool:
     return shutil.which("pandoc") is not None
+
+
+PANDOC_INSTALL_HINT = (
+    "Format mode needs Pandoc. Install it with: "
+    "winget install --id JohnMacFarlane.Pandoc"
+)
+
+
+class PandocMissingError(RuntimeError):
+    """Pandoc is not on PATH."""
+
+
+class ReferenceDocMissingError(RuntimeError):
+    """The bundled styled.docx reference doc could not be found."""
+
+
+def _require_pandoc() -> None:
+    if not pandoc_available():
+        raise PandocMissingError(PANDOC_INSTALL_HINT)
+
+
+def bundled_reference_doc():
+    """Context manager yielding a real filesystem path to the bundled
+    ``translate_doc/assets/styled.docx``.
+
+    The file ships as package data and is located with importlib.resources, so
+    it is found whether the tool runs from the project folder or from an
+    installed copy. If it is missing, raise rather than fall back to pandoc's
+    default (unstyled) reference doc.
+    """
+    resource = resources.files("translate_doc").joinpath("assets").joinpath("styled.docx")
+    if not resource.is_file():
+        raise ReferenceDocMissingError(
+            "Format mode's bundled reference doc (translate_doc/assets/styled.docx) "
+            f"was not found in the installed package (looked for: {resource}). "
+            "The install is incomplete — reinstall translate-doc. Refusing to "
+            "continue with default styling."
+        )
+    return resources.as_file(resource)
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +649,38 @@ def _set_doc_default_font(document, name: str, size_pt: float) -> None:
         el.set(qn("w:val"), half)
 
 
+def _style_named(document, name: str):
+    """Find a style by its exact name. (python-docx's ``styles[name]`` maps
+    "Heading N" to the internal "heading N", which misses pandoc's
+    capitalised "Heading N" styles.)"""
+    for style in document.styles:
+        if style.name == name:
+            return style
+    raise KeyError(name)
+
+
+def _clear_theme_overrides(style) -> None:
+    """Drop theme font/colour attributes, which Word applies in preference to the
+    explicit font name and RGB colour we set."""
+    rpr = style.element.find(qn("w:rPr"))
+    if rpr is None:
+        return
+    rfonts = rpr.find(qn("w:rFonts"))
+    if rfonts is not None:
+        for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
+            rfonts.attrib.pop(qn(attr), None)
+    color = rpr.find(qn("w:color"))
+    if color is not None:
+        for attr in ("w:themeColor", "w:themeShade", "w:themeTint"):
+            color.attrib.pop(qn(attr), None)
+
+
 def build_reference_doc(ref_path: Path) -> None:
+    """Maintainer helper: regenerate ``translate_doc/assets/styled.docx``.
+
+    Not used at runtime — Format mode always loads the bundled copy. Run:
+        python -c "from pathlib import Path; from translate_doc.formatter import build_reference_doc; build_reference_doc(Path('translate_doc/assets/styled.docx'))"
+    """
     with open(ref_path, "wb") as fh:
         subprocess.run(
             ["pandoc", "--print-default-data-file", "reference.docx"],
@@ -645,9 +717,15 @@ def build_reference_doc(ref_path: Path) -> None:
         pf.space_after = Pt(0)
         pf.line_spacing = 1.0
 
-    # Section titles: Heading 2.
+    # Title (Heading 1) and section titles (Heading 2): serif, not the theme font.
     try:
-        h2 = document.styles["Heading 2"]
+        h1 = _style_named(document, "Heading 1")
+        h1.font.name = "Times New Roman"
+        _clear_theme_overrides(h1)
+    except KeyError:
+        pass
+    try:
+        h2 = _style_named(document, "Heading 2")
         h2.font.name = "Times New Roman"
         h2.font.size = Pt(14)
         h2.font.bold = True
@@ -655,6 +733,7 @@ def build_reference_doc(ref_path: Path) -> None:
         h2.paragraph_format.space_before = Pt(12)
         h2.paragraph_format.space_after = Pt(6)
         h2.paragraph_format.keep_with_next = True
+        _clear_theme_overrides(h2)
     except KeyError:
         pass
 
@@ -682,8 +761,7 @@ def run_pandoc(md_path: Path, output_path: Path, ref_path: Path) -> None:
             "markdown",
             "-o",
             str(output_path),
-            "--reference-doc",
-            str(ref_path),
+            f"--reference-doc={ref_path}",
         ],
         check=True,
     )
@@ -777,6 +855,7 @@ def format_document(
 ) -> FormatResult:
     """Full Format-mode pipeline (pandoc round-trip). Pandoc availability is
     assumed to have been checked by the caller."""
+    _require_pandoc()
     input_path = input_path.resolve()
     output_path = input_path.parent / f"{input_path.stem}_formatted.docx"
     if restart:
@@ -842,12 +921,12 @@ def format_document(
     work_md = _build_markdown(title, blocks, defs)
     md_path = input_path.parent / f"{input_path.stem}_formatted.md"
     md_path.write_text(work_md, encoding="utf-8")
-    ref_path = input_path.parent / f"{input_path.stem}_reference.docx"
-    build_reference_doc(ref_path)
-    run_pandoc(md_path, output_path, ref_path)
-
-    md_path.unlink(missing_ok=True)
-    ref_path.unlink(missing_ok=True)
+    try:
+        with bundled_reference_doc() as ref_path:
+            reference_doc = str(Path(ref_path).resolve())
+            run_pandoc(md_path, output_path, Path(ref_path))
+    finally:
+        md_path.unlink(missing_ok=True)
 
     return FormatResult(
         output_path=output_path,
@@ -857,4 +936,5 @@ def format_document(
         paragraphs_produced=total_paragraphs,
         footnotes_preserved=len(defs),
         paragraphing_ran=paragraphing_ran,
+        reference_doc=reference_doc,
     )

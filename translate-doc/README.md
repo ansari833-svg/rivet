@@ -229,6 +229,19 @@ The cleaning pass:
 Format mode requires **Pandoc**. If it is not installed the tool prints the
 install command and stops without discarding any checkpoint.
 
+The styling comes from a reference document bundled **inside the package** at
+`translate_doc/assets/styled.docx` (declared as package data in
+`pyproject.toml` and loaded with `importlib.resources`), so it is found from any
+install — `setup.ps1`, `pip install`, or `uv tool install .`. If that file is
+missing the tool stops with an error rather than silently producing unstyled
+output, and the run summary prints the exact path it loaded the reference doc
+from. To change the styling, edit `build_reference_doc()` in `formatter.py` and
+regenerate the asset:
+
+```cmd
+python -c "from pathlib import Path; from translate_doc.formatter import build_reference_doc; build_reference_doc(Path('translate_doc/assets/styled.docx'))"
+```
+
 The end-of-run summary reports: cover pages dropped, running headers removed,
 section headings promoted, paragraphs produced, footnotes preserved, and whether
 the Claude pass ran or the mechanical fallback was used.

@@ -478,10 +478,7 @@ def run_format_flow(input_path: Path, restart: bool) -> None:
     # Pandoc is required; fail fast (before any API spend) so the checkpoint,
     # if one exists from a prior run, is left untouched.
     if not formatter.pandoc_available():
-        print(
-            "Format mode needs Pandoc. Install it with: "
-            "winget install --id JohnMacFarlane.Pandoc"
-        )
+        print(formatter.PANDOC_INSTALL_HINT)
         sys.exit(1)
 
     input_path = input_path.resolve()
@@ -512,12 +509,15 @@ def run_format_flow(input_path: Path, restart: bool) -> None:
 
     try:
         _retry_on_permission_error(_do_format, f"{input_path.stem}_formatted.docx")
+    except formatter.PandocMissingError as exc:
+        print(exc)
+        sys.exit(1)
+    except formatter.ReferenceDocMissingError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
     except FileNotFoundError:
-        # build_reference_doc / run_pandoc invoke the pandoc binary.
-        print(
-            "Format mode needs Pandoc. Install it with: "
-            "winget install --id JohnMacFarlane.Pandoc"
-        )
+        # The pandoc binary vanished between the PATH check and the call.
+        print(formatter.PANDOC_INSTALL_HINT)
         sys.exit(1)
 
     result = result_holder["result"]
@@ -534,6 +534,7 @@ def _print_format_summary(input_path: Path, result: "formatter.FormatResult") ->
     print(f"  Section headings:        {result.section_headings}")
     print(f"  Paragraphs produced:     {result.paragraphs_produced}")
     print(f"  Footnotes preserved:     {result.footnotes_preserved}")
+    print(f"  Reference doc:           {result.reference_doc}")
     print(
         "  Paragraphing:            "
         + (

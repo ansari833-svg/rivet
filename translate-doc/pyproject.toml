@@ -21,3 +21,8 @@ translate-doc = "translate_doc.main:main"
 
 [tool.setuptools]
 packages = ["translate_doc"]
+
+# Ship the pandoc reference doc inside the package so Format mode can load it
+# with importlib.resources from any install (uv tool install, pip, editable).
+[tool.setuptools.package-data]
+translate_doc = ["assets/*.docx"]
