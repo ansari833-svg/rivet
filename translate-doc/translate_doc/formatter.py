@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from collections import Counter
 from importlib import resources
@@ -136,6 +138,10 @@ class ReferenceDocMissingError(RuntimeError):
     """The bundled styled.docx reference doc could not be found."""
 
 
+class PandocError(RuntimeError):
+    """A pandoc call failed or produced no output."""
+
+
 def _require_pandoc() -> None:
     if not pandoc_available():
         raise PandocMissingError(PANDOC_INSTALL_HINT)
@@ -166,14 +172,55 @@ def bundled_reference_doc():
 # ---------------------------------------------------------------------------
 
 
-def export_markdown(input_docx: Path) -> str:
-    result = subprocess.run(
-        ["pandoc", str(input_docx), "-t", "markdown", "--wrap=none"],
+def _pandoc_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"  # belt-and-braces: force UTF-8 for any child Python
+    return env
+
+
+def _run_pandoc_to_file(args: list[str], output: Path, action: str) -> None:
+    """Run pandoc writing to ``output`` (never via captured stdout).
+
+    pandoc's stderr is decoded explicitly as UTF-8 — never the platform default
+    (cp1252 on Windows), which cannot decode Arabic text. A non-zero exit code or
+    a missing/empty output file raises :class:`PandocError` with pandoc's stderr.
+    """
+    proc = subprocess.run(
+        ["pandoc", *args, "-o", str(output)],
         capture_output=True,
         text=True,
-        check=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_pandoc_env(),
     )
-    return result.stdout
+    stderr = (proc.stderr or "").strip() or "(pandoc printed nothing on stderr)"
+    if proc.returncode != 0:
+        raise PandocError(
+            f"pandoc failed while {action} (exit code {proc.returncode}).\n"
+            f"pandoc said:\n{stderr}"
+        )
+    if not output.exists() or output.stat().st_size == 0:
+        raise PandocError(
+            f"pandoc produced no output while {action} (expected {output}).\n"
+            f"pandoc said:\n{stderr}"
+        )
+
+
+def export_markdown(input_docx: Path, work_md: Path) -> str:
+    """docx -> Markdown via pandoc, written to ``work_md`` and read back as UTF-8."""
+    _run_pandoc_to_file(
+        [str(input_docx), "-t", "markdown", "--wrap=none"],
+        work_md,
+        f"converting {input_docx.name} to Markdown",
+    )
+    with open(work_md, encoding="utf-8") as fh:
+        md = fh.read()
+    if not md.strip():
+        raise PandocError(
+            f"pandoc returned empty Markdown for {input_docx.name}; "
+            "the document may be empty or unreadable."
+        )
+    return md
 
 
 # ---------------------------------------------------------------------------
@@ -681,11 +728,17 @@ def build_reference_doc(ref_path: Path) -> None:
     Not used at runtime — Format mode always loads the bundled copy. Run:
         python -c "from pathlib import Path; from translate_doc.formatter import build_reference_doc; build_reference_doc(Path('translate_doc/assets/styled.docx'))"
     """
-    with open(ref_path, "wb") as fh:
-        subprocess.run(
+    with open(ref_path, "wb") as fh:  # binary .docx bytes, no text decoding
+        proc = subprocess.run(
             ["pandoc", "--print-default-data-file", "reference.docx"],
             stdout=fh,
-            check=True,
+            stderr=subprocess.PIPE,
+            env=_pandoc_env(),
+        )
+    if proc.returncode != 0 or ref_path.stat().st_size == 0:
+        raise PandocError(
+            "pandoc could not print its default reference.docx.\npandoc said:\n"
+            + (proc.stderr.decode("utf-8", errors="replace").strip() or "(nothing)")
         )
     document = Document(str(ref_path))
     _set_doc_default_font(document, "Times New Roman", 12)
@@ -753,17 +806,11 @@ def build_reference_doc(ref_path: Path) -> None:
 
 
 def run_pandoc(md_path: Path, output_path: Path, ref_path: Path) -> None:
-    subprocess.run(
-        [
-            "pandoc",
-            str(md_path),
-            "-f",
-            "markdown",
-            "-o",
-            str(output_path),
-            f"--reference-doc={ref_path}",
-        ],
-        check=True,
+    """Markdown (UTF-8 file) -> styled .docx via pandoc."""
+    _run_pandoc_to_file(
+        [str(md_path), "-f", "markdown", f"--reference-doc={ref_path}"],
+        output_path,
+        f"building {output_path.name}",
     )
 
 
@@ -861,8 +908,24 @@ def format_document(
     if restart:
         FormatCheckpoint.path_for(input_path).unlink(missing_ok=True)
 
+    # Intermediate Markdown files live in a temp folder, always UTF-8.
+    work_dir = Path(tempfile.mkdtemp(prefix="translate-doc-format-"))
+    try:
+        return _format_in(work_dir, input_path, output_path, client, restart, progress)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def _format_in(
+    work_dir: Path,
+    input_path: Path,
+    output_path: Path,
+    client,
+    restart: bool,
+    progress,
+) -> FormatResult:
     # 0/1 — export and set footnote defs aside.
-    md = export_markdown(input_path)
+    md = export_markdown(input_path, work_dir / "work.md")
     body, defs = extract_footnote_defs(md)
 
     # 2 — segment and drop cover / front matter.
@@ -919,14 +982,12 @@ def format_document(
     # 3b/8 — rebuild with pandoc against the styled reference doc.
     title = _derive_title(input_path)
     work_md = _build_markdown(title, blocks, defs)
-    md_path = input_path.parent / f"{input_path.stem}_formatted.md"
-    md_path.write_text(work_md, encoding="utf-8")
-    try:
-        with bundled_reference_doc() as ref_path:
-            reference_doc = str(Path(ref_path).resolve())
-            run_pandoc(md_path, output_path, Path(ref_path))
-    finally:
-        md_path.unlink(missing_ok=True)
+    md_path = work_dir / "work_clean.md"
+    with open(md_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(work_md)
+    with bundled_reference_doc() as ref_path:
+        reference_doc = str(Path(ref_path).resolve())
+        run_pandoc(md_path, output_path, Path(ref_path))
 
     return FormatResult(
         output_path=output_path,

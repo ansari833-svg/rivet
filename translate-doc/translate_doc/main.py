@@ -515,6 +515,9 @@ def run_format_flow(input_path: Path, restart: bool) -> None:
     except formatter.ReferenceDocMissingError as exc:
         print(f"ERROR: {exc}")
         sys.exit(1)
+    except formatter.PandocError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
     except FileNotFoundError:
         # The pandoc binary vanished between the PATH check and the call.
         print(formatter.PANDOC_INSTALL_HINT)
