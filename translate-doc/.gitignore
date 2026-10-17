@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Tool outputs / checkpoints
+*_translated.docx
+*_bilingual.docx
+*_bilingual.pdf
+*_translation_log.csv
+*_checkpoint.json
